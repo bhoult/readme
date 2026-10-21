@@ -123,30 +123,127 @@ fn terminal_shows_kitty<'a>(var: impl Fn(&str) -> Option<&'a str>) -> bool {
 pub struct Picture {
     /// "1920×1080 PNG"
     pub info: String,
-    protocol: StatefulProtocol,
+    image: DynamicImage,
+    picker: Picker,
     /// Half-blocks have about two pixels to a character, so images are scaled up to
     /// fill the pane; real graphics show them no bigger than they are
     fill: bool,
+    /// 1 is the image fitted to the pane; more is zoomed in
+    pub zoom: f32,
+    /// The point of the image at the middle of the view, as fractions of its size
+    center: (f32, f32),
+    /// The view drawn last, and its protocol, rebuilt only when the view changes
+    view: Option<(View, StatefulProtocol)>,
 }
+
+/// The part of the image on screen (in image pixels), where it was drawn, and at how
+/// many screen pixels to an image pixel.
+#[derive(Clone, Copy, PartialEq)]
+struct View {
+    crop: (u32, u32, u32, u32),
+    at: Rect,
+    scale: f32,
+}
+
+const ZOOMS: (f32, f32) = (0.1, 50.0);
 
 impl Picture {
     pub fn new(image: DynamicImage, format: &str, picker: &Picker) -> Self {
         let info = format!("{}×{} {}", image.width(), image.height(), format.to_uppercase());
         let fill = picker.protocol_type() == ProtocolType::Halfblocks;
-        Self { info, protocol: picker.new_resize_protocol(image), fill }
+        Self { info, image, picker: picker.clone(), fill, zoom: 1.0, center: (0.5, 0.5), view: None }
     }
 
-    /// Fitted into `area` and centered.
+    fn cell(&self) -> (f32, f32) {
+        let font = self.picker.font_size();
+        (font.width.max(1) as f32, font.height.max(1) as f32)
+    }
+
+    /// What of the image fits in `area` at the current zoom, centered there.
+    fn layout(&mut self, area: Rect) -> View {
+        let (cell_w, cell_h) = self.cell();
+        let (width, height) = (self.image.width().max(1) as f32, self.image.height().max(1) as f32);
+        let (room_w, room_h) = (area.width as f32 * cell_w, area.height as f32 * cell_h);
+        let mut fit = (room_w / width).min(room_h / height);
+        if !self.fill {
+            fit = fit.min(1.0);
+        }
+        let scale = fit * self.zoom;
+        let (view_w, view_h) = ((room_w / scale).min(width), (room_h / scale).min(height));
+        let x = (self.center.0 * width - view_w / 2.0).clamp(0.0, width - view_w);
+        let y = (self.center.1 * height - view_h / 2.0).clamp(0.0, height - view_h);
+        // Panning stops at the edges
+        self.center = ((x + view_w / 2.0) / width, (y + view_h / 2.0) / height);
+        let cols = ((view_w * scale / cell_w).round() as u16).clamp(1, area.width);
+        let rows = ((view_h * scale / cell_h).round() as u16).clamp(1, area.height);
+        let at = Rect::new(area.x + (area.width - cols) / 2, area.y + (area.height - rows) / 2, cols, rows);
+        let crop = (x as u32, y as u32, (view_w as u32).max(1), (view_h as u32).max(1));
+        View { crop, at, scale }
+    }
+
     pub fn draw(&mut self, f: &mut Frame, area: Rect) {
-        let fill = self.fill;
-        let resize = || {
-            if fill { Resize::Scale(Some(FilterType::Triangle)) } else { Resize::Fit(Some(FilterType::Triangle)) }
-        };
-        let size = self.protocol.size_for(resize(), area.as_size());
-        let x = area.x + area.width.saturating_sub(size.width) / 2;
-        let y = area.y + area.height.saturating_sub(size.height) / 2;
-        let at = Rect::new(x, y, size.width.min(area.width), size.height.min(area.height));
-        f.render_stateful_widget(StatefulImage::default().resize(resize()), at, &mut self.protocol);
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let view = self.layout(area);
+        if self.view.as_ref().is_none_or(|(v, _)| v.crop != view.crop || v.at.as_size() != view.at.as_size()) {
+            let (x, y, w, h) = view.crop;
+            let whole = (x, y, w, h) == (0, 0, self.image.width(), self.image.height());
+            let part = if whole { self.image.clone() } else { self.image.crop_imm(x, y, w, h) };
+            self.view = Some((view, self.picker.new_resize_protocol(part)));
+        }
+        let Some((last, protocol)) = &mut self.view else { return };
+        *last = view;
+        f.render_stateful_widget(
+            StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle))),
+            view.at,
+            protocol,
+        );
+    }
+
+    /// Zooms by `factor`. With a screen cell, the part of the image under it stays put.
+    pub fn zoom_by(&mut self, factor: f32, at: Option<(u16, u16)>) {
+        let zoom = (self.zoom * factor).clamp(ZOOMS.0, ZOOMS.1);
+        if let (Some((x, y)), Some((view, _))) = (at, &self.view) {
+            let (cell_w, cell_h) = self.cell();
+            let (width, height) = (self.image.width() as f32, self.image.height() as f32);
+            // Screen pixels from the middle of the drawn image to the pointer
+            let dx = (x as f32 + 0.5 - (view.at.x as f32 + view.at.width as f32 / 2.0)) * cell_w;
+            let dy = (y as f32 + 0.5 - (view.at.y as f32 + view.at.height as f32 / 2.0)) * cell_h;
+            let (crop_x, crop_y, crop_w, crop_h) = view.crop;
+            let under = (
+                crop_x as f32 + crop_w as f32 / 2.0 + dx / view.scale,
+                crop_y as f32 + crop_h as f32 / 2.0 + dy / view.scale,
+            );
+            let scale = view.scale * zoom / self.zoom;
+            self.center = ((under.0 - dx / scale) / width, (under.1 - dy / scale) / height);
+        }
+        self.zoom = zoom;
+    }
+
+    pub fn reset(&mut self) {
+        (self.zoom, self.center) = (1.0, (0.5, 0.5));
+    }
+
+    /// Moves the view by a fraction of its own size.
+    pub fn pan(&mut self, across: f32, down: f32) {
+        let Some((view, _)) = &self.view else { return };
+        let (_, _, w, h) = view.crop;
+        self.center.0 += across * w as f32 / self.image.width().max(1) as f32;
+        self.center.1 += down * h as f32 / self.image.height().max(1) as f32;
+    }
+
+    /// Moves the view with the mouse, by screen cells.
+    pub fn drag(&mut self, cols: i32, rows: i32) {
+        let Some((view, _)) = &self.view else { return };
+        let (cell_w, cell_h) = self.cell();
+        self.center.0 -= cols as f32 * cell_w / view.scale / self.image.width().max(1) as f32;
+        self.center.1 -= rows as f32 * cell_h / view.scale / self.image.height().max(1) as f32;
+    }
+
+    /// Whether there's more of the image off to the left.
+    pub fn more_left(&self) -> bool {
+        self.view.as_ref().is_some_and(|(view, _)| view.crop.0 > 0)
     }
 }
 

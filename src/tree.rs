@@ -44,6 +44,9 @@ pub struct Tree {
     pub scroll_to_selected: bool,
     /// What's typed in the filter box, while it's open
     pub filter: Option<String>,
+    /// Rows marked for moving or deleting, and where a range of them starts
+    pub marks: HashSet<PathBuf>,
+    pub anchor: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     /// Everything under the root, read once for the filter
     everything: Option<Vec<(PathBuf, bool)>>,
@@ -61,6 +64,8 @@ impl Tree {
             show_hidden: false,
             scroll_to_selected: false,
             filter: None,
+            marks: HashSet::new(),
+            anchor: None,
             expanded: HashSet::new(),
             everything: None,
             archives: RefCell::default(),
@@ -83,6 +88,48 @@ impl Tree {
             self.selected = i;
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
+        // Only what's on view stays marked, so nothing hidden gets moved or deleted
+        let shown: HashSet<&PathBuf> = self.rows.iter().map(|r| &r.path).collect();
+        self.marks.retain(|p| shown.contains(p));
+    }
+
+    pub fn toggle_mark(&mut self, i: usize) {
+        let Some(row) = self.rows.get(i) else { return };
+        if !self.marks.remove(&row.path) {
+            self.marks.insert(row.path.clone());
+        }
+        self.anchor = Some(row.path.clone());
+    }
+
+    /// Marks the rows from the anchor to the selection.
+    pub fn mark_range(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let anchor = self.anchor.get_or_insert_with(|| row.path.clone()).clone();
+        let start = self.rows.iter().position(|r| r.path == anchor).unwrap_or(self.selected);
+        let (from, to) = (start.min(self.selected), start.max(self.selected));
+        self.marks = self.rows[from..=to].iter().map(|r| r.path.clone()).collect();
+    }
+
+    /// What a move or delete applies to: the marked rows in tree order, or else the
+    /// selected one.
+    pub fn marked_or_selected(&self) -> Vec<PathBuf> {
+        if self.marks.is_empty() {
+            return self.rows.get(self.selected).map(|r| r.path.clone()).into_iter().collect();
+        }
+        self.rows.iter().filter(|r| self.marks.contains(&r.path)).map(|r| r.path.clone()).collect()
+    }
+
+    /// Carries open folders and marks over to where something was moved or renamed.
+    pub fn renamed(&mut self, from: &Path, to: &Path) {
+        let moved = |set: &mut HashSet<PathBuf>| {
+            let paths: Vec<PathBuf> = set.iter().filter(|p| p.starts_with(from)).cloned().collect();
+            for path in paths {
+                set.remove(&path);
+                set.insert(to.join(path.strip_prefix(from).unwrap_or(Path::new(""))));
+            }
+        };
+        moved(&mut self.expanded);
+        moved(&mut self.marks);
     }
 
     fn list_into(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {

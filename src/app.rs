@@ -20,7 +20,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     archive,
     buffer::{Buffer, Loaded, Pos},
-    clipboard, external,
+    clipboard, external, fileops,
     gallery::{self, Gallery},
     git,
     highlight::{self, LineCache},
@@ -251,6 +251,10 @@ impl Doc {
         }
     }
 
+    fn scrolled_sideways(&self) -> bool {
+        if self.formatted() { self.fmt_left > 0 } else { !self.wrap && self.left > 0 }
+    }
+
     fn scroll_sideways(&mut self, delta: isize) {
         if self.formatted() {
             self.fmt_left = self.fmt_left.saturating_add_signed(delta);
@@ -408,6 +412,24 @@ struct Opened {
 enum Prompt {
     Unsaved(After),
     Search(String),
+    /// Yes or no to moving or deleting files
+    Confirm(Change),
+    /// A file's new name, being typed
+    Rename(PathBuf, String),
+}
+
+/// A change to files from the tree, waiting for a yes.
+enum Change {
+    Trash(Vec<PathBuf>),
+    Move(Vec<PathBuf>, PathBuf),
+}
+
+/// Where dragged tree rows would land.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Row(usize),
+    /// Below the last row: the folder at the top
+    Root,
 }
 
 /// What to do once unsaved changes are dealt with.
@@ -416,11 +438,19 @@ enum After {
     Open(PathBuf),
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Drag {
     None,
     Divider,
     Select,
+    /// A tree row pressed: a click if it's let go there, or else a move
+    Tree {
+        from: usize,
+        double: bool,
+        to: Option<Target>,
+    },
+    /// An image being moved around, last at this cell
+    Pan(u16, u16),
 }
 
 pub struct App {
@@ -802,12 +832,36 @@ impl App {
                 }
                 _ => self.prompt = Some(Prompt::Search(query)),
             },
+            Prompt::Confirm(change) => match key.code {
+                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.perform(change),
+                _ => self.say("Left as it was"),
+            },
+            Prompt::Rename(path, mut name) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.rename(path, &name),
+                KeyCode::Backspace => {
+                    name.pop();
+                    self.prompt = Some(Prompt::Rename(path, name));
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    name.push(c);
+                    self.prompt = Some(Prompt::Rename(path, name));
+                }
+                _ => self.prompt = Some(Prompt::Rename(path, name)),
+            },
         }
     }
 
     fn tree_key(&mut self, key: KeyEvent) {
         let page = self.tree_area.height.max(1) as isize;
         match key.code {
+            KeyCode::Up | KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.tree.marks.is_empty() {
+                    self.tree.anchor = self.tree.rows.get(self.tree.selected).map(|r| r.path.clone());
+                }
+                self.tree_move(if key.code == KeyCode::Up { -1 } else { 1 });
+                self.tree.mark_range();
+            }
             KeyCode::Up | KeyCode::Char('k') => self.tree_move(-1),
             KeyCode::Down | KeyCode::Char('j') => self.tree_move(1),
             KeyCode::PageUp => self.tree_move(-page),
@@ -822,6 +876,13 @@ impl App {
                 }
                 self.filtering = true;
             }
+            KeyCode::Char(' ') => {
+                self.tree.toggle_mark(self.tree.selected);
+                self.tree_move(1);
+            }
+            KeyCode::Delete => self.request_trash(),
+            KeyCode::F(2) => self.request_rename(),
+            KeyCode::Esc if !self.tree.marks.is_empty() => self.tree.marks.clear(),
             KeyCode::Esc if self.tree.filter.is_some() => self.tree.set_filter(None),
             KeyCode::Char('.') => {
                 self.tree.show_hidden = !self.tree.show_hidden;
@@ -1120,6 +1181,10 @@ impl App {
         if let Shown::Gallery(gallery) = &mut self.shown {
             let (across, rows) = (gallery.per_row as isize, gallery.rows_shown.max(1) as isize);
             match key.code {
+                // From the first of a row, back to the tree
+                KeyCode::Left | KeyCode::Char('h') if gallery.selected % gallery.per_row.max(1) == 0 => {
+                    self.focus = Focus::Tree;
+                }
                 KeyCode::Left | KeyCode::Char('h') => gallery.select(-1),
                 KeyCode::Right | KeyCode::Char('l') => gallery.select(1),
                 KeyCode::Up | KeyCode::Char('k') => gallery.select(-across),
@@ -1137,6 +1202,22 @@ impl App {
             return;
         }
         if matches!(key.code, KeyCode::Esc | KeyCode::Backspace) && self.back_to_gallery() {
+            return;
+        }
+        if let Shown::Image(image) = &mut self.shown {
+            let picture = &mut image.picture;
+            match key.code {
+                KeyCode::Char('+' | '=') => picture.zoom_by(1.25, None),
+                KeyCode::Char('-' | '_') => picture.zoom_by(0.8, None),
+                KeyCode::Char('0') => picture.reset(),
+                KeyCode::Left | KeyCode::Char('h') if picture.more_left() => picture.pan(-0.25, 0.0),
+                KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
+                KeyCode::Right | KeyCode::Char('l') => picture.pan(0.25, 0.0),
+                KeyCode::Up | KeyCode::Char('k') => picture.pan(0.0, -0.25),
+                KeyCode::Down | KeyCode::Char('j') => picture.pan(0.0, 0.25),
+                KeyCode::Char('q') => self.request_quit(),
+                _ => {}
+            }
             return;
         }
         let (page, width) = (self.page(), self.text_width());
@@ -1161,6 +1242,11 @@ impl App {
             }
             _ => {}
         }
+        // Nothing here uses ← itself, so it goes back to the tree
+        if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) && !matches!(self.shown, Shown::Doc(_)) {
+            self.focus = Focus::Tree;
+            return;
+        }
         let Some(doc) = self.doc() else { return };
         let p = page as isize;
         match key.code {
@@ -1170,7 +1256,8 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => doc.scroll(p, page, width),
             KeyCode::Home | KeyCode::Char('g') => doc.scroll_to(false, page, width),
             KeyCode::End | KeyCode::Char('G') => doc.scroll_to(true, page, width),
-            KeyCode::Left | KeyCode::Char('h') => doc.scroll_sideways(-4),
+            KeyCode::Left | KeyCode::Char('h') if doc.scrolled_sideways() => doc.scroll_sideways(-4),
+            KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
             KeyCode::Right | KeyCode::Char('l') => doc.scroll_sideways(4),
             KeyCode::Char('m') if doc.kind != Kind::Text => doc.toggle_raw(),
             _ => {}
@@ -1286,7 +1373,8 @@ impl App {
                 query.push_str(first_line);
                 self.search = (!query.is_empty()).then(|| query.clone());
             }
-            Some(Prompt::Unsaved(_)) => {}
+            Some(Prompt::Rename(_, name)) => name.push_str(first_line),
+            Some(Prompt::Unsaved(_) | Prompt::Confirm(_)) => {}
             None if self.focus == Focus::Tree && self.filtering => {
                 let query = format!("{}{first_line}", self.tree.filter.clone().unwrap_or_default());
                 self.tree.set_filter(Some(query));
@@ -1413,7 +1501,7 @@ impl App {
                 } else if self.tree_area.contains(at) {
                     self.focus = Focus::Tree;
                     self.filtering = false;
-                    self.tree_click(y, double);
+                    self.tree_press(y, double, mouse.modifiers);
                 } else if self.content_area.contains(at) {
                     self.focus = Focus::Content;
                     self.content_click(x, y, double, mouse.modifiers.contains(KeyModifiers::SHIFT));
@@ -1422,10 +1510,17 @@ impl App {
             MouseEventKind::Drag(MouseButton::Left) => match self.drag {
                 Drag::Divider => self.tree_width = x.max(8),
                 Drag::Select => self.drag_select(x, y),
+                Drag::Tree { from, double, .. } => self.tree_drag(from, double, y),
+                Drag::Pan(px, py) => {
+                    if let Shown::Image(image) = &mut self.shown {
+                        image.picture.drag(x as i32 - px as i32, y as i32 - py as i32);
+                    }
+                    self.drag = Drag::Pan(x, y);
+                }
                 Drag::None => {}
             },
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.drag == Drag::Select {
+            MouseEventKind::Up(MouseButton::Left) => match std::mem::replace(&mut self.drag, Drag::None) {
+                Drag::Select => {
                     // Like herdr's copy_on_select: a mouse selection is copied right away
                     let text = match &self.shown {
                         Shown::Doc(doc) => doc.buf.selected_text(),
@@ -1436,8 +1531,10 @@ impl App {
                         self.say(format!("Copied {} characters", text.chars().count()));
                     }
                 }
-                self.drag = Drag::None;
-            }
+                Drag::Tree { from, double, to: None } => self.tree_click(from, double),
+                Drag::Tree { from, to: Some(target), .. } => self.tree_drop(from, target),
+                _ => {}
+            },
             MouseEventKind::Down(MouseButton::Middle)
                 if self.prompt.is_none() && self.editing() && self.content_area.contains(at) =>
             {
@@ -1476,7 +1573,14 @@ impl App {
                 } else if self.content_area.contains(at) {
                     let (page, width) = (self.page(), self.text_width());
                     if let Shown::Gallery(gallery) = &mut self.shown {
-                        gallery.scroll(delta.signum());
+                        if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                            gallery.resize(if delta < 0 { 25 } else { -25 });
+                        } else {
+                            gallery.scroll(delta.signum());
+                        }
+                    } else if let Shown::Image(image) = &mut self.shown {
+                        // The wheel zooms, about the pointer
+                        image.picture.zoom_by(if delta < 0 { 1.25 } else { 0.8 }, Some((x, y)));
                     } else if let Some(doc) = self.doc() {
                         if sideways {
                             doc.scroll_sideways(delta * 2);
@@ -1513,8 +1617,194 @@ impl App {
         }
     }
 
-    fn tree_click(&mut self, y: u16, double: bool) {
-        let i = self.tree.scroll + (y - self.tree_area.y) as usize;
+    /// The tree row on screen line `y`, if there is one.
+    fn row_at(&self, y: u16) -> Option<usize> {
+        let i = self.tree.scroll + y.checked_sub(self.tree_area.y)? as usize;
+        (y < self.tree_area.bottom() && i < self.tree.rows.len()).then_some(i)
+    }
+
+    /// A button going down on the tree. Ctrl marks the row and Shift marks a range;
+    /// otherwise letting go decides between a click and a drag.
+    fn tree_press(&mut self, y: u16, double: bool, modifiers: KeyModifiers) {
+        let Some(i) = self.row_at(y) else {
+            self.tree.marks.clear();
+            return;
+        };
+        self.tree.selected = i;
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            self.tree.toggle_mark(i);
+        } else if modifiers.contains(KeyModifiers::SHIFT) {
+            self.tree.mark_range();
+        } else {
+            self.drag = Drag::Tree { from: i, double, to: None };
+        }
+    }
+
+    fn tree_drag(&mut self, from: usize, double: bool, y: u16) {
+        // Near the edges the tree scrolls
+        let (top, bottom) = (self.tree_area.y, self.tree_area.bottom());
+        if y < top {
+            self.tree.scroll = self.tree.scroll.saturating_sub(1);
+        } else if y >= bottom {
+            let max = self.tree.rows.len().saturating_sub(self.tree_area.height as usize);
+            self.tree.scroll = (self.tree.scroll + 1).min(max);
+        }
+        let to = match self.row_at(y.clamp(top, bottom.saturating_sub(1))) {
+            Some(i) if i == from => None,
+            Some(i) => Some(Target::Row(i)),
+            None => Some(Target::Root),
+        };
+        self.drag = Drag::Tree { from, double, to };
+        if let Some(target) = to {
+            let items = self.items_from(from);
+            match self.drop_dir(target) {
+                Some(dir) => self.say(format!("Drop to move {} into {}", describe(&items), self.dir_name(&dir))),
+                None => self.say("Can't move things there"),
+            }
+        }
+    }
+
+    /// What dragging row `from` carries: the marked rows if it's one of them, or else it.
+    fn items_from(&self, from: usize) -> Vec<PathBuf> {
+        match self.tree.rows.get(from) {
+            Some(row) if self.tree.marks.contains(&row.path) => self.tree.marked_or_selected(),
+            Some(row) => vec![row.path.clone()],
+            None => Vec::new(),
+        }
+    }
+
+    /// The folder a drop lands in: a folder's row, a file's folder, or the top.
+    fn drop_dir(&self, target: Target) -> Option<PathBuf> {
+        let dir = match target {
+            Target::Root => self.tree.root.clone(),
+            Target::Row(i) => {
+                let row = self.tree.rows.get(i)?;
+                if row.is_dir && !row.archive { row.path.clone() } else { row.path.parent()?.to_path_buf() }
+            }
+        };
+        // Folders inside archives aren't on disk
+        dir.is_dir().then_some(dir)
+    }
+
+    fn tree_drop(&mut self, from: usize, target: Target) {
+        let Some(dir) = self.drop_dir(target) else { return self.say("Can't move things there") };
+        let items: Vec<PathBuf> =
+            self.items_from(from).into_iter().filter(|p| p.parent() != Some(dir.as_path())).collect();
+        if items.is_empty() {
+            return self.say("Already there");
+        }
+        if let Some(problem) = self.unchangeable(&items) {
+            return self.say(problem);
+        }
+        self.prompt = Some(Prompt::Confirm(Change::Move(items, dir)));
+    }
+
+    /// Why these can't be moved, renamed or deleted, if they can't.
+    fn unchangeable(&self, items: &[PathBuf]) -> Option<String> {
+        if items.iter().any(|p| p.symlink_metadata().is_err()) {
+            return Some("Files inside archives can't be changed".into());
+        }
+        if items.contains(&self.tree.root) {
+            return Some("The folder at the top can't be changed here".into());
+        }
+        if let Shown::Doc(doc) = &self.shown
+            && doc.buf.dirty
+            && items.iter().any(|p| doc.path.starts_with(p))
+        {
+            return Some(format!("Save or discard the changes to {} first", file_name(&doc.path)));
+        }
+        None
+    }
+
+    fn request_trash(&mut self) {
+        let items = self.tree.marked_or_selected();
+        if items.is_empty() {
+            return;
+        }
+        match self.unchangeable(&items) {
+            Some(problem) => self.say(problem),
+            None => self.prompt = Some(Prompt::Confirm(Change::Trash(items))),
+        }
+    }
+
+    fn request_rename(&mut self) {
+        let Some(path) = self.tree.rows.get(self.tree.selected).map(|r| r.path.clone()) else { return };
+        match self.unchangeable(std::slice::from_ref(&path)) {
+            Some(problem) => self.say(problem),
+            None => self.prompt = Some(Prompt::Rename(path.clone(), file_name(&path))),
+        }
+    }
+
+    fn perform(&mut self, change: Change) {
+        self.gallery_stash = None;
+        match change {
+            Change::Trash(items) => match fileops::trash(&items) {
+                Ok(()) => {
+                    let gone = self.shown_path().filter(|shown| items.iter().any(|p| shown.starts_with(p)));
+                    if let Some(path) = gone.map(Path::to_path_buf) {
+                        self.shown = Shown::Note(path, "Moved to the trash".into());
+                    }
+                    self.say(format!("Moved {} to the trash", describe(&items)));
+                }
+                Err(e) => self.say(format!("{e:#}")),
+            },
+            Change::Move(items, dir) => {
+                let (moved, problem) = fileops::move_into(&items, &dir);
+                for (from, to) in &moved {
+                    self.tree.renamed(from, to);
+                    self.follow(from, to);
+                }
+                match problem {
+                    Some(e) if moved.is_empty() => self.say(format!("{e}")),
+                    Some(e) => self.say(format!("Moved {}, then stopped: {e}", describe(&items[..moved.len()]))),
+                    None => self.say(format!("Moved {} into {}", describe(&items), self.dir_name(&dir))),
+                }
+            }
+        }
+        self.tree.marks.clear();
+        self.tree.refresh();
+    }
+
+    fn rename(&mut self, path: PathBuf, name: &str) {
+        match fileops::rename(&path, name) {
+            Ok(to) => {
+                self.gallery_stash = None;
+                self.tree.renamed(&path, &to);
+                self.follow(&path, &to);
+                self.tree.marks.clear();
+                self.tree.refresh();
+                self.tree.reveal(&to);
+                self.say(format!("Renamed to {name}"));
+            }
+            Err(e) => self.say(format!("{e:#}")),
+        }
+    }
+
+    /// Keeps showing what was shown after it (or a folder it's in) moved.
+    fn follow(&mut self, from: &Path, to: &Path) {
+        let Some(rest) = self.shown_path().and_then(|shown| shown.strip_prefix(from).ok()) else { return };
+        let new = if rest.as_os_str().is_empty() { to.to_path_buf() } else { to.join(rest) };
+        let from_history = matches!(&self.shown, Shown::Doc(doc) if doc.source != Source::Disk);
+        if from_history {
+            return;
+        }
+        if let Shown::Doc(doc) = &mut self.shown {
+            doc.disk = disk_stamp(&new);
+            doc.path = new;
+        } else if let Shown::Gallery(_) = &self.shown {
+            self.shown = Shown::Nothing;
+            self.show_gallery(&new);
+        } else {
+            self.open(&new);
+        }
+    }
+
+    fn dir_name(&self, dir: &Path) -> String {
+        let rel = relative(dir, &self.tree.root);
+        if rel.is_empty() { tilde(dir) } else { format!("{rel}/") }
+    }
+
+    fn tree_click(&mut self, i: usize, double: bool) {
         let Some(row) = self.tree.rows.get(i) else { return };
         let (is_dir, path) = (row.is_dir, row.path.clone());
         self.tree.selected = i;
@@ -1555,6 +1845,15 @@ impl App {
     }
 
     fn content_click(&mut self, x: u16, y: u16, double: bool, shift: bool) {
+        if let Shown::Image(image) = &mut self.shown {
+            // A double-click fits it back in; otherwise a drag moves it around
+            if double {
+                image.picture.reset();
+            } else {
+                self.drag = Drag::Pan(x, y);
+            }
+            return;
+        }
         if let Shown::Gallery(gallery) = &mut self.shown {
             if let Some(i) = gallery.at(x, y) {
                 gallery.selected = i;
@@ -1697,11 +1996,22 @@ impl App {
                 style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
             }
             let selected = i == self.tree.selected;
-            let bar = if selected && focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            let mut bar =
+                if selected && focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
             if selected {
                 style = style.add_modifier(if focused { Modifier::REVERSED } else { Modifier::UNDERLINED });
             }
-            let mut spans = vec![Span::styled("  ".repeat(row.depth), bar)];
+            // Where a drag would drop
+            if matches!(self.drag, Drag::Tree { to: Some(Target::Row(t)), .. } if t == i) {
+                style = Style::new().fg(Color::Black).bg(Color::Green).add_modifier(Modifier::BOLD);
+                bar = style;
+            }
+            let mark = if self.tree.marks.contains(&row.path) {
+                Span::styled("●", Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled(" ", bar)
+            };
+            let mut spans = vec![mark, Span::styled("  ".repeat(row.depth), bar)];
             push_span(&mut spans, icon, style);
             // Where the filter's words match, in the name
             let hits: Vec<(usize, usize)> = words.iter().flat_map(|w| find_all(&row.name, w)).collect();
@@ -1861,9 +2171,16 @@ impl App {
                     format!(" Unsaved changes to {name}: s save · d discard · Esc cancel")
                 }
                 Prompt::Search(query) => format!(" /{query}"),
+                Prompt::Confirm(Change::Trash(items)) => {
+                    format!(" Move {} to the trash? y yes · n no", describe(items))
+                }
+                Prompt::Confirm(Change::Move(items, dir)) => {
+                    format!(" Move {} into {}? y yes · n no", describe(items), self.dir_name(dir))
+                }
+                Prompt::Rename(_, name) => format!(" Rename to: {name}"),
             };
             let style = Style::new().add_modifier(Modifier::BOLD);
-            if let Prompt::Search(_) = prompt {
+            if let Prompt::Search(_) | Prompt::Rename(..) = prompt {
                 f.set_cursor_position(Position::new(area.x + str_width(&text) as u16, area.y));
             }
             f.render_widget(Paragraph::new(Line::styled(text, style)), area);
@@ -1902,9 +2219,15 @@ impl App {
             }
             (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ open · Esc files · ⇥ view · q quit",
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
-            (_, Focus::Tree) => "↑↓ move · ⏎ open · ←→ fold · / filter · H history · ⇥ file · q quit",
+            (_, Focus::Tree) if !self.tree.marks.is_empty() => {
+                "Space mark · drag onto a folder to move · Del trash · Esc unmark"
+            }
+            (_, Focus::Tree) => "↑↓ move · ⏎ open · Space mark · Del trash · F2 rename · / filter · H history · q quit",
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
-            (Shown::Image(_), _) if self.gallery_stash.is_some() => "Esc back to the thumbnails · ⇥ tree · q quit",
+            (Shown::Image(_), _) if self.gallery_stash.is_some() => {
+                "wheel or +/- zoom · 0 fit · drag to move · Esc back to the thumbnails · ← tree"
+            }
+            (Shown::Image(_), _) => "wheel or +/- zoom · 0 fit · drag or arrows to move · ← tree · q quit",
             (Shown::Doc(doc), _) if doc.editing => {
                 "Esc done · ^S save · ^Z/^Y undo/redo · ^C ^X ^V copy/cut/paste · ^F find · Alt+Z wrap · ⇥ tree"
             }
@@ -2075,6 +2398,14 @@ fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
     f.render_widget(Paragraph::new(line).style(style), Rect::new(area.x, area.y, area.width, 1));
 }
 
+/// "notes.md", or "3 items".
+fn describe(items: &[PathBuf]) -> String {
+    match items {
+        [one] => file_name(one),
+        _ => format!("{} items", items.len()),
+    }
+}
+
 fn find_readme(dir: &Path) -> Option<PathBuf> {
     let mut names: Vec<PathBuf> = fs::read_dir(dir)
         .ok()?
@@ -2162,7 +2493,11 @@ mod tests {
         }
 
         fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
-            self.send(Event::Mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE }));
+            self.mouse_with(kind, x, y, KeyModifiers::NONE);
+        }
+
+        fn mouse_with(&mut self, kind: MouseEventKind, x: u16, y: u16, modifiers: KeyModifiers) {
+            self.send(Event::Mouse(MouseEvent { kind, column: x, row: y, modifiers }));
         }
 
         fn click(&mut self, x: u16, y: u16) {
@@ -2527,6 +2862,108 @@ mod tests {
         h.click(x + 2, y);
         assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
         assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
+    }
+
+    #[test]
+    fn marked_files_go_to_the_trash() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+        h.key(KeyCode::Char(' '));
+        h.key(KeyCode::Char(' '));
+        assert_eq!(h.screen().matches('●').count(), 2, "{}", h.screen());
+        h.key(KeyCode::Delete);
+        assert!(h.screen().contains("Move 2 items to the trash?"), "{}", h.screen());
+        h.key(KeyCode::Char('y'));
+        assert!(!h.root.join("a.txt").exists() && !h.root.join("b.txt").exists());
+        assert!(h.root.join("c.txt").exists());
+        // No leaves it alone
+        h.key(KeyCode::Delete);
+        assert!(h.screen().contains("Move c.txt to the trash?"), "{}", h.screen());
+        h.key(KeyCode::Char('n'));
+        assert!(h.root.join("c.txt").exists());
+    }
+
+    #[test]
+    fn ctrl_click_marks_rows() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+        for name in ["  a.txt", "  c.txt"] {
+            let (x, y) = h.find(name);
+            h.mouse_with(MouseEventKind::Down(MouseButton::Left), x + 2, y, KeyModifiers::CONTROL);
+            h.mouse_with(MouseEventKind::Up(MouseButton::Left), x + 2, y, KeyModifiers::CONTROL);
+        }
+        h.key(KeyCode::Delete);
+        assert!(h.screen().contains("Move 2 items to the trash?"), "{}", h.screen());
+        h.key(KeyCode::Esc);
+        assert!(h.root.join("a.txt").exists());
+    }
+
+    #[test]
+    fn renaming_the_open_file_follows_it() {
+        let mut h = Harness::new(&[("notes.txt", "hello\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::F(2));
+        assert!(h.screen().contains("Rename to: notes.txt"), "{}", h.screen());
+        for _ in 0..3 {
+            h.key(KeyCode::Backspace);
+        }
+        h.typing("md");
+        h.key(KeyCode::Enter);
+        assert!(h.root.join("notes.md").exists() && !h.root.join("notes.txt").exists());
+        // Edits are saved under the new name
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('e'));
+        h.typing("x");
+        h.key_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(fs::read_to_string(h.root.join("notes.md")).unwrap(), "xhello\n");
+        assert!(!h.root.join("notes.txt").exists());
+    }
+
+    #[test]
+    fn dragging_onto_a_folder_moves_files() {
+        let mut h = Harness::new(&[("sub/keep.txt", "k\n"), ("x.txt", "x\n")]);
+        let (x, from) = h.find("  x.txt");
+        let (_, to) = h.find("▸ sub");
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x + 2, from);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), x + 2, to);
+        assert!(h.screen().contains("Drop to move x.txt into sub/"), "{}", h.screen());
+        h.mouse(MouseEventKind::Up(MouseButton::Left), x + 2, to);
+        assert!(h.screen().contains("Move x.txt into sub/?"), "{}", h.screen());
+        h.key(KeyCode::Char('y'));
+        assert!(h.root.join("sub/x.txt").exists() && !h.root.join("x.txt").exists());
+    }
+
+    #[test]
+    fn left_goes_back_to_the_tree_unless_editing() {
+        let mut h = Harness::new(&[("a.txt", "abc\n")]);
+        h.key(KeyCode::Enter);
+        assert_eq!(h.app.focus, Focus::Content);
+        h.key(KeyCode::Left);
+        assert_eq!(h.app.focus, Focus::Tree);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.key(KeyCode::End);
+        h.key(KeyCode::Left);
+        assert_eq!(h.app.focus, Focus::Content);
+        assert_eq!(h.cursor().col, 2);
+    }
+
+    #[test]
+    fn images_zoom_with_the_wheel_and_keys() {
+        let h0 = Harness::new(&[]);
+        write_png(&h0.root.join("big.png"), 64, 48);
+        let mut h = Harness { app: App::new(&h0.root.join("big.png")).unwrap(), ..h0 };
+        h.draw();
+        let zoom = |h: &Harness| match &h.app.shown {
+            Shown::Image(image) => image.picture.zoom,
+            _ => panic!("no image shown"),
+        };
+        let area = h.app.content_area;
+        h.mouse(MouseEventKind::ScrollUp, area.x + area.width / 2, area.y + area.height / 2);
+        assert!(zoom(&h) > 1.0);
+        h.key(KeyCode::Char('0'));
+        assert_eq!(zoom(&h), 1.0);
+        h.key(KeyCode::Char('-'));
+        assert!(zoom(&h) < 1.0);
     }
 
     #[test]

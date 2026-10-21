@@ -20,6 +20,7 @@ image = "0.25"
 liblzma = "0.4"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm", "image-defaults"] }
 tar = "0.4"
+trash = "5"
 zip = { version = "9", default-features = false, features = ["deflate"] }
 zstd = "0.13"
 ignore = "0.4"

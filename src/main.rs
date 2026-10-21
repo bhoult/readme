@@ -6,6 +6,7 @@ mod archive;
 mod buffer;
 mod clipboard;
 mod external;
+mod fileops;
 mod gallery;
 mod git;
 mod highlight;
@@ -48,12 +49,16 @@ Keys
   Tab          switch between the tree and the file
   Tree         ↑↓/jk move · Enter open · ←→/hl fold · / filter by name
                . hidden files · r refresh · H git history
-  File         ↑↓ PgUp PgDn Home End scroll · / search, n/N next/prev
+               Space mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
+               F2 rename · drag marked files onto a folder to move them
+  File         ↑↓ PgUp PgDn Home End scroll · ← back to the tree
+               / search, n/N next/prev
                e edit · w word wrap · m raw/formatted (Markdown, CSV)
                y copy selection
   Editing      Esc stop · Ctrl+S save · Ctrl+Z/Ctrl+Y undo/redo
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
+  Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
   History      ↑↓ commits · Enter its files · d diff or file · a all files
                ←/Esc back · H leave
   Anywhere     Ctrl+Q quit (q when not editing)

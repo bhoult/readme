@@ -24,7 +24,8 @@ as they land.
   right, and the header row kept on screen as you scroll.
 - **Images** (PNG, JPEG, GIF, WebP, BMP, TIFF and more) show in the terminal:
   with real pixels where the terminal has a graphics protocol (Kitty, Sixel,
-  iTerm2), and with colored half-blocks anywhere else.
+  iTerm2), and with colored half-blocks anywhere else. The wheel (or `+` and
+  `-`) zooms, dragging or the arrow keys move around, and `0` fits it again.
 - **Archives**: zip files and tar files (plain, `.gz`, `.bz2`, `.xz`, `.zst`)
   open in the tree like directories, and the files inside them open like any
   other, without unpacking anything.
@@ -35,6 +36,10 @@ as they land.
   `Enter` on it, opens it in your browser or video player.
 - **Git history**: in a repository, `H` lists the commits. Open one to see the
   files it changed, each as it was at that commit or, with `d`, as a diff.
+- **Managing files**: mark files in the tree with `Space` or `Ctrl`+click
+  (`Shift`+`↑↓` for a range), then press `Delete` to send them to the trash or
+  drag them onto a folder to move them. `F2` renames. Both ask first, nothing
+  gets overwritten, and an open file follows its new name.
 - **Editing**: `e` starts editing and `Esc` stops. Selection, undo and redo,
   clipboard, auto-indent, and a prompt before unsaved changes would be lost.
 - **Live**: when something else changes the open file, it reloads. If you have
@@ -80,9 +85,11 @@ readme src/main.rs  # open a file, with its directory in the tree
 |---|---|
 | Anywhere | `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` quit |
 | Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `q` quit |
+| Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
-| File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
+| File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
+| Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` `Esc` back · `H` leave |
 
@@ -100,6 +107,10 @@ on, the arrow keys move by screen row.
   starts editing there. Middle-click pastes the primary selection while editing.
 - In the history, click a commit or file to show it, double-click to open it,
   and click the title to go back.
+- `Ctrl`+click marks files in the tree; drag a file, or marked files, onto a
+  folder to move them there.
+- On an image, the wheel zooms toward the pointer, dragging moves it, and a
+  double-click fits it again. Over thumbnails, `Ctrl`+wheel resizes them.
 - Drag the divider between the panes to resize the tree.
 
 ### Images and terminal multiplexers
