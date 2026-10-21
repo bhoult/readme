@@ -1,0 +1,38 @@
+[package]
+name = "readme"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "Terminal file viewer and basic editor: a directory tree on the left, the file on the right, mouse everywhere"
+license = "MIT"
+repository = "https://github.com/bhoult/readme"
+readme = "README.md"
+keywords = ["tui", "file-viewer", "markdown", "terminal", "editor"]
+categories = ["command-line-utilities", "text-editors"]
+publish = false
+
+[dependencies]
+anyhow = "1"
+bzip2 = "0.6"
+csv = "1"
+flate2 = "1"
+image = "0.25"
+liblzma = "0.4"
+ratatui-image = { version = "11.1", default-features = false, features = ["crossterm", "image-defaults"] }
+tar = "0.4"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+zstd = "0.13"
+ignore = "0.4"
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui = "0.30"
+syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+unicode-width = "0.2"
+base64 = "0.22"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = "thin"
+strip = true

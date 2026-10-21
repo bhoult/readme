@@ -1,0 +1,2415 @@
+//! The application: what's open, input handling, and drawing.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant, SystemTime},
+};
+
+use anyhow::{Context, Result};
+use ratatui::{
+    Frame,
+    crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind},
+    layout::{Position, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::Paragraph,
+};
+use ratatui_image::picker::Picker;
+
+use crate::{
+    archive,
+    buffer::{Buffer, Loaded, Pos},
+    clipboard, git,
+    highlight::{self, LineCache},
+    markdown::{self, Rendered},
+    picture::{self, Picture},
+    table,
+    text::{
+        char_at_col, display_col, find_all, line_spans, push_span, row_of, search, slice_line, str_width, wrap_points,
+    },
+    tree::Tree,
+};
+
+const MESSAGE_FOR: Duration = Duration::from_secs(4);
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+const TREE_REFRESH: Duration = Duration::from_secs(2);
+const WHEEL: isize = 3;
+
+fn dim() -> Style {
+    Style::new().add_modifier(Modifier::DIM)
+}
+
+fn match_style() -> Style {
+    Style::new().fg(Color::Black).bg(Color::Yellow)
+}
+
+fn selection_style() -> Style {
+    Style::new().add_modifier(Modifier::REVERSED)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Focus {
+    Tree,
+    Content,
+}
+
+/// How a file can be shown besides its plain text.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Text,
+    Markdown,
+    /// CSV or TSV, with its delimiter
+    Table(u8),
+}
+
+/// Where what's shown came from. Only files on disk get edited or reloaded.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Source {
+    Disk,
+    Archive,
+    History,
+}
+
+/// An open text file and how it's being shown.
+struct Doc {
+    path: PathBuf,
+    source: Source,
+    /// Title in place of the path (for a file from history, say)
+    label: Option<String>,
+    buf: Buffer,
+    colors: LineCache,
+    kind: Kind,
+    /// The plain text rather than the formatted view (Markdown, tables)
+    raw: bool,
+    editing: bool,
+    wrap: bool,
+    /// The source view's first line on screen, which of its wrapped rows is at the
+    /// top, and (when not wrapping) the first screen column
+    top: usize,
+    top_row: usize,
+    left: usize,
+    /// Column within a wrapped row, kept while moving up and down
+    wrap_x: Option<usize>,
+    /// The formatted view, with the buffer version, width and highlighting it was made for
+    rendered: Option<((u64, u16, bool), Rendered)>,
+    /// First formatted line below the pinned ones, and how far it's scrolled sideways
+    fmt_top: usize,
+    fmt_left: usize,
+    /// Source line to put at the top of the formatted view once it's rendered
+    fmt_sync: Option<usize>,
+    last_match: Option<Pos>,
+    /// Modification time and size when last read or saved
+    disk: (Option<SystemTime>, u64),
+    /// Changed on disk while it had unsaved changes here
+    disk_changed: bool,
+}
+
+fn disk_stamp(path: &Path) -> (Option<SystemTime>, u64) {
+    fs::metadata(path).map_or((None, 0), |m| (m.modified().ok(), m.len()))
+}
+
+impl Doc {
+    fn new(path: &Path, buf: Buffer, wrap: bool, source: Source, label: Option<String>) -> Self {
+        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let kind = match ext.as_str() {
+            "md" | "markdown" | "mdx" => Kind::Markdown,
+            ext => table::delimiter(ext).map_or(Kind::Text, Kind::Table),
+        };
+        Self {
+            path: path.into(),
+            source,
+            label,
+            colors: LineCache::new(path, &buf.lines),
+            buf,
+            kind,
+            raw: false,
+            editing: false,
+            wrap,
+            top: 0,
+            top_row: 0,
+            left: 0,
+            wrap_x: None,
+            rendered: None,
+            fmt_top: 0,
+            fmt_left: 0,
+            fmt_sync: None,
+            last_match: None,
+            disk: disk_stamp(path),
+            disk_changed: false,
+        }
+    }
+
+    /// Showing the formatted view rather than the text.
+    fn formatted(&self) -> bool {
+        self.kind != Kind::Text && !self.raw && !self.editing
+    }
+
+    fn render(&mut self, width: u16) -> &Rendered {
+        // Tables don't depend on the width, so resizing doesn't redo them
+        let width = if let Kind::Table(_) = self.kind { 0 } else { width };
+        let key = (self.buf.version, width, highlight::get().is_some());
+        if self.rendered.as_ref().is_none_or(|(k, _)| *k != key) {
+            let text = self.buf.lines.join("\n");
+            let rendered = match self.kind {
+                Kind::Table(delimiter) => table::render(&text, delimiter),
+                _ => markdown::render(&text, width),
+            };
+            self.rendered = Some((key, rendered));
+        }
+        let rendered = &self.rendered.as_ref().unwrap().1;
+        if let Some(line) = self.fmt_sync.take() {
+            self.fmt_top = rendered.line_for_src(line).max(rendered.pinned);
+        }
+        rendered
+    }
+
+    fn pinned(&self) -> usize {
+        self.rendered.as_ref().map_or(0, |(_, r)| r.pinned)
+    }
+
+    /// The source line shown at the top of the formatted view.
+    fn formatted_top_src(&self) -> usize {
+        self.rendered.as_ref().and_then(|(_, r)| r.src.get(self.fmt_top).copied()).unwrap_or(self.top)
+    }
+
+    /// Where each screen row of `line` starts: one row unless wrapping.
+    fn rows(&self, line: usize, width: usize) -> Vec<usize> {
+        if self.wrap { wrap_points(&self.buf.lines[line], width) } else { vec![0] }
+    }
+
+    /// `delta` screen rows on from (line, row), stopping at either end of the file.
+    fn step_rows(&self, mut at: (usize, usize), delta: isize, width: usize) -> (usize, usize) {
+        let last = self.buf.lines.len() - 1;
+        for _ in 0..delta.unsigned_abs() {
+            if delta > 0 {
+                if at.1 + 1 < self.rows(at.0, width).len() {
+                    at.1 += 1;
+                } else if at.0 < last {
+                    at = (at.0 + 1, 0);
+                } else {
+                    break;
+                }
+            } else if at.1 > 0 {
+                at.1 -= 1;
+            } else if at.0 > 0 {
+                at.0 -= 1;
+                at.1 = self.rows(at.0, width).len() - 1;
+            } else {
+                break;
+            }
+        }
+        at
+    }
+
+    /// The top that puts the end of the file at the bottom of the screen.
+    fn last_top(&self, height: usize, width: usize) -> (usize, usize) {
+        let mut left = height.max(1);
+        let mut line = self.buf.lines.len() - 1;
+        loop {
+            let rows = self.rows(line, width).len();
+            if rows >= left {
+                return (line, rows - left);
+            }
+            left -= rows;
+            if line == 0 {
+                return (0, 0);
+            }
+            line -= 1;
+        }
+    }
+
+    fn scroll(&mut self, delta: isize, height: usize, width: usize) {
+        if self.formatted() {
+            let pinned = self.pinned();
+            let len = self.rendered.as_ref().map_or(0, |(_, r)| r.lines.len());
+            let max = len.saturating_sub(height.saturating_sub(pinned)).max(pinned);
+            self.fmt_top = self.fmt_top.max(pinned).saturating_add_signed(delta).clamp(pinned, max);
+        } else if self.wrap {
+            let at = self.step_rows((self.top, self.top_row), delta, width);
+            (self.top, self.top_row) = at.min(self.last_top(height, width));
+        } else {
+            let max = self.buf.lines.len().saturating_sub(height);
+            self.top = self.top.saturating_add_signed(delta).min(max);
+        }
+    }
+
+    /// To the start or the end of the file.
+    fn scroll_to(&mut self, end: bool, height: usize, width: usize) {
+        if self.formatted() {
+            self.fmt_top = if end { usize::MAX } else { 0 };
+            // Clamped when drawn
+            self.scroll(0, height, width);
+        } else if !end {
+            (self.top, self.top_row) = (0, 0);
+        } else if self.wrap {
+            (self.top, self.top_row) = self.last_top(height, width);
+        } else {
+            self.top = self.buf.lines.len().saturating_sub(height);
+        }
+    }
+
+    fn scroll_sideways(&mut self, delta: isize) {
+        if self.formatted() {
+            self.fmt_left = self.fmt_left.saturating_add_signed(delta);
+        } else if !self.wrap {
+            self.left = self.left.saturating_add_signed(delta);
+        }
+    }
+
+    /// Scrolls so the cursor is on screen.
+    fn follow_cursor(&mut self, height: usize, width: usize) {
+        let cursor = self.buf.cursor;
+        if !self.wrap {
+            if cursor.line < self.top {
+                self.top = cursor.line;
+            } else if height > 0 && cursor.line >= self.top + height {
+                self.top = cursor.line + 1 - height;
+            }
+            let col = display_col(&self.buf.lines[cursor.line], cursor.col);
+            if col < self.left {
+                self.left = col;
+            } else if width > 0 && col >= self.left + width {
+                self.left = col + 1 - width;
+            }
+            return;
+        }
+        self.left = 0;
+        let at = (cursor.line, row_of(&self.rows(cursor.line, width), cursor.col));
+        if at < (self.top, self.top_row) {
+            (self.top, self.top_row) = at;
+        } else if cursor.line >= self.top + height
+            || self.step_rows((self.top, self.top_row), height as isize - 1, width) < at
+        {
+            // Put the cursor's row at the bottom
+            (self.top, self.top_row) = self.step_rows(at, -(height as isize - 1), width);
+        }
+    }
+
+    /// The buffer position under a screen cell of the source view.
+    fn pos_at(&self, area: Rect, gutter: u16, x: u16, y: u16, width: usize) -> Pos {
+        let dy = y.saturating_sub(area.y) as isize;
+        let (line, row) = if self.wrap {
+            self.step_rows((self.top, self.top_row), dy, width)
+        } else {
+            ((self.top + dy as usize).min(self.buf.lines.len() - 1), 0)
+        };
+        let text = &self.buf.lines[line];
+        let starts = self.rows(line, width);
+        let first = if self.wrap { display_col(text, starts[row]) } else { self.left };
+        let mut col = char_at_col(text, first + x.saturating_sub(area.x + gutter) as usize);
+        // Past the end of a wrapped row is its last character, not the next row
+        if let Some(&next) = starts.get(row + 1) {
+            col = col.min(next - 1);
+        }
+        Pos::new(line, col)
+    }
+
+    /// Up or down by screen rows when wrapping, by lines otherwise.
+    fn move_rows(&mut self, delta: isize, select: bool, width: usize) {
+        if !self.wrap {
+            return self.buf.vertical(delta, select);
+        }
+        let cursor = self.buf.cursor;
+        let starts = self.rows(cursor.line, width);
+        let row = row_of(&starts, cursor.col);
+        let text = &self.buf.lines[cursor.line];
+        let x = self.wrap_x.unwrap_or_else(|| display_col(text, cursor.col) - display_col(text, starts[row]));
+        let (line, row) = self.step_rows((cursor.line, row), delta, width);
+        let starts = self.rows(line, width);
+        let text = &self.buf.lines[line];
+        let mut col = char_at_col(text, display_col(text, starts[row]) + x);
+        if let Some(&next) = starts.get(row + 1) {
+            col = col.min(next - 1);
+        }
+        self.buf.move_to(Pos::new(line, col), select);
+        self.wrap_x = Some(x);
+    }
+
+    fn toggle_raw(&mut self) {
+        // A match's place is in formatted lines or source lines, not both
+        self.last_match = None;
+        if self.raw {
+            self.raw = false;
+            self.fmt_sync = Some(self.top);
+        } else {
+            (self.top, self.top_row) = (self.formatted_top_src(), 0);
+            self.raw = true;
+        }
+    }
+
+    fn stop_editing(&mut self) {
+        self.editing = false;
+        self.buf.anchor = None;
+        if self.kind != Kind::Text && !self.raw {
+            self.last_match = None;
+            self.fmt_sync = Some(self.top);
+        }
+    }
+
+    /// Re-reads the file after it changed on disk, keeping the place.
+    fn reload(&mut self) -> bool {
+        let Ok(Loaded::Text(mut buf)) = Buffer::load(&self.path) else { return false };
+        buf.cursor = buf.clamp(self.buf.cursor);
+        if buf.read_only.is_some() {
+            // start_editing is the only check, so leave edit mode rather than slip past it
+            self.editing = false;
+        }
+        self.colors = LineCache::new(&self.path, &buf.lines);
+        self.buf = buf;
+        self.top = self.top.min(self.buf.lines.len() - 1);
+        self.top_row = 0;
+        self.last_match = None;
+        true
+    }
+}
+
+enum Shown {
+    Nothing,
+    Note(PathBuf, String),
+    Doc(Box<Doc>),
+    Image(Box<ImageShown>),
+}
+
+struct ImageShown {
+    path: PathBuf,
+    source: Source,
+    label: Option<String>,
+    bytes: u64,
+    picture: Picture,
+}
+
+/// The left pane's history view: the commits that touched the folder, and the files
+/// of one of them once it's opened.
+struct History {
+    repo: PathBuf,
+    commits: Vec<git::Commit>,
+    selected: usize,
+    scroll: usize,
+    opened: Option<Opened>,
+    /// Files show as diffs rather than as they were
+    diff: bool,
+}
+
+struct Opened {
+    commit: usize,
+    /// Status letter (M, A, D, R; a space when listing all files) and path in the repo
+    files: Vec<(char, String)>,
+    /// Every file at the commit, not just the ones it changed
+    all: bool,
+    selected: usize,
+    scroll: usize,
+}
+
+enum Prompt {
+    Unsaved(After),
+    Search(String),
+}
+
+/// What to do once unsaved changes are dealt with.
+enum After {
+    Quit,
+    Open(PathBuf),
+}
+
+#[derive(PartialEq, Eq)]
+enum Drag {
+    None,
+    Divider,
+    Select,
+}
+
+pub struct App {
+    tree: Tree,
+    shown: Shown,
+    pub focus: Focus,
+    /// Keys go to the tree's filter box
+    filtering: bool,
+    /// Word wrap, for files opened from now on as well
+    wrap: bool,
+    /// The left pane shows git history instead of the files
+    history: Option<History>,
+    picker: Picker,
+    tree_width: u16,
+    prompt: Option<Prompt>,
+    message: Option<(String, Instant)>,
+    search: Option<String>,
+    drag: Drag,
+    last_click: Option<(Instant, u16, u16)>,
+    // Where things were drawn last, for the mouse
+    filter_area: Rect,
+    tree_area: Rect,
+    content_area: Rect,
+    divider_x: u16,
+    gutter: u16,
+    last_refresh: Instant,
+    pub quit: bool,
+}
+
+impl App {
+    /// Opens a directory, showing its README if it has one, or a file in its directory.
+    pub fn new(target: &Path) -> Result<Self> {
+        let target = target.canonicalize().with_context(|| format!("can't open {}", target.display()))?;
+        let (root, file) = if target.is_dir() {
+            (target.clone(), find_readme(&target))
+        } else {
+            (target.parent().map_or_else(|| PathBuf::from("/"), Path::to_path_buf), Some(target.clone()))
+        };
+        let mut app = Self {
+            tree: Tree::new(root),
+            shown: Shown::Nothing,
+            focus: Focus::Tree,
+            filtering: false,
+            wrap: false,
+            history: None,
+            picker: Picker::halfblocks(),
+            tree_width: 0,
+            prompt: None,
+            message: None,
+            search: None,
+            drag: Drag::None,
+            last_click: None,
+            filter_area: Rect::default(),
+            tree_area: Rect::default(),
+            content_area: Rect::default(),
+            divider_x: 0,
+            gutter: 0,
+            last_refresh: Instant::now(),
+            quit: false,
+        };
+        if let Some(file) = file {
+            app.tree.reveal(&file);
+            app.open(&file);
+            if !target.is_dir() {
+                app.focus = Focus::Content;
+            }
+        }
+        Ok(app)
+    }
+
+    fn doc(&mut self) -> Option<&mut Doc> {
+        match &mut self.shown {
+            Shown::Doc(doc) => Some(doc),
+            _ => None,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        matches!(&self.shown, Shown::Doc(doc) if doc.buf.dirty)
+    }
+
+    fn shown_path(&self) -> Option<&Path> {
+        match &self.shown {
+            Shown::Doc(doc) => Some(&doc.path),
+            Shown::Image(image) => Some(&image.path),
+            Shown::Note(path, _) => Some(path),
+            Shown::Nothing => None,
+        }
+    }
+
+    /// Showing `path` as it is now, not a version of it from history.
+    fn showing(&self, path: &Path) -> bool {
+        let source = match &self.shown {
+            Shown::Doc(doc) => Some(doc.source),
+            Shown::Image(image) => Some(image.source),
+            _ => None,
+        };
+        self.shown_path() == Some(path) && source != Some(Source::History)
+    }
+
+    /// How images are drawn, once the terminal has been asked. The image on screen, if
+    /// any, is drawn again the new way.
+    pub fn set_picker(&mut self, picker: Picker) {
+        self.picker = picker;
+        if let Shown::Image(image) = &self.shown
+            && image.source != Source::History
+        {
+            let path = image.path.clone();
+            self.open(&path);
+        }
+    }
+
+    /// Typing goes into the file.
+    pub fn editing(&self) -> bool {
+        self.focus == Focus::Content && matches!(&self.shown, Shown::Doc(doc) if doc.editing)
+    }
+
+    fn say(&mut self, message: impl Into<String>) {
+        self.message = Some((message.into(), Instant::now()));
+    }
+
+    fn page(&self) -> usize {
+        self.content_area.height.max(1) as usize
+    }
+
+    fn text_width(&self) -> usize {
+        self.content_area.width.saturating_sub(self.gutter).max(1) as usize
+    }
+
+    /// Width of the formatted view, which has a column of margin each side.
+    fn formatted_width(&self) -> usize {
+        self.content_area.width.saturating_sub(2).max(1) as usize
+    }
+
+    /// Opens a file on disk, or inside an archive.
+    fn open(&mut self, path: &Path) {
+        self.shown = if path.exists() {
+            if picture::is_image(path) {
+                let bytes = match fs::metadata(path) {
+                    Ok(m) if !m.is_file() => Err(anyhow::anyhow!("not a regular file")),
+                    Ok(m) if m.len() > 50 << 20 => Err(anyhow::anyhow!("too large ({})", human_size(m.len()))),
+                    _ => fs::read(path).map_err(Into::into),
+                };
+                self.show_bytes(path, bytes, Source::Disk, None)
+            } else {
+                match Buffer::load(path) {
+                    Ok(Loaded::Text(buf)) => Shown::Doc(Box::new(Doc::new(path, buf, self.wrap, Source::Disk, None))),
+                    Ok(Loaded::Binary(size)) => Shown::Note(path.into(), format!("Binary file, {}", human_size(size))),
+                    Ok(Loaded::TooBig(size)) => {
+                        Shown::Note(path.into(), format!("Too large to open ({})", human_size(size)))
+                    }
+                    Err(e) => Shown::Note(path.into(), format!("Can't open: {e}")),
+                }
+            }
+        } else if let Some((archive, entry)) = archive::split(path) {
+            self.show_bytes(path, archive::read(&archive, &entry), Source::Archive, None)
+        } else {
+            Shown::Note(path.into(), "Can't open: it isn't there any more".into())
+        };
+    }
+
+    /// What to show for a file read some other way than from disk: text, an image,
+    /// or a note saying why it can't be shown.
+    fn show_bytes(&self, path: &Path, bytes: Result<Vec<u8>>, source: Source, label: Option<String>) -> Shown {
+        let bytes = match bytes {
+            Ok(bytes) => bytes,
+            Err(e) => return Shown::Note(path.into(), format!("Can't open: {e}")),
+        };
+        let size = bytes.len() as u64;
+        if picture::is_image(path) {
+            let format = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
+            return match image::load_from_memory(&bytes) {
+                Ok(image) => Shown::Image(Box::new(ImageShown {
+                    path: path.into(),
+                    source,
+                    label,
+                    bytes: size,
+                    picture: Picture::new(image, &format, &self.picker),
+                })),
+                Err(e) => Shown::Note(path.into(), format!("Can't show this image: {e}")),
+            };
+        }
+        match Buffer::from_bytes(bytes) {
+            Loaded::Text(mut buf) => {
+                buf.read_only = buf.read_only.or(match source {
+                    Source::Disk => None,
+                    Source::Archive => Some("in an archive"),
+                    Source::History => Some("from history"),
+                });
+                Shown::Doc(Box::new(Doc::new(path, buf, self.wrap, source, label)))
+            }
+            Loaded::Binary(size) => Shown::Note(path.into(), format!("Binary file, {}", human_size(size))),
+            Loaded::TooBig(size) => Shown::Note(path.into(), format!("Too large to open ({})", human_size(size))),
+        }
+    }
+
+    /// Opens `path`, asking first what to do with unsaved changes.
+    fn request_open(&mut self, path: PathBuf) {
+        if self.showing(&path) {
+            return;
+        }
+        if self.dirty() {
+            self.prompt = Some(Prompt::Unsaved(After::Open(path)));
+        } else {
+            self.open(&path);
+        }
+    }
+
+    fn request_quit(&mut self) {
+        if self.dirty() {
+            self.prompt = Some(Prompt::Unsaved(After::Quit));
+        } else {
+            self.quit = true;
+        }
+    }
+
+    fn proceed(&mut self, after: After) {
+        match after {
+            After::Quit => self.quit = true,
+            After::Open(path) => self.open(&path),
+        }
+    }
+
+    fn save(&mut self) -> bool {
+        let Shown::Doc(doc) = &mut self.shown else { return false };
+        if !doc.buf.dirty {
+            self.say("No changes to save");
+            return true;
+        }
+        let result = doc.buf.save(&doc.path);
+        let name = file_name(&doc.path);
+        match result {
+            Ok(()) => {
+                doc.disk = disk_stamp(&doc.path);
+                doc.disk_changed = false;
+                self.say(format!("Saved {name}"));
+                true
+            }
+            Err(e) => {
+                self.say(format!("Couldn't save {name}: {e}"));
+                false
+            }
+        }
+    }
+
+    fn toggle_wrap(&mut self) {
+        self.wrap = !self.wrap;
+        let (wrap, page, width) = (self.wrap, self.page(), self.text_width());
+        if let Some(doc) = self.doc() {
+            doc.wrap = wrap;
+            (doc.top_row, doc.left, doc.wrap_x) = (0, 0, None);
+            if doc.editing {
+                doc.follow_cursor(page, width);
+            }
+        }
+        self.say(if wrap { "Word wrap on" } else { "Word wrap off" });
+    }
+
+    /// Picks up files changed by something else, such as an agent in the next pane.
+    pub fn tick(&mut self) {
+        if let Shown::Doc(doc) = &mut self.shown
+            && doc.source == Source::Disk
+        {
+            let stamp = disk_stamp(&doc.path);
+            if stamp.0.is_some() && stamp != doc.disk {
+                doc.disk = stamp;
+                // Unsaved changes stay, as does what's shown when the new contents can't be
+                // (binary, too big, unreadable); either way the header says it's out of date
+                if !doc.buf.dirty && doc.reload() {
+                    doc.disk_changed = false;
+                    self.say("Reloaded: the file changed on disk");
+                } else {
+                    doc.disk_changed = true;
+                }
+            }
+        }
+        if self.last_refresh.elapsed() >= TREE_REFRESH {
+            self.tree.rebuild();
+            self.last_refresh = Instant::now();
+        }
+    }
+
+    // Input
+
+    pub fn handle(&mut self, event: Event) {
+        match event {
+            Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
+            Event::Mouse(mouse) => self.mouse(mouse),
+            Event::Paste(text) => self.paste(&text),
+            _ => {}
+        }
+    }
+
+    fn key(&mut self, key: KeyEvent) {
+        if let Some(prompt) = self.prompt.take() {
+            return self.prompt_key(prompt, key);
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Char('q') if ctrl => return self.request_quit(),
+            KeyCode::Char('s') if ctrl => {
+                self.save();
+                return;
+            }
+            KeyCode::Char('z') if alt => return self.toggle_wrap(),
+            KeyCode::Tab | KeyCode::BackTab => {
+                self.filtering = false;
+                self.focus = if self.focus == Focus::Tree { Focus::Content } else { Focus::Tree };
+                return;
+            }
+            _ => {}
+        }
+        match self.focus {
+            Focus::Tree if self.history.is_some() => self.history_key(key),
+            Focus::Tree if self.filtering => self.filter_key(key),
+            Focus::Tree => self.tree_key(key),
+            Focus::Content if self.editing() => self.edit_key(key),
+            Focus::Content => self.view_key(key),
+        }
+    }
+
+    fn prompt_key(&mut self, prompt: Prompt, key: KeyEvent) {
+        match prompt {
+            Prompt::Unsaved(after) => match key.code {
+                KeyCode::Char('s' | 'y') => {
+                    if self.save() {
+                        self.proceed(after);
+                    }
+                }
+                KeyCode::Char('d' | 'n') => {
+                    if let Some(doc) = self.doc() {
+                        doc.buf.dirty = false;
+                    }
+                    self.proceed(after);
+                }
+                KeyCode::Esc | KeyCode::Char('c') => {
+                    // Put the tree back on the file that's still open
+                    if let Some(path) = self.shown_path().map(Path::to_path_buf) {
+                        self.tree.reveal(&path);
+                    }
+                }
+                _ => self.prompt = Some(Prompt::Unsaved(after)),
+            },
+            Prompt::Search(mut query) => match key.code {
+                KeyCode::Esc => self.search = None,
+                KeyCode::Enter => {
+                    self.search = (!query.is_empty()).then_some(query);
+                    if self.search.is_some() {
+                        self.count_matches();
+                        self.find(true, true);
+                    }
+                }
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.search = (!query.is_empty()).then(|| query.clone());
+                    self.prompt = Some(Prompt::Search(query));
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(c);
+                    self.search = Some(query.clone());
+                    self.prompt = Some(Prompt::Search(query));
+                }
+                _ => self.prompt = Some(Prompt::Search(query)),
+            },
+        }
+    }
+
+    fn tree_key(&mut self, key: KeyEvent) {
+        let page = self.tree_area.height.max(1) as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.tree_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.tree_move(1),
+            KeyCode::PageUp => self.tree_move(-page),
+            KeyCode::PageDown => self.tree_move(page),
+            KeyCode::Home | KeyCode::Char('g') => self.tree_move(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.tree_move(isize::MAX / 2),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.tree_activate(key.code == KeyCode::Enter),
+            KeyCode::Left | KeyCode::Char('h') => self.tree.collapse_or_parent(),
+            KeyCode::Char('/') => {
+                if self.tree.filter.is_none() {
+                    self.tree.set_filter(Some(String::new()));
+                }
+                self.filtering = true;
+            }
+            KeyCode::Esc if self.tree.filter.is_some() => self.tree.set_filter(None),
+            KeyCode::Char('.') => {
+                self.tree.show_hidden = !self.tree.show_hidden;
+                self.tree.refresh();
+                self.say(if self.tree.show_hidden {
+                    "Showing hidden and ignored files"
+                } else {
+                    "Hiding hidden and ignored files"
+                });
+            }
+            KeyCode::Char('r') | KeyCode::F(5) => self.tree.refresh(),
+            KeyCode::Char('H') => self.toggle_history(),
+            KeyCode::Char('q') => self.request_quit(),
+            _ => {}
+        }
+        self.tree.keep_visible(self.tree_area.height as usize);
+    }
+
+    // History
+
+    fn toggle_history(&mut self) {
+        if self.history.take().is_some() {
+            return self.say("Back to the files");
+        }
+        let Some(repo) = git::repo_root(&self.tree.root) else {
+            return self.say("This folder isn't in a git repository");
+        };
+        match git::log(&repo, &self.tree.root) {
+            Ok(commits) if commits.is_empty() => self.say("No commits here yet"),
+            Ok(commits) => {
+                self.history = Some(History { repo, commits, selected: 0, scroll: 0, opened: None, diff: false });
+                self.focus = Focus::Tree;
+                self.filtering = false;
+                self.history_preview();
+            }
+            Err(e) => self.say(format!("Couldn't read the history: {e}")),
+        }
+    }
+
+    /// Shows the selected commit, or the selected file of the opened commit, as it was
+    /// or as a diff.
+    fn history_preview(&mut self) {
+        let Some(h) = &self.history else { return };
+        let repo = h.repo.clone();
+        let (path, bytes, label) = match &h.opened {
+            None => {
+                let c = &h.commits[h.selected];
+                let label = format!(" {} {}", c.short, c.subject);
+                (repo.join(format!("{}.diff", c.short)), git::commit_text(&repo, &c.hash), label)
+            }
+            Some(opened) => {
+                let Some((status, file)) = opened.files.get(opened.selected) else { return };
+                let c = &h.commits[opened.commit];
+                if h.diff {
+                    let label = format!(" {file} · diff in {}", c.short);
+                    (repo.join(format!("{file}.diff")), git::file_diff(&repo, c, file), label)
+                } else if *status == 'D' {
+                    // A file the commit deleted, as it was just before
+                    let parent = c.parent.clone().unwrap_or_default();
+                    let label = format!(" {file} · before {} deleted it", c.short);
+                    (repo.join(file), git::show(&repo, &parent, file), label)
+                } else {
+                    (repo.join(file), git::show(&repo, &c.hash, file), format!(" {file} @ {}", c.short))
+                }
+            }
+        };
+        self.shown = self.show_bytes(&path, bytes, Source::History, Some(label));
+    }
+
+    fn history_key(&mut self, key: KeyEvent) {
+        let page = self.tree_area.height.max(1) as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.history_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.history_move(1),
+            KeyCode::PageUp => self.history_move(-page),
+            KeyCode::PageDown => self.history_move(page),
+            KeyCode::Home | KeyCode::Char('g') => self.history_move(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.history_move(isize::MAX / 2),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.history_enter(),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace | KeyCode::Esc => self.history_back(),
+            KeyCode::Char('d') => {
+                if let Some(h) = &mut self.history {
+                    h.diff = !h.diff;
+                    let diff = h.diff;
+                    self.history_preview();
+                    self.say(if diff { "Showing what each commit changed" } else { "Showing files as they were" });
+                }
+            }
+            KeyCode::Char('a') => self.history_all_files(),
+            KeyCode::Char('H') => self.toggle_history(),
+            KeyCode::Char('q') => self.request_quit(),
+            _ => {}
+        }
+    }
+
+    fn history_move(&mut self, delta: isize) {
+        let height = self.tree_area.height.max(1) as usize;
+        let Some(h) = &mut self.history else { return };
+        let (selected, scroll, len) = match &mut h.opened {
+            Some(o) => (&mut o.selected, &mut o.scroll, o.files.len()),
+            None => (&mut h.selected, &mut h.scroll, h.commits.len()),
+        };
+        if len == 0 {
+            return;
+        }
+        *selected = selected.saturating_add_signed(delta).min(len - 1);
+        if *selected < *scroll {
+            *scroll = *selected;
+        } else if *selected >= *scroll + height {
+            *scroll = *selected + 1 - height;
+        }
+        self.history_preview();
+    }
+
+    /// Opens the selected commit's files, or moves into the selected file.
+    fn history_enter(&mut self) {
+        let Some(h) = &mut self.history else { return };
+        if h.opened.is_some() {
+            self.focus = Focus::Content;
+            return;
+        }
+        match git::changes(&h.repo, &h.commits[h.selected]) {
+            Ok(changes) if changes.is_empty() => self.say("This commit changed no files"),
+            Ok(changes) => {
+                let files = changes.into_iter().map(|c| (c.status, c.path)).collect();
+                h.opened = Some(Opened { commit: h.selected, files, all: false, selected: 0, scroll: 0 });
+                self.history_preview();
+            }
+            Err(e) => self.say(format!("Couldn't read the commit: {e}")),
+        }
+    }
+
+    /// Back from a commit's files to the commits, or from the commits to the files on disk.
+    fn history_back(&mut self) {
+        let Some(h) = &mut self.history else { return };
+        if h.opened.take().is_some() {
+            self.history_preview();
+        } else {
+            self.history = None;
+            self.say("Back to the files");
+        }
+    }
+
+    /// Switches an opened commit between the files it changed and all of its files.
+    fn history_all_files(&mut self) {
+        let Some(h) = &mut self.history else { return };
+        let Some(opened) = &mut h.opened else { return };
+        let commit = &h.commits[opened.commit];
+        let changes = match git::changes(&h.repo, commit) {
+            Ok(changes) => changes,
+            Err(e) => return self.say(format!("Couldn't read the commit: {e}")),
+        };
+        let current = opened.files.get(opened.selected).map(|f| f.1.clone());
+        opened.all = !opened.all;
+        opened.files = if opened.all {
+            let status: std::collections::HashMap<&str, char> =
+                changes.iter().map(|c| (c.path.as_str(), c.status)).collect();
+            let mut files: Vec<(char, String)> = match git::files(&h.repo, &commit.hash) {
+                Ok(files) => files.into_iter().map(|f| (status.get(f.as_str()).copied().unwrap_or(' '), f)).collect(),
+                Err(e) => return self.say(format!("Couldn't list the files: {e}")),
+            };
+            files.extend(changes.iter().filter(|c| c.status == 'D').map(|c| ('D', c.path.clone())));
+            files.sort_by(|a, b| a.1.cmp(&b.1));
+            files
+        } else {
+            changes.into_iter().map(|c| (c.status, c.path)).collect()
+        };
+        opened.selected = current.and_then(|p| opened.files.iter().position(|f| f.1 == p)).unwrap_or(0);
+        opened.scroll = opened.selected.saturating_sub(self.tree_area.height as usize / 2);
+        let all = opened.all;
+        self.history_preview();
+        self.say(if all { "All files at this commit" } else { "Files this commit changed" });
+    }
+
+    /// Typing in the tree's filter box.
+    fn filter_key(&mut self, key: KeyEvent) {
+        let page = self.tree_area.height.max(1) as isize;
+        let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => {
+                self.filtering = false;
+                self.tree.set_filter(None);
+            }
+            KeyCode::Enter => {
+                self.filtering = false;
+                if self.tree.rows.get(self.tree.selected).is_some_and(|r| !r.is_dir || r.archive) {
+                    self.tree_activate(true);
+                }
+            }
+            KeyCode::Up => self.tree_move(-1),
+            KeyCode::Down => self.tree_move(1),
+            KeyCode::PageUp => self.tree_move(-page),
+            KeyCode::PageDown => self.tree_move(page),
+            KeyCode::Backspace | KeyCode::Char(_) => {
+                let mut query = self.tree.filter.clone().unwrap_or_default();
+                match key.code {
+                    KeyCode::Char(c) if plain => query.push(c),
+                    KeyCode::Backspace => {
+                        query.pop();
+                    }
+                    _ => return,
+                }
+                self.tree.set_filter(Some(query));
+                // The first file that matches, ready for Enter
+                if let Some(i) = self.tree.rows.iter().position(|r| !r.is_dir) {
+                    self.tree.selected = i;
+                }
+                self.tree.scroll = 0;
+            }
+            _ => {}
+        }
+        self.tree.keep_visible(self.tree_area.height as usize);
+    }
+
+    fn tree_move(&mut self, delta: isize) {
+        if self.tree.rows.is_empty() {
+            return;
+        }
+        self.tree.selected = self.tree.selected.saturating_add_signed(delta).min(self.tree.rows.len() - 1);
+        self.preview();
+    }
+
+    /// Shows the selected file as the selection moves, unless that would drop unsaved changes.
+    fn preview(&mut self) {
+        let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
+        if row.is_dir || self.dirty() || self.showing(&row.path) {
+            return;
+        }
+        let path = row.path.clone();
+        self.open(&path);
+    }
+
+    fn tree_activate(&mut self, enter: bool) {
+        let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
+        let (is_dir, archive, open, path) = (row.is_dir, row.archive, self.tree.is_open(row), row.path.clone());
+        if !is_dir {
+            self.request_open(path);
+            self.focus = Focus::Content;
+        } else if archive && self.tree.filter.is_some() {
+            // The filter doesn't look inside archives, so open it in the full tree
+            self.tree.set_filter(None);
+            if let Some(i) = self.tree.rows.iter().position(|r| r.path == path) {
+                self.tree.toggle(i);
+            }
+        } else if enter || !open {
+            self.tree.toggle(self.tree.selected);
+        } else {
+            self.tree_move(1);
+        }
+    }
+
+    fn view_key(&mut self, key: KeyEvent) {
+        let (page, width) = (self.page(), self.text_width());
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('q') => return self.request_quit(),
+            KeyCode::Char('e' | 'i') | KeyCode::Enter => return self.start_editing(None),
+            KeyCode::Char('/') => return self.prompt = Some(Prompt::Search(String::new())),
+            KeyCode::Char('f') if ctrl => return self.prompt = Some(Prompt::Search(String::new())),
+            KeyCode::Char('n') => return self.find(true, false),
+            KeyCode::Char('N') => return self.find(false, false),
+            KeyCode::Char('y') => return self.copy_selection(),
+            KeyCode::Char('c') if ctrl => return self.copy_selection(),
+            KeyCode::Char('w') => return self.toggle_wrap(),
+            KeyCode::Char('H') => return self.toggle_history(),
+            KeyCode::Esc => {
+                self.search = None;
+                if let Some(doc) = self.doc() {
+                    doc.buf.anchor = None;
+                }
+                return;
+            }
+            _ => {}
+        }
+        let Some(doc) = self.doc() else { return };
+        let p = page as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => doc.scroll(-1, page, width),
+            KeyCode::Down | KeyCode::Char('j') => doc.scroll(1, page, width),
+            KeyCode::PageUp | KeyCode::Char('b') => doc.scroll(-p, page, width),
+            KeyCode::PageDown | KeyCode::Char(' ') => doc.scroll(p, page, width),
+            KeyCode::Home | KeyCode::Char('g') => doc.scroll_to(false, page, width),
+            KeyCode::End | KeyCode::Char('G') => doc.scroll_to(true, page, width),
+            KeyCode::Left | KeyCode::Char('h') => doc.scroll_sideways(-4),
+            KeyCode::Right | KeyCode::Char('l') => doc.scroll_sideways(4),
+            KeyCode::Char('m') if doc.kind != Kind::Text => doc.toggle_raw(),
+            _ => {}
+        }
+    }
+
+    fn start_editing(&mut self, at: Option<Pos>) {
+        let (page, width) = (self.page(), self.text_width());
+        let Shown::Doc(doc) = &mut self.shown else { return };
+        if let Some(why) = doc.buf.read_only {
+            return self.say(format!("Can't edit this file: {why}"));
+        }
+        if doc.formatted() {
+            (doc.top, doc.top_row) = (doc.formatted_top_src(), 0);
+            doc.last_match = None;
+        }
+        doc.editing = true;
+        let cursor = doc.buf.cursor;
+        let on_screen = cursor.line >= doc.top && cursor.line < doc.top + page;
+        let pos = at.unwrap_or(if on_screen { cursor } else { Pos::new(doc.top, 0) });
+        doc.buf.move_to(pos, false);
+        doc.follow_cursor(page, width);
+        self.focus = Focus::Content;
+    }
+
+    fn edit_key(&mut self, key: KeyEvent) {
+        let (page, width) = (self.page(), self.text_width());
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if let (true, KeyCode::Char(c)) = (ctrl, key.code) {
+            return self.edit_command(c.to_ascii_lowercase(), shift);
+        }
+        let Some(doc) = self.doc() else { return };
+        if !matches!(key.code, KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown) {
+            doc.wrap_x = None;
+        }
+        let rows = page as isize;
+        match key.code {
+            KeyCode::Esc => return doc.stop_editing(),
+            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
+                doc.buf.insert(c.encode_utf8(&mut [0; 4]))
+            }
+            KeyCode::Enter => doc.buf.newline(),
+            KeyCode::Backspace => doc.buf.backspace(),
+            KeyCode::Delete => doc.buf.delete(),
+            KeyCode::Left => doc.buf.left(shift, ctrl),
+            KeyCode::Right => doc.buf.right(shift, ctrl),
+            KeyCode::Up => doc.move_rows(-1, shift, width),
+            KeyCode::Down => doc.move_rows(1, shift, width),
+            KeyCode::PageUp => doc.move_rows(-rows, shift, width),
+            KeyCode::PageDown => doc.move_rows(rows, shift, width),
+            KeyCode::Home if ctrl => doc.buf.move_to(Pos::default(), shift),
+            KeyCode::End if ctrl => doc.buf.move_to(doc.buf.end(), shift),
+            KeyCode::Home => doc.buf.home(shift),
+            KeyCode::End => doc.buf.line_end(shift),
+            _ => return,
+        }
+        doc.follow_cursor(page, width);
+    }
+
+    fn edit_command(&mut self, c: char, shift: bool) {
+        let (page, width) = (self.page(), self.text_width());
+        match c {
+            'c' => self.copy_selection(),
+            'x' => {
+                let cut = self.doc().and_then(|doc| doc.buf.cut());
+                match cut {
+                    Some(text) => {
+                        clipboard::copy(&text, false);
+                        self.say(format!("Cut {} characters", text.chars().count()));
+                    }
+                    None => self.say("Nothing selected"),
+                }
+            }
+            'v' => match clipboard::paste(false) {
+                Some(text) => self.insert_text(&text),
+                None => self.say("Nothing to paste"),
+            },
+            'f' => self.prompt = Some(Prompt::Search(String::new())),
+            'z' | 'y' | 'a' => {
+                let Some(doc) = self.doc() else { return };
+                let done = match c {
+                    'z' if !shift => doc.buf.undo(),
+                    'z' | 'y' => doc.buf.redo(),
+                    _ => {
+                        doc.buf.select_all();
+                        true
+                    }
+                };
+                doc.follow_cursor(page, width);
+                if !done {
+                    self.say(if c == 'z' && !shift { "Nothing to undo" } else { "Nothing to redo" });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn insert_text(&mut self, text: &str) {
+        let (page, width) = (self.page(), self.text_width());
+        if let Some(doc) = self.doc() {
+            doc.buf.insert(text);
+            doc.follow_cursor(page, width);
+        }
+    }
+
+    /// Text pasted through the terminal (bracketed paste).
+    fn paste(&mut self, text: &str) {
+        let first_line = text.lines().next().unwrap_or("");
+        match &mut self.prompt {
+            // Into the search box, not the file behind it; a search is one line
+            Some(Prompt::Search(query)) => {
+                query.push_str(first_line);
+                self.search = (!query.is_empty()).then(|| query.clone());
+            }
+            Some(Prompt::Unsaved(_)) => {}
+            None if self.focus == Focus::Tree && self.filtering => {
+                let query = format!("{}{first_line}", self.tree.filter.clone().unwrap_or_default());
+                self.tree.set_filter(Some(query));
+            }
+            None => {
+                if self.editing() {
+                    self.insert_text(text);
+                } else if matches!(self.shown, Shown::Doc(_)) {
+                    self.say("Press e to edit before pasting");
+                }
+            }
+        }
+    }
+
+    fn copy_selection(&mut self) {
+        let text = match &self.shown {
+            Shown::Doc(doc) => doc.buf.selected_text(),
+            _ => None,
+        };
+        match text {
+            Some(text) => {
+                clipboard::copy(&text, false);
+                self.say(format!("Copied {} characters", text.chars().count()));
+            }
+            None => self.say("Nothing selected; drag across text to select it"),
+        }
+    }
+
+    fn count_matches(&mut self) {
+        let Some(query) = self.search.clone() else { return };
+        let Some(doc) = self.doc() else { return };
+        let count: usize = if doc.formatted() {
+            let r = doc.rendered.as_ref().map(|(_, r)| r);
+            r.map_or(0, |r| (0..r.lines.len()).map(|i| find_all(&r.text(i), &query).len()).sum())
+        } else {
+            doc.buf.lines.iter().map(|l| find_all(l, &query).len()).sum()
+        };
+        self.say(match count {
+            0 => format!("No matches for “{query}”"),
+            1 => "1 match".to_string(),
+            n => format!("{n} matches · n next, N previous"),
+        });
+    }
+
+    /// Jumps to the next (or previous) match of the search. A `fresh` search starts
+    /// from the top of the screen.
+    fn find(&mut self, forward: bool, fresh: bool) {
+        let Some(query) = self.search.clone() else {
+            return self.say("Press / to search");
+        };
+        let (page, width, fmt_width) = (self.page(), self.text_width(), self.formatted_width());
+        let Some(doc) = self.doc() else { return };
+        let formatted = doc.formatted();
+        let top = if formatted { doc.fmt_top } else { doc.top };
+        let last = doc.last_match.filter(|m| !fresh && m.line >= top && m.line < top + page);
+        let (from, inclusive) = if doc.editing {
+            let from = if forward { doc.buf.cursor } else { doc.buf.selection().map_or(doc.buf.cursor, |s| s.0) };
+            // Forward from the end of the selected match, one starting right there is the next
+            (from, forward || doc.buf.selection().is_none())
+        } else {
+            match last {
+                Some(m) => (m, false),
+                None => (Pos::new(if formatted { 0 } else { top }, 0), forward),
+            }
+        };
+        let found = if formatted {
+            let r = doc.rendered.as_ref().map(|(_, r)| r);
+            let lines: Vec<String> = r.map_or(Vec::new(), |r| (0..r.lines.len()).map(|i| r.text(i)).collect());
+            search(&lines, &query, (from.line.max(if last.is_none() { top } else { 0 }), from.col), forward, inclusive)
+        } else {
+            search(&doc.buf.lines, &query, (from.line, from.col), forward, inclusive)
+        };
+        let Some((line, start, end)) = found else {
+            return self.say(format!("No matches for “{query}”"));
+        };
+        doc.last_match = Some(Pos::new(line, start));
+        if formatted {
+            let (pinned, gutter) = doc.rendered.as_ref().map_or((0, 0), |(_, r)| (r.pinned, r.gutter));
+            let body = page.saturating_sub(pinned);
+            if line >= pinned && (line < doc.fmt_top || line >= doc.fmt_top + body) {
+                doc.fmt_top = line.saturating_sub(body / 3).max(pinned);
+            }
+            // Tables also scroll sideways to it
+            let text = doc.rendered.as_ref().map(|(_, r)| r.text(line)).unwrap_or_default();
+            let col = str_width(&text.chars().take(start).collect::<String>());
+            let room = fmt_width.saturating_sub(gutter);
+            if col >= gutter && (col < gutter + doc.fmt_left || col >= gutter + doc.fmt_left + room) {
+                doc.fmt_left = (col - gutter).saturating_sub(room / 3);
+            }
+        } else if doc.editing {
+            doc.buf.move_to(Pos::new(line, start), false);
+            doc.buf.move_to(Pos::new(line, end), true);
+            doc.follow_cursor(page, width);
+        } else {
+            if line < doc.top || line >= doc.top + page {
+                (doc.top, doc.top_row) = (line.saturating_sub(page / 3), 0);
+            }
+            let col = display_col(&doc.buf.lines[line], start);
+            if !doc.wrap && (col < doc.left || col >= doc.left + width) {
+                doc.left = col.saturating_sub(width / 3);
+            }
+        }
+    }
+
+    fn mouse(&mut self, mouse: MouseEvent) {
+        let (x, y) = (mouse.column, mouse.row);
+        let at = Position::new(x, y);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if self.prompt.is_some() {
+                    return;
+                }
+                let double =
+                    self.last_click.is_some_and(|(t, cx, cy)| t.elapsed() < DOUBLE_CLICK && (cx, cy) == (x, y));
+                self.last_click = Some((Instant::now(), x, y));
+                if x == self.divider_x && y < self.content_area.bottom() {
+                    self.drag = Drag::Divider;
+                } else if self.history.is_some() && x < self.divider_x && y < self.content_area.bottom() {
+                    self.focus = Focus::Tree;
+                    self.history_click(y, double);
+                } else if self.filter_area.contains(at) {
+                    self.focus = Focus::Tree;
+                    self.filtering = true;
+                } else if self.tree_area.contains(at) {
+                    self.focus = Focus::Tree;
+                    self.filtering = false;
+                    self.tree_click(y, double);
+                } else if self.content_area.contains(at) {
+                    self.focus = Focus::Content;
+                    self.content_click(x, y, double, mouse.modifiers.contains(KeyModifiers::SHIFT));
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => match self.drag {
+                Drag::Divider => self.tree_width = x.max(8),
+                Drag::Select => self.drag_select(x, y),
+                Drag::None => {}
+            },
+            MouseEventKind::Up(MouseButton::Left) => {
+                if self.drag == Drag::Select {
+                    // Like herdr's copy_on_select: a mouse selection is copied right away
+                    let text = match &self.shown {
+                        Shown::Doc(doc) => doc.buf.selected_text(),
+                        _ => None,
+                    };
+                    if let Some(text) = text {
+                        clipboard::copy(&text, true);
+                        self.say(format!("Copied {} characters", text.chars().count()));
+                    }
+                }
+                self.drag = Drag::None;
+            }
+            MouseEventKind::Down(MouseButton::Middle)
+                if self.prompt.is_none() && self.editing() && self.content_area.contains(at) =>
+            {
+                let (area, gutter, width) = (self.content_area, self.gutter, self.text_width());
+                if let Some(doc) = self.doc() {
+                    let pos = doc.pos_at(area, gutter, x, y, width);
+                    doc.buf.move_to(pos, false);
+                }
+                if let Some(text) = clipboard::paste(true) {
+                    self.insert_text(&text);
+                }
+            }
+            MouseEventKind::ScrollUp
+            | MouseEventKind::ScrollDown
+            | MouseEventKind::ScrollLeft
+            | MouseEventKind::ScrollRight => {
+                let sideways = matches!(mouse.kind, MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight)
+                    || mouse.modifiers.contains(KeyModifiers::SHIFT);
+                let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft) {
+                    -WHEEL
+                } else {
+                    WHEEL
+                };
+                if self.tree_area.contains(at) && self.history.is_some() {
+                    let height = self.tree_area.height as usize;
+                    if let Some(h) = &mut self.history {
+                        let (scroll, len) = match &mut h.opened {
+                            Some(o) => (&mut o.scroll, o.files.len()),
+                            None => (&mut h.scroll, h.commits.len()),
+                        };
+                        *scroll = scroll.saturating_add_signed(delta).min(len.saturating_sub(height));
+                    }
+                } else if self.tree_area.contains(at) {
+                    let max = self.tree.rows.len().saturating_sub(self.tree_area.height as usize);
+                    self.tree.scroll = self.tree.scroll.saturating_add_signed(delta).min(max);
+                } else if self.content_area.contains(at) {
+                    let (page, width) = (self.page(), self.text_width());
+                    if let Some(doc) = self.doc() {
+                        if sideways {
+                            doc.scroll_sideways(delta * 2);
+                        } else {
+                            doc.scroll(delta, page, width);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A click in the history pane: its title goes back, a row selects (or with a
+    /// double-click, opens).
+    fn history_click(&mut self, y: u16, double: bool) {
+        if y < self.tree_area.y {
+            if self.history.as_ref().is_some_and(|h| h.opened.is_some()) {
+                self.history_back();
+            }
+            return;
+        }
+        let Some(h) = &self.history else { return };
+        let (scroll, selected) = match &h.opened {
+            Some(o) => (o.scroll, o.selected),
+            None => (h.scroll, h.selected),
+        };
+        let row = scroll + (y - self.tree_area.y) as usize;
+        if row != selected {
+            self.history_move(row as isize - selected as isize);
+        }
+        if double {
+            self.history_enter();
+        }
+    }
+
+    fn tree_click(&mut self, y: u16, double: bool) {
+        let i = self.tree.scroll + (y - self.tree_area.y) as usize;
+        let Some(row) = self.tree.rows.get(i) else { return };
+        let (is_dir, path) = (row.is_dir, row.path.clone());
+        self.tree.selected = i;
+        if is_dir {
+            // The second click of a double-click would fold it straight back
+            if !double {
+                self.tree.toggle(i);
+            }
+        } else {
+            self.request_open(path);
+            if double {
+                self.focus = Focus::Content;
+            }
+        }
+    }
+
+    fn content_click(&mut self, x: u16, y: u16, double: bool, shift: bool) {
+        let (area, gutter, width) = (self.content_area, self.gutter, self.text_width());
+        let Some(doc) = self.doc() else { return };
+        if doc.formatted() {
+            if double {
+                let dy = (y - area.y) as usize;
+                let pinned = doc.pinned();
+                let row = if dy < pinned { dy } else { doc.fmt_top + dy - pinned };
+                let line = doc.rendered.as_ref().and_then(|(_, r)| r.src.get(row).copied());
+                if let Some(line) = line {
+                    self.start_editing(Some(Pos::new(line, 0)));
+                }
+            }
+            return;
+        }
+        doc.wrap_x = None;
+        let pos = doc.pos_at(area, gutter, x, y, width);
+        if double {
+            if doc.editing {
+                doc.buf.select_word(pos);
+            } else {
+                self.start_editing(Some(pos));
+            }
+            return;
+        }
+        doc.buf.move_to(pos, shift);
+        if !shift {
+            doc.buf.anchor = Some(pos);
+        }
+        self.drag = Drag::Select;
+    }
+
+    fn drag_select(&mut self, x: u16, y: u16) {
+        let (area, gutter, page, width) = (self.content_area, self.gutter, self.page(), self.text_width());
+        let Some(doc) = self.doc() else { return };
+        if doc.formatted() || area.height == 0 {
+            return;
+        }
+        // Dragging past the top or bottom edge scrolls
+        if y < area.y {
+            doc.scroll(-1, page, width);
+        } else if y >= area.bottom() {
+            doc.scroll(1, page, width);
+        }
+        let pos = doc.pos_at(area, gutter, x, y.clamp(area.y, area.bottom() - 1), width);
+        doc.buf.cursor = pos;
+    }
+
+    // Drawing
+
+    pub fn draw(&mut self, f: &mut Frame) {
+        let area = f.area();
+        if area.width < 30 || area.height < 5 {
+            f.render_widget(Paragraph::new("Too small"), area);
+            return;
+        }
+        if self.tree_width == 0 {
+            self.tree_width = (area.width * 3 / 10).clamp(16, 40);
+        }
+        self.tree_width = self.tree_width.clamp(8, area.width - 20);
+        let (tw, body) = (self.tree_width, area.height - 1);
+        let filter = u16::from(self.tree.filter.is_some() && self.history.is_none());
+        self.divider_x = area.x + tw;
+        self.filter_area = Rect::new(area.x, area.y + 1, tw, filter);
+        self.tree_area = Rect::new(area.x, area.y + 1 + filter, tw, body - 1 - filter);
+        self.content_area = Rect::new(self.divider_x + 1, area.y + 1, area.width - tw - 1, body - 1);
+
+        if self.history.is_some() {
+            self.draw_history(f, Rect::new(area.x, area.y, tw, 1));
+        } else {
+            self.draw_tree(f, Rect::new(area.x, area.y, tw, 1));
+        }
+        let divider = if self.drag == Drag::Divider { Style::new().add_modifier(Modifier::BOLD) } else { dim() };
+        let bar: Vec<Line> = (0..body).map(|_| Line::styled("│", divider)).collect();
+        f.render_widget(Paragraph::new(bar), Rect::new(self.divider_x, area.y, 1, body));
+        self.draw_content(f, Rect::new(self.divider_x + 1, area.y, area.width - tw - 1, body));
+        self.draw_status(f, Rect::new(area.x, area.y + body, area.width, 1));
+    }
+
+    fn draw_tree(&mut self, f: &mut Frame, header_area: Rect) {
+        let focused = self.focus == Focus::Tree;
+        let flag = if self.tree.show_hidden { "all " } else { "" };
+        header(f, header_area, &format!(" {}", tilde(&self.tree.root)), flag, focused);
+
+        let words: Vec<String> = match &self.tree.filter {
+            Some(query) => {
+                let typing = focused && self.filtering;
+                let area = self.filter_area;
+                let files = self.tree.rows.iter().filter(|r| !r.is_dir).count();
+                let count = if self.tree.filtering() { format!("{files} ") } else { String::new() };
+                let room = (area.width as usize).saturating_sub(3 + str_width(&count));
+                let shown: String = query.chars().rev().take(room).collect::<Vec<_>>().into_iter().rev().collect();
+                let pad = room.saturating_sub(str_width(&shown));
+                let style = if typing { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
+                let line = Line::from(vec![
+                    Span::styled(" / ", Style::new().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                    Span::styled(shown.clone(), style),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(count, dim()),
+                ]);
+                f.render_widget(Paragraph::new(line), area);
+                if typing {
+                    f.set_cursor_position(Position::new(area.x + 3 + str_width(&shown) as u16, area.y));
+                }
+                query.split_whitespace().map(str::to_string).collect()
+            }
+            None => Vec::new(),
+        };
+
+        let list = self.tree_area;
+        let height = list.height as usize;
+        if std::mem::take(&mut self.tree.scroll_to_selected) {
+            self.tree.keep_visible(height);
+        }
+        self.tree.scroll = self.tree.scroll.min(self.tree.rows.len().saturating_sub(height));
+        let open = self.shown_path();
+        let mut lines = Vec::new();
+        for (i, row) in self.tree.rows.iter().enumerate().skip(self.tree.scroll).take(height) {
+            let icon = match (row.is_dir, self.tree.is_open(row)) {
+                (true, true) => "▾ ",
+                (true, false) => "▸ ",
+                _ => "  ",
+            };
+            let mut style = if row.archive {
+                Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD)
+            } else if row.is_dir {
+                Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)
+            } else if row.name.starts_with('.') {
+                dim()
+            } else {
+                Style::new()
+            };
+            if open == Some(row.path.as_path()) {
+                style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+            }
+            let selected = i == self.tree.selected;
+            let bar = if selected && focused { Style::new().add_modifier(Modifier::REVERSED) } else { Style::new() };
+            if selected {
+                style = style.add_modifier(if focused { Modifier::REVERSED } else { Modifier::UNDERLINED });
+            }
+            let mut spans = vec![Span::styled("  ".repeat(row.depth), bar)];
+            push_span(&mut spans, icon, style);
+            // Where the filter's words match, in the name
+            let hits: Vec<(usize, usize)> = words.iter().flat_map(|w| find_all(&row.name, w)).collect();
+            let hit = style.fg(Color::Magenta).add_modifier(Modifier::BOLD);
+            for (idx, c) in row.name.chars().enumerate() {
+                let matched = hits.iter().any(|&(s, e)| idx >= s && idx < e);
+                push_span(&mut spans, c.encode_utf8(&mut [0; 4]), if matched { hit } else { style });
+            }
+            let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
+            spans.push(Span::styled(" ".repeat((list.width as usize).saturating_sub(used)), bar));
+            lines.push(Line::from(spans));
+        }
+        if self.tree.rows.is_empty() {
+            let note = if self.tree.filtering() { "  (no matches)" } else { "  (empty)" };
+            lines.push(Line::styled(note, dim()));
+        }
+        f.render_widget(Paragraph::new(lines), list);
+    }
+
+    fn draw_history(&mut self, f: &mut Frame, header_area: Rect) {
+        let focused = self.focus == Focus::Tree;
+        let list = self.tree_area;
+        let (height, width) = (list.height as usize, list.width as usize);
+        let Some(h) = &mut self.history else { return };
+        let mut lines = Vec::new();
+        let row_style = |selected: bool| match (selected, focused) {
+            (true, true) => Style::new().add_modifier(Modifier::REVERSED),
+            (true, false) => Style::new().add_modifier(Modifier::UNDERLINED),
+            _ => Style::new(),
+        };
+        match &mut h.opened {
+            None => {
+                let name = h.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                header(f, header_area, &format!(" ⎇ {name} history"), &format!("{} ", h.commits.len()), focused);
+                h.scroll = h.scroll.min(h.commits.len().saturating_sub(height));
+                for (i, c) in h.commits.iter().enumerate().skip(h.scroll).take(height) {
+                    let base = row_style(i == h.selected);
+                    let age = git::age(c.time);
+                    let room = width.saturating_sub(c.short.len() + age.len() + 3);
+                    let subject: String = c.subject.chars().take(room).collect();
+                    let pad = room.saturating_sub(str_width(&subject));
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {} ", c.short), base.fg(Color::Yellow)),
+                        Span::styled(subject, base),
+                        Span::styled(" ".repeat(pad + 1), base),
+                        Span::styled(age, base.add_modifier(Modifier::DIM)),
+                    ]));
+                }
+            }
+            Some(o) => {
+                let c = &h.commits[o.commit];
+                let what = if o.all { "all files " } else { "" };
+                // The subject gives way, not the hash
+                let room = width.saturating_sub(c.short.len() + str_width(what) + 5);
+                let subject = if str_width(&c.subject) > room {
+                    format!("{}…", c.subject.chars().take(room.saturating_sub(1)).collect::<String>())
+                } else {
+                    c.subject.clone()
+                };
+                header(f, header_area, &format!(" ◂ {} {subject}", c.short), what, focused);
+                o.scroll = o.scroll.min(o.files.len().saturating_sub(height));
+                for (i, (status, path)) in o.files.iter().enumerate().skip(o.scroll).take(height) {
+                    let base = row_style(i == o.selected);
+                    let color = match status {
+                        'A' => Color::Green,
+                        'D' => Color::Red,
+                        'R' | 'C' => Color::Cyan,
+                        ' ' => Color::Reset,
+                        _ => Color::Yellow,
+                    };
+                    let text = path.as_str();
+                    let room = width.saturating_sub(4);
+                    // Long paths keep their end
+                    let skip = str_width(text).saturating_sub(room);
+                    let shown: String = text.chars().skip(skip).collect();
+                    let pad = room.saturating_sub(str_width(&shown));
+                    let path_style = if *status == ' ' { base.add_modifier(Modifier::DIM) } else { base };
+                    lines.push(Line::from(vec![
+                        Span::styled(format!(" {status} "), base.fg(color).add_modifier(Modifier::BOLD)),
+                        Span::styled(shown, path_style),
+                        Span::styled(" ".repeat(pad + 1), base),
+                    ]));
+                }
+            }
+        }
+        f.render_widget(Paragraph::new(lines), list);
+    }
+
+    fn draw_content(&mut self, f: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Content;
+        let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        let root = self.tree.root.clone();
+        let search = self.search.clone();
+        match &mut self.shown {
+            Shown::Nothing => {
+                header(f, area, " readme", "", focused);
+                f.render_widget(Paragraph::new(Line::styled("  Pick a file on the left.", dim())), body);
+            }
+            Shown::Note(path, note) => {
+                header(f, area, &format!(" {}", relative(path, &root)), "", focused);
+                f.render_widget(Paragraph::new(Line::styled(format!("  {note}"), dim())), body);
+            }
+            Shown::Image(image) => {
+                let title = image.label.clone().unwrap_or_else(|| format!(" {}", relative(&image.path, &root)));
+                header(f, area, &title, &format!("{} · {} ", image.picture.info, human_size(image.bytes)), focused);
+                image.picture.draw(f, body);
+            }
+            Shown::Doc(doc) => {
+                let mut flags = Vec::new();
+                if doc.disk_changed {
+                    flags.push("changed on disk");
+                }
+                if let Some(why) = doc.buf.read_only {
+                    flags.push(why);
+                }
+                if doc.kind != Kind::Text && !doc.editing {
+                    flags.push(match (doc.raw, doc.kind) {
+                        (true, _) => "raw",
+                        (false, Kind::Table(_)) => "table",
+                        _ => "rendered",
+                    });
+                }
+                if doc.wrap && !doc.formatted() {
+                    flags.push("wrap");
+                }
+                let dirty = if doc.buf.dirty { " ●" } else { "" };
+                let title = match &doc.label {
+                    Some(label) => label.clone(),
+                    None => format!(" {}{dirty}", relative(&doc.path, &root)),
+                };
+                let flags = if flags.is_empty() { String::new() } else { format!("{} ", flags.join(" · ")) };
+                header(f, area, &title, &flags, focused);
+                if doc.formatted() {
+                    draw_formatted(f, doc, body, search.as_deref());
+                } else {
+                    self.gutter = draw_source(f, doc, body, focused, search.as_deref());
+                }
+            }
+        }
+    }
+
+    fn draw_status(&mut self, f: &mut Frame, area: Rect) {
+        if let Some(prompt) = &self.prompt {
+            let text = match prompt {
+                Prompt::Unsaved(_) => {
+                    let name = self.shown_path().map(file_name).unwrap_or_default();
+                    format!(" Unsaved changes to {name}: s save · d discard · Esc cancel")
+                }
+                Prompt::Search(query) => format!(" /{query}"),
+            };
+            let style = Style::new().add_modifier(Modifier::BOLD);
+            if let Prompt::Search(_) = prompt {
+                f.set_cursor_position(Position::new(area.x + str_width(&text) as u16, area.y));
+            }
+            f.render_widget(Paragraph::new(Line::styled(text, style)), area);
+            return;
+        }
+        let (mode, color) = match self.focus {
+            Focus::Tree if self.history.is_some() => (" GIT ", Color::Magenta),
+            Focus::Tree => (" TREE ", Color::Blue),
+            Focus::Content if self.editing() => (" EDIT ", Color::Green),
+            Focus::Content => (" VIEW ", Color::Cyan),
+        };
+        let message = self.message.as_ref().filter(|(_, at)| at.elapsed() < MESSAGE_FOR).map(|(m, _)| m.clone());
+        let (text, text_style) = match message {
+            Some(m) => (m, Style::new().add_modifier(Modifier::BOLD)),
+            None => (self.hints().to_string(), dim()),
+        };
+        let position = self.position();
+        let room = (area.width as usize).saturating_sub(mode.len() + position.len() + 3);
+        let text: String = text.chars().take(room).collect();
+        let pad = room.saturating_sub(str_width(&text));
+        let line = Line::from(vec![
+            Span::styled(mode, Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)),
+            Span::raw(" "),
+            Span::styled(text, text_style),
+            Span::raw(" ".repeat(pad + 1)),
+            Span::styled(position, dim()),
+            Span::raw(" "),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+    }
+
+    fn hints(&self) -> &'static str {
+        match (&self.shown, self.focus) {
+            (_, Focus::Tree) if self.history.as_ref().is_some_and(|h| h.opened.is_some()) => {
+                "↑↓ files · d diff/file · a all files · ← commits · ⇥ view · q quit"
+            }
+            (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ open · Esc files · ⇥ view · q quit",
+            (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
+            (_, Focus::Tree) => "↑↓ move · ⏎ open · ←→ fold · / filter · H history · ⇥ file · q quit",
+            (Shown::Doc(doc), _) if doc.editing => {
+                "Esc done · ^S save · ^Z/^Y undo/redo · ^C ^X ^V copy/cut/paste · ^F find · Alt+Z wrap · ⇥ tree"
+            }
+            // Dragging selects only in the source view
+            (Shown::Doc(doc), _) if doc.formatted() && doc.kind == Kind::Markdown => {
+                "e edit · / find · m raw/rendered · ⇥ tree · q quit"
+            }
+            (Shown::Doc(doc), _) if doc.formatted() => "e edit · / find · ←→ scroll · m raw/table · ⇥ tree · q quit",
+            (Shown::Doc(doc), _) if doc.kind != Kind::Text => {
+                "e edit · / find · w wrap · m formatted · drag to copy · ⇥ tree · q quit"
+            }
+            _ => "e edit · / find · w wrap · drag to copy · ⇥ tree · q quit",
+        }
+    }
+
+    fn position(&self) -> String {
+        let Shown::Doc(doc) = &self.shown else { return String::new() };
+        if self.editing() {
+            let c = doc.buf.cursor;
+            return format!("Ln {}, Col {}", c.line + 1, display_col(&doc.buf.lines[c.line], c.col) + 1);
+        }
+        let (top, total) = if doc.formatted() {
+            (
+                doc.fmt_top - doc.pinned().min(doc.fmt_top),
+                doc.rendered.as_ref().map_or(0, |(_, r)| r.lines.len() - r.pinned),
+            )
+        } else {
+            (doc.top, doc.buf.lines.len())
+        };
+        let bottom = (top + self.page()).min(total);
+        if top == 0 && bottom >= total { "All".into() } else { format!("{}%", bottom * 100 / total.max(1)) }
+    }
+}
+
+/// Draws rendered Markdown or a table: any pinned header lines, then the rest from
+/// `fmt_top`, scrolled sideways past the gutter.
+fn draw_formatted(f: &mut Frame, doc: &mut Doc, area: Rect, search: Option<&str>) {
+    let text = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), area.height);
+    let height = area.height as usize;
+    doc.render(text.width);
+    let Some((_, rendered)) = &doc.rendered else { return };
+    let pinned = rendered.pinned.min(height);
+    let body = height - pinned;
+    let max_top = rendered.lines.len().saturating_sub(body).max(rendered.pinned);
+    doc.fmt_top = doc.fmt_top.clamp(rendered.pinned, max_top);
+    doc.fmt_left = doc.fmt_left.min(rendered.width.saturating_sub(text.width as usize));
+    let (top, left, gutter) = (doc.fmt_top, doc.fmt_left, rendered.gutter);
+    let lines: Vec<Line> = rendered.lines[..pinned]
+        .iter()
+        .chain(rendered.lines.iter().skip(top).take(body))
+        .map(|line| {
+            let line = slice_line(line, gutter, left);
+            match search {
+                Some(q) => markdown::mark_matches(&line, q, match_style()),
+                None => line,
+            }
+        })
+        .collect();
+    f.render_widget(Paragraph::new(lines), text);
+}
+
+/// Draws the file with line numbers, wrapped or scrolled sideways; returns the gutter width.
+fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: Option<&str>) -> u16 {
+    if let Some(line) = doc.buf.changed_from.take() {
+        doc.colors.invalidate(line);
+    }
+    let total = doc.buf.lines.len();
+    let height = area.height as usize;
+    let digits = total.to_string().len();
+    let gutter = digits as u16 + 2;
+    let width = area.width.saturating_sub(gutter).max(1) as usize;
+    doc.top = doc.top.min(total - 1);
+    if !doc.wrap {
+        doc.top_row = 0;
+    }
+
+    // The screen rows: (line, row within it, first char, first char of the next row)
+    let mut rows = Vec::with_capacity(height);
+    let (mut line, mut row) = (doc.top, doc.top_row);
+    while rows.len() < height && line < total {
+        let starts = doc.rows(line, width);
+        for r in row.min(starts.len() - 1)..starts.len() {
+            if rows.len() == height {
+                break;
+            }
+            rows.push((line, r, starts[r], starts.get(r + 1).copied()));
+        }
+        line += 1;
+        row = 0;
+    }
+    let bottom = rows.last().map_or(doc.top, |r| r.0 + 1);
+    doc.colors.ensure(&doc.buf.lines, bottom);
+
+    let selection = doc.buf.selection();
+    let current = doc.last_match;
+    let mut lines = Vec::with_capacity(height);
+    for &(i, r, start, next) in &rows {
+        let text = &doc.buf.lines[i];
+        let number = if r > 0 { " ".repeat(digits + 2) } else { format!("{:>digits$}  ", i + 1) };
+        let number_style = if doc.editing && i == doc.buf.cursor.line { Style::new().fg(Color::Yellow) } else { dim() };
+        let mut marks = Vec::new();
+        if let Some(q) = search {
+            for (s, e) in find_all(text, q) {
+                let style = if current == Some(Pos::new(i, s)) {
+                    match_style().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
+                } else {
+                    match_style()
+                };
+                marks.push((s, e, style));
+            }
+        }
+        if let Some((s, e)) = selection.filter(|(s, e)| (s.line..=e.line).contains(&i)) {
+            let from = if i == s.line { s.col } else { 0 };
+            let to = if i == e.line { e.col } else { usize::MAX };
+            marks.push((from, to, selection_style()));
+        }
+        // A wrapped row shows just its own characters; the last row of a line may
+        // also show the selection running on past its end
+        let (left, room) = if doc.wrap {
+            let left = display_col(text, start);
+            (left, next.map_or(width, |n| display_col(text, n) - left))
+        } else {
+            (doc.left, width)
+        };
+        let mut spans = vec![Span::styled(number, number_style)];
+        spans.extend(line_spans(text, doc.colors.get(i), left, room, &marks));
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), area);
+
+    if focused && doc.editing {
+        let c = doc.buf.cursor;
+        let text = &doc.buf.lines[c.line];
+        let col = display_col(text, c.col);
+        let on_row = rows
+            .iter()
+            .position(|&(i, _, start, next)| i == c.line && c.col >= start && next.is_none_or(|n| c.col < n));
+        if let Some(y) = on_row {
+            let left = if doc.wrap { display_col(text, rows[y].2) } else { doc.left };
+            if col >= left && col - left < width {
+                f.set_cursor_position(Position::new(area.x + gutter + (col - left) as u16, area.y + y as u16));
+            }
+        }
+    }
+    gutter
+}
+
+/// A one-line pane title, reversed when the pane has the focus.
+fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
+    let style = if focused {
+        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+    } else {
+        Style::new().add_modifier(Modifier::BOLD | Modifier::DIM)
+    };
+    let width = area.width as usize;
+    let room = width.saturating_sub(str_width(right));
+    // Long paths lose their beginning, not the file name
+    let mut title = title.to_string();
+    if str_width(&title) > room {
+        let skip = str_width(&title) - room + 2;
+        title = format!(" …{}", title.chars().skip(skip + 1).collect::<String>());
+    }
+    let pad = width.saturating_sub(str_width(&title) + str_width(right));
+    let line = Line::from(vec![Span::raw(title), Span::raw(" ".repeat(pad)), Span::raw(right.to_string())]);
+    f.render_widget(Paragraph::new(line).style(style), Rect::new(area.x, area.y, area.width, 1));
+}
+
+fn find_readme(dir: &Path) -> Option<PathBuf> {
+    let mut names: Vec<PathBuf> = fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_file() && file_name(p).to_lowercase().starts_with("readme"))
+        .collect();
+    names.sort_by_key(|p| !file_name(p).eq_ignore_ascii_case("readme.md"));
+    names.into_iter().next()
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned())
+}
+
+fn tilde(path: &Path) -> String {
+    match std::env::var_os("HOME").map(PathBuf::from) {
+        Some(home) if path.starts_with(&home) && path != home => {
+            format!("~/{}", path.strip_prefix(&home).unwrap().display())
+        }
+        Some(home) if path == home => "~".into(),
+        _ => path.display().to_string(),
+    }
+}
+
+fn relative(path: &Path, root: &Path) -> String {
+    path.strip_prefix(root).map_or_else(|_| tilde(path), |p| p.display().to_string())
+}
+
+fn human_size(bytes: u64) -> String {
+    match bytes {
+        b if b < 1024 => format!("{b} bytes"),
+        b if b < 1 << 20 => format!("{:.1} KB", b as f64 / 1024.0),
+        b => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend, crossterm::event::KeyEventState};
+
+    struct Harness {
+        app: App,
+        term: Terminal<TestBackend>,
+        _dir: tempfile::TempDir,
+        root: PathBuf,
+    }
+
+    impl Harness {
+        fn new(files: &[(&str, &str)]) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            for (name, text) in files {
+                let path = root.join(name);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            let app = App::new(&root).unwrap();
+            let mut h = Self { app, term: Terminal::new(TestBackend::new(80, 20)).unwrap(), _dir: dir, root };
+            h.draw();
+            h
+        }
+
+        fn draw(&mut self) {
+            self.term.draw(|f| self.app.draw(f)).unwrap();
+        }
+
+        fn send(&mut self, event: Event) {
+            self.app.handle(event);
+            self.draw();
+        }
+
+        fn key(&mut self, code: KeyCode) {
+            self.key_with(code, KeyModifiers::NONE);
+        }
+
+        fn key_with(&mut self, code: KeyCode, modifiers: KeyModifiers) {
+            self.send(Event::Key(KeyEvent { code, modifiers, kind: KeyEventKind::Press, state: KeyEventState::NONE }));
+        }
+
+        fn typing(&mut self, text: &str) {
+            for c in text.chars() {
+                self.key(KeyCode::Char(c));
+            }
+        }
+
+        fn mouse(&mut self, kind: MouseEventKind, x: u16, y: u16) {
+            self.send(Event::Mouse(MouseEvent { kind, column: x, row: y, modifiers: KeyModifiers::NONE }));
+        }
+
+        fn click(&mut self, x: u16, y: u16) {
+            self.app.last_click = None;
+            self.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+            self.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        }
+
+        fn row(&self, y: u16) -> String {
+            let buf = self.term.backend().buffer();
+            (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect::<String>()
+        }
+
+        fn screen(&self) -> String {
+            (0..self.term.backend().buffer().area.height).map(|y| self.row(y)).collect::<Vec<_>>().join("\n")
+        }
+
+        /// Row and column where `text` first appears on screen.
+        fn find(&self, text: &str) -> (u16, u16) {
+            for y in 0..self.term.backend().buffer().area.height {
+                let row = self.row(y);
+                if let Some(i) = row.find(text) {
+                    return (row[..i].chars().count() as u16, y);
+                }
+            }
+            panic!("{text:?} not on screen:\n{}", self.screen());
+        }
+
+        fn cursor(&mut self) -> Pos {
+            self.app.doc().unwrap().buf.cursor
+        }
+    }
+
+    #[test]
+    fn opens_the_readme_rendered() {
+        let h = Harness::new(&[("README.md", "# Hello\n\nSome **bold** words.\n"), ("src/main.rs", "fn main() {}\n")]);
+        let screen = h.screen();
+        assert!(screen.contains("Hello"), "{screen}");
+        assert!(screen.contains("━━━━━"), "{screen}");
+        assert!(screen.contains("Some bold words."), "{screen}");
+        assert!(!screen.contains("**"), "{screen}");
+        assert!(screen.contains("▸ src"), "{screen}");
+    }
+
+    #[test]
+    fn tab_switches_panes() {
+        let mut h = Harness::new(&[("a.txt", "a\n")]);
+        assert_eq!(h.app.focus, Focus::Tree);
+        h.key(KeyCode::Tab);
+        assert_eq!(h.app.focus, Focus::Content);
+        h.key(KeyCode::Tab);
+        assert_eq!(h.app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn clicking_opens_dirs_and_files() {
+        let mut h = Harness::new(&[("src/lib.rs", "pub fn lib() {}\n"), ("notes.txt", "hello notes\n")]);
+        let (x, y) = h.find("src");
+        h.click(x, y);
+        let (x, y) = h.find("lib.rs");
+        h.click(x, y);
+        assert!(h.screen().contains("pub fn lib() {}"), "{}", h.screen());
+        let (x, y) = h.find("notes.txt");
+        h.click(x, y);
+        assert!(h.screen().contains("hello notes"), "{}", h.screen());
+    }
+
+    #[test]
+    fn wheel_scrolls_the_file() {
+        let text: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+        let mut h = Harness::new(&[("long.txt", &text)]);
+        h.key(KeyCode::Enter);
+        let (x, y) = h.find("line 1");
+        h.mouse(MouseEventKind::ScrollDown, x, y);
+        h.mouse(MouseEventKind::ScrollDown, x, y);
+        assert!(h.row(1).contains("line 7"), "{}", h.screen());
+    }
+
+    #[test]
+    fn edit_and_save() {
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.key(KeyCode::End);
+        h.typing(" world");
+        h.key(KeyCode::Enter);
+        h.typing("again");
+        assert!(h.screen().contains("a.txt ●"), "{}", h.screen());
+        h.key_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "hello world\nagain\n");
+        assert!(!h.screen().contains("●"));
+        h.key_with(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert!(h.screen().contains("hello world"));
+        assert!(!h.screen().contains("again"));
+    }
+
+    #[test]
+    fn quitting_with_changes_asks_first() {
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('i'));
+        h.typing("x");
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Char('q'));
+        assert!(!h.app.quit);
+        assert!(h.screen().contains("Unsaved changes to a.txt"), "{}", h.screen());
+        h.key(KeyCode::Esc);
+        assert!(!h.app.quit);
+        h.key(KeyCode::Char('q'));
+        h.key(KeyCode::Char('d'));
+        assert!(h.app.quit);
+        assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn dragging_selects_and_copies() {
+        let mut h = Harness::new(&[("a.txt", "alpha beta gamma\n")]);
+        h.key(KeyCode::Enter);
+        let (x, y) = h.find("beta");
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), x + 4, y);
+        h.mouse(MouseEventKind::Up(MouseButton::Left), x + 4, y);
+        let copied = clipboard::COPIED.with(|c| c.borrow().last().cloned());
+        assert_eq!(copied.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn clicking_in_edit_mode_moves_the_cursor() {
+        let mut h = Harness::new(&[("a.txt", "alpha beta\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        let (x, y) = h.find("beta");
+        h.click(x, y);
+        h.typing("new ");
+        assert!(h.screen().contains("alpha new beta"), "{}", h.screen());
+    }
+
+    #[test]
+    fn search_jumps_to_matches() {
+        let text: String =
+            (1..=100).map(|i| if i == 60 { "the needle\n".to_string() } else { format!("hay {i}\n") }).collect();
+        let mut h = Harness::new(&[("hay.txt", &text)]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('/'));
+        h.typing("needle");
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("the needle"), "{}", h.screen());
+    }
+
+    #[test]
+    fn markdown_toggles_to_raw_and_back() {
+        let mut h = Harness::new(&[("README.md", "# Title\n\ntext\n")]);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('m'));
+        assert!(h.screen().contains("# Title"), "{}", h.screen());
+        h.key(KeyCode::Char('m'));
+        assert!(!h.screen().contains("# Title"), "{}", h.screen());
+    }
+
+    #[test]
+    fn reloads_when_the_file_changes() {
+        let mut h = Harness::new(&[("a.txt", "before\n")]);
+        h.key(KeyCode::Enter);
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(h.root.join("a.txt"), "after, longer\n").unwrap();
+        h.app.tick();
+        h.draw();
+        assert!(h.screen().contains("after, longer"), "{}", h.screen());
+    }
+
+    #[test]
+    fn reloads_rendered_markdown_when_the_file_changes() {
+        let mut h = Harness::new(&[("README.md", "# Before\n")]);
+        assert!(h.screen().contains("Before"), "{}", h.screen());
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(h.root.join("README.md"), "# After, longer\n").unwrap();
+        h.app.tick();
+        h.draw();
+        assert!(h.screen().contains("After, longer"), "{}", h.screen());
+    }
+
+    #[test]
+    fn pasting_into_the_search_prompt_leaves_the_file_alone() {
+        let mut h = Harness::new(&[("a.txt", "alpha needle\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.key_with(KeyCode::Char('f'), KeyModifiers::CONTROL);
+        h.send(Event::Paste("needle\nmore".into()));
+        assert!(h.screen().contains("/needle"), "{}", h.screen());
+        assert!(!h.app.dirty());
+    }
+
+    #[test]
+    fn dragging_the_divider_resizes() {
+        let mut h = Harness::new(&[("a.txt", "a\n")]);
+        let x = h.app.divider_x;
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x, 3);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), x + 10, 3);
+        h.mouse(MouseEventKind::Up(MouseButton::Left), x + 10, 3);
+        assert_eq!(h.app.divider_x, x + 10);
+    }
+
+    #[test]
+    fn binary_files_are_not_shown() {
+        let mut h = Harness::new(&[("blob.bin", "ab\0cd")]);
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("Binary file"), "{}", h.screen());
+    }
+
+    const LONG: &str = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen\nshort\n";
+
+    #[test]
+    fn word_wrap_toggles() {
+        let mut h = Harness::new(&[("a.txt", LONG)]);
+        h.key(KeyCode::Enter);
+        assert!(!h.screen().contains("eighteen"), "{}", h.screen());
+        h.key(KeyCode::Char('w'));
+        let screen = h.screen();
+        assert!(screen.contains("eighteen"), "{screen}");
+        assert!(screen.contains("wrap"), "{screen}");
+        // The continuation has no line number, and the next line is numbered 2
+        let (_, short) = h.find("short");
+        assert!(h.row(short).contains("2  short"), "{screen}");
+        assert!(!h.row(short - 1).contains(" 1 "), "{screen}");
+        h.key(KeyCode::Char('w'));
+        assert!(!h.screen().contains("eighteen"), "{}", h.screen());
+    }
+
+    #[test]
+    fn editing_wrapped_lines_moves_by_screen_rows() {
+        let mut h = Harness::new(&[("a.txt", LONG)]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('w'));
+        h.key(KeyCode::Char('e'));
+        h.key(KeyCode::Down);
+        let pos = h.cursor();
+        assert_eq!(pos.line, 0, "still in the first line, one row down");
+        assert!(pos.col > 0);
+        // A click on the continuation row lands in the same line
+        let (x, y) = h.find("eighteen");
+        h.click(x, y);
+        let pos = h.cursor();
+        assert_eq!((pos.line, &LONG[pos.col..pos.col + 8]), (0, "eighteen"));
+        h.typing("X");
+        assert!(h.screen().contains("Xeighteen"), "{}", h.screen());
+    }
+
+    #[test]
+    fn csv_shows_as_a_table_with_its_header_kept() {
+        let mut text = String::from("name,amount,note\n");
+        for i in 1..=60 {
+            text.push_str(&format!("item {i},{},\"row {i}\"\n", i * 10));
+        }
+        let mut h = Harness::new(&[("data.csv", &text)]);
+        h.key(KeyCode::Enter);
+        let screen = h.screen();
+        assert!(screen.contains("name    │ amount │ note"), "{screen}");
+        assert!(screen.contains("item 1  │     10 │ row 1"), "{screen}");
+        assert!(screen.contains("table"), "{screen}");
+        for _ in 0..30 {
+            h.key(KeyCode::Down);
+        }
+        let screen = h.screen();
+        assert!(screen.contains("name    │ amount"), "header stays:\n{screen}");
+        assert!(!screen.contains("item 1  │"), "{screen}");
+        // The raw text opens at the same place
+        h.key(KeyCode::Char('m'));
+        let (_, y) = h.find("item 31,310,\"row 31\"");
+        assert_eq!(y, 1, "{}", h.screen());
+    }
+
+    #[test]
+    fn tree_filter_finds_files_anywhere() {
+        let mut h = Harness::new(&[("src/deep/needle.rs", "found me\n"), ("src/other.rs", "\n"), ("notes.txt", "\n")]);
+        h.key(KeyCode::Char('/'));
+        h.typing("needle");
+        let screen = h.screen();
+        assert!(screen.contains("/ needle"), "{screen}");
+        assert!(screen.contains("needle.rs"), "{screen}");
+        assert!(!screen.contains("notes.txt"), "{screen}");
+        assert!(!screen.contains("other.rs"), "{screen}");
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("found me"), "{}", h.screen());
+        assert_eq!(h.app.focus, Focus::Content);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Esc);
+        let screen = h.screen();
+        assert!(screen.contains("notes.txt"), "{screen}");
+        assert!(!screen.contains("/ needle"), "{screen}");
+    }
+
+    #[test]
+    fn archives_open_like_directories() {
+        use std::io::Write;
+        let mut h = Harness::new(&[("other.txt", "\n")]);
+        let mut zip = zip::ZipWriter::new(fs::File::create(h.root.join("bundle.zip")).unwrap());
+        zip.start_file("docs/guide.md", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.write_all(b"# Guide\n\nInside the zip.\n").unwrap();
+        zip.finish().unwrap();
+        h.app.tree.refresh();
+        h.draw();
+        let (x, y) = h.find("bundle.zip");
+        h.click(x, y);
+        let (x, y) = h.find("docs");
+        h.click(x, y);
+        let (x, y) = h.find("guide.md");
+        h.click(x, y);
+        let screen = h.screen();
+        assert!(screen.contains("Inside the zip."), "{screen}");
+        assert!(screen.contains("bundle.zip/docs/guide.md"), "{screen}");
+        // Read-only: e says why instead of editing
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('e'));
+        assert!(!h.app.editing());
+        assert!(h.screen().contains("in an archive"), "{}", h.screen());
+    }
+
+    #[test]
+    fn images_show_in_half_blocks() {
+        let h0 = Harness::new(&[]);
+        let mut image = image::RgbImage::new(8, 8);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([x as u8 * 30, y as u8 * 30, 200]);
+        }
+        image.save(h0.root.join("dot.png")).unwrap();
+        let mut h = Harness { app: App::new(&h0.root.join("dot.png")).unwrap(), ..h0 };
+        h.draw();
+        let screen = h.screen();
+        assert!(screen.contains("8×8 PNG"), "{screen}");
+        assert!(screen.contains('▀') || screen.contains('▄'), "{screen}");
+    }
+
+    #[test]
+    fn history_shows_commits_files_and_diffs() {
+        let h0 = Harness::new(&[("a.txt", "one\n")]);
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&h0.root)
+                .args(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first version"]);
+        fs::write(h0.root.join("a.txt"), "two\n").unwrap();
+        git(&["commit", "-q", "-am", "second version"]);
+        let mut h = h0;
+
+        h.key(KeyCode::Char('H'));
+        let screen = h.screen();
+        assert!(screen.contains("second versi") && screen.contains("first versi"), "{screen}");
+        // The newest commit, whole, in the right pane
+        assert!(screen.contains("+two"), "{screen}");
+
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Enter);
+        let screen = h.screen();
+        assert!(screen.contains(" A a.txt"), "{screen}");
+        assert!(screen.contains("a.txt @"), "{screen}");
+        assert!(screen.contains("one"), "{screen}");
+
+        h.key(KeyCode::Left);
+        h.key(KeyCode::Up);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('d'));
+        let screen = h.screen();
+        assert!(screen.contains("-one") && screen.contains("+two"), "{screen}");
+
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Esc);
+        assert!(h.app.history.is_none());
+        let (x, y) = h.find("a.txt");
+        h.click(x, y);
+        assert!(h.screen().contains("1  two"), "the file as it is now:\n{}", h.screen());
+    }
+}
