@@ -24,7 +24,6 @@ use ratatui_image::{
 
 use crate::{picture, text::str_width};
 
-const WORKERS: usize = 3;
 /// Columns between thumbnails
 const GAP: u16 = 2;
 /// Thumbnails are decoded this big at most, so resizing them doesn't decode again
@@ -80,7 +79,8 @@ impl Gallery {
         let (jobs, queue) = mpsc::channel::<(usize, PathBuf)>();
         let (finished, done) = mpsc::channel();
         let queue = Arc::new(Mutex::new(queue));
-        for _ in 0..WORKERS {
+        // Every core but the one the screen needs
+        for _ in 0..crate::cores().saturating_sub(1).max(1) {
             let (queue, finished) = (queue.clone(), finished.clone());
             // They end when the gallery goes away and takes its sender with it
             thread::spawn(move || {

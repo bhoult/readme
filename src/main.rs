@@ -9,6 +9,7 @@ mod external;
 mod fileops;
 mod gallery;
 mod git;
+mod grep;
 mod highlight;
 mod markdown;
 mod picture;
@@ -48,6 +49,7 @@ if it has one) or a file to open.
 Keys
   Tab          switch between the tree and the file
   Tree         ↑↓/jk move · Enter open · ←→/hl fold · / filter by name
+               F find text in all the files (Esc back to the tree)
                . hidden files · r refresh · H git history
                Space mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
                F2 rename · drag marked files onto a folder to move them
@@ -126,6 +128,11 @@ fn restore() {
         Show
     );
     let _ = terminal::disable_raw_mode();
+}
+
+/// How many threads the machine can run at once.
+pub fn cores() -> usize {
+    std::thread::available_parallelism().map_or(4, |n| n.get())
 }
 
 fn main() -> Result<()> {

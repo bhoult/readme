@@ -7,15 +7,24 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{
+        Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::SystemTime,
 };
 
-use ignore::WalkBuilder;
+use ignore::{WalkBuilder, WalkState};
 
 use crate::{
     archive::{self, Entry},
+    cores,
     text::find_all,
 };
+
+/// Dependency and build folders, left out of the filter and the search unless hidden
+/// files are showing, so big trees stay quick
+pub const SKIP_DIRS: [&str; 6] = ["node_modules", "target", ".venv", "venv", "__pycache__", ".git"];
 
 /// An archive's contents, and its modification time when they were read
 type Listing = (Option<SystemTime>, Rc<Vec<Entry>>);
@@ -298,22 +307,34 @@ impl Tree {
     }
 }
 
-/// Everything under `root`, for the filter. Unless `all`, this leaves out what the
-/// tree hides, and dependency and build directories too, so big trees stay quick.
+/// Everything under `root`, for the filter, read on all the cores. Unless `all`,
+/// this leaves out what the tree hides, and SKIP_DIRS too.
 fn walk_all(root: &Path, all: bool) -> Vec<(PathBuf, bool)> {
-    const SKIP: [&str; 6] = ["node_modules", "target", ".venv", "venv", "__pycache__", ".git"];
+    let found = Mutex::new(Vec::new());
+    let count = AtomicUsize::new(0);
     WalkBuilder::new(root)
         .standard_filters(!all)
-        .filter_entry(move |e| all || e.depth() == 0 || !SKIP.contains(&e.file_name().to_string_lossy().as_ref()))
-        .build()
-        .filter_map(Result::ok)
-        .filter(|e| e.depth() > 0)
-        .take(FILTER_LIMIT)
-        .map(|e| {
-            let is_dir = e.file_type().is_some_and(|t| t.is_dir()) || (e.path_is_symlink() && e.path().is_dir());
-            (e.into_path(), is_dir)
-        })
-        .collect()
+        .filter_entry(move |e| all || e.depth() == 0 || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
+        .threads(cores())
+        .build_parallel()
+        .run(|| {
+            Box::new(|entry| {
+                let Ok(entry) = entry else { return WalkState::Continue };
+                if entry.depth() == 0 {
+                    return WalkState::Continue;
+                }
+                if count.fetch_add(1, Ordering::Relaxed) >= FILTER_LIMIT {
+                    return WalkState::Quit;
+                }
+                let is_dir =
+                    entry.file_type().is_some_and(|t| t.is_dir()) || (entry.path_is_symlink() && entry.path().is_dir());
+                if let Ok(mut found) = found.lock() {
+                    found.push((entry.into_path(), is_dir));
+                }
+                WalkState::Continue
+            })
+        });
+    found.into_inner().unwrap_or_default()
 }
 
 /// A directory's entries, directories first, honoring .gitignore unless `all`.

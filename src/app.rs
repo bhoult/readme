@@ -23,6 +23,7 @@ use crate::{
     clipboard, external, fileops,
     gallery::{self, Gallery},
     git,
+    grep::Grep,
     highlight::{self, LineCache},
     markdown::{self, Rendered},
     picture::{self, Picture},
@@ -420,6 +421,8 @@ enum Prompt {
     Confirm(Change),
     /// A file's new name, being typed
     Rename(PathBuf, String),
+    /// What to find in all the files, being typed
+    Grep(String),
 }
 
 /// A change to files from the tree, waiting for a yes.
@@ -470,6 +473,12 @@ pub struct App {
     picker: Picker,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
+    /// The left pane shows the matches of a search through all the files
+    grep: Option<Grep>,
+    /// The last thing searched for in all the files, to start from next time
+    last_grep: String,
+    /// Whether a match has been shown yet, since the search started
+    grep_shown: bool,
     tree_width: u16,
     prompt: Option<Prompt>,
     message: Option<(String, Instant)>,
@@ -504,6 +513,9 @@ impl App {
             history: None,
             picker: Picker::halfblocks(),
             gallery_stash: None,
+            grep: None,
+            last_grep: String::new(),
+            grep_shown: false,
             tree_width: 0,
             prompt: None,
             message: None,
@@ -785,6 +797,7 @@ impl App {
             _ => {}
         }
         match self.focus {
+            Focus::Tree if self.grep.is_some() => self.grep_key(key),
             Focus::Tree if self.history.is_some() => self.history_key(key),
             Focus::Tree if self.filtering => self.filter_key(key),
             Focus::Tree => self.tree_key(key),
@@ -839,6 +852,19 @@ impl App {
             Prompt::Confirm(change) => match key.code {
                 KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.perform(change),
                 _ => self.say("Left as it was"),
+            },
+            Prompt::Grep(mut query) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.start_grep(query),
+                KeyCode::Backspace => {
+                    query.pop();
+                    self.prompt = Some(Prompt::Grep(query));
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    query.push(c);
+                    self.prompt = Some(Prompt::Grep(query));
+                }
+                _ => self.prompt = Some(Prompt::Grep(query)),
             },
             Prompt::Rename(path, mut name) => match key.code {
                 KeyCode::Esc => {}
@@ -899,10 +925,108 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.tree.refresh(),
             KeyCode::Char('H') => self.toggle_history(),
+            KeyCode::Char('F') => self.prompt = Some(Prompt::Grep(self.last_grep.clone())),
             KeyCode::Char('q') => self.request_quit(),
             _ => {}
         }
         self.tree.keep_visible(self.tree_area.height as usize);
+    }
+
+    // Finding text in all the files
+
+    fn start_grep(&mut self, query: String) {
+        if query.is_empty() {
+            return;
+        }
+        self.last_grep = query.clone();
+        self.history = None;
+        self.filtering = false;
+        self.grep = Some(Grep::start(&self.tree.root, &query, self.tree.show_hidden));
+        self.grep_shown = false;
+        self.focus = Focus::Tree;
+    }
+
+    fn grep_key(&mut self, key: KeyEvent) {
+        let page = self.tree_area.height.max(1) as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.grep_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.grep_move(1),
+            KeyCode::PageUp => self.grep_move(-page),
+            KeyCode::PageDown => self.grep_move(page),
+            KeyCode::Home | KeyCode::Char('g') | KeyCode::End | KeyCode::Char('G') => {
+                let end = matches!(key.code, KeyCode::End | KeyCode::Char('G'));
+                if let Some(grep) = &mut self.grep {
+                    let last = grep.files.len().saturating_sub(1);
+                    let last_hit = grep.files.get(last).map_or(0, |f| f.hits.len().saturating_sub(1));
+                    grep.selected = if end { (last, last_hit) } else { (0, 0) };
+                }
+                self.grep_move(0);
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                self.grep_preview();
+                self.focus = Focus::Content;
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                self.grep = None;
+                self.say("Back to the files");
+            }
+            KeyCode::Char('F') => self.prompt = Some(Prompt::Grep(self.last_grep.clone())),
+            KeyCode::Char('q') => self.request_quit(),
+            _ => {}
+        }
+    }
+
+    fn grep_move(&mut self, delta: isize) {
+        let height = self.tree_area.height.max(1) as usize;
+        let Some(grep) = &mut self.grep else { return };
+        grep.step(delta);
+        let row = grep.selected_row();
+        // Keep the file's own line in view with its first match
+        if row <= grep.scroll {
+            grep.scroll = row.saturating_sub(1);
+        } else if row >= grep.scroll + height {
+            grep.scroll = row + 1 - height;
+        }
+        self.grep_preview();
+    }
+
+    /// Shows the selected match: its file at that line, with the matches lit.
+    fn grep_preview(&mut self) {
+        let Some((path, line, col, query)) = self
+            .grep
+            .as_ref()
+            .and_then(|g| g.current().map(|(p, h)| (p.to_path_buf(), h.line, h.col, g.query.clone())))
+        else {
+            return;
+        };
+        self.grep_shown = true;
+        if !self.showing(&path) {
+            if self.dirty() {
+                return self.say("Save or discard your changes first, to see other files");
+            }
+            self.open(&path);
+        }
+        self.search = Some(query);
+        let (page, width) = (self.page(), self.text_width());
+        if let Some(doc) = self.doc() {
+            // A match is on a line of the text, so formatted views show the text
+            doc.raw = true;
+            doc.last_match = Some(Pos::new(line, col));
+            (doc.top, doc.top_row) = (line.saturating_sub(page / 3), 0);
+            let at = display_col(doc.buf.lines.get(line).map_or("", String::as_str), col);
+            doc.left = if doc.wrap || at < width { 0 } else { at.saturating_sub(width / 3) };
+        }
+    }
+
+    fn grep_click(&mut self, y: u16, double: bool) {
+        let Some(grep) = &mut self.grep else { return };
+        let Some(row) = y.checked_sub(self.tree_area.y).map(|dy| grep.scroll + dy as usize) else { return };
+        let Some(selected) = grep.at_row(row) else { return };
+        grep.selected = selected;
+        self.grep_preview();
+        if double {
+            self.focus = Focus::Content;
+        }
     }
 
     // History
@@ -1287,6 +1411,7 @@ impl App {
             KeyCode::Char('c') if ctrl => return self.copy_selection(),
             KeyCode::Char('w') => return self.toggle_wrap(),
             KeyCode::Char('H') => return self.toggle_history(),
+            KeyCode::Char('F') => return self.prompt = Some(Prompt::Grep(self.last_grep.clone())),
             KeyCode::Esc => {
                 self.search = None;
                 if let Some(doc) = self.doc() {
@@ -1427,7 +1552,7 @@ impl App {
                 query.push_str(first_line);
                 self.search = (!query.is_empty()).then(|| query.clone());
             }
-            Some(Prompt::Rename(_, name)) => name.push_str(first_line),
+            Some(Prompt::Rename(_, name) | Prompt::Grep(name)) => name.push_str(first_line),
             Some(Prompt::Unsaved(_) | Prompt::Confirm(_)) => {}
             None if self.focus == Focus::Tree && self.filtering => {
                 let query = format!("{}{first_line}", self.tree.filter.clone().unwrap_or_default());
@@ -1546,6 +1671,9 @@ impl App {
                 self.last_click = Some((Instant::now(), x, y));
                 if x == self.divider_x && y < self.content_area.bottom() {
                     self.drag = Drag::Divider;
+                } else if self.grep.is_some() && x < self.divider_x && y < self.content_area.bottom() {
+                    self.focus = Focus::Tree;
+                    self.grep_click(y, double);
                 } else if self.history.is_some() && x < self.divider_x && y < self.content_area.bottom() {
                     self.focus = Focus::Tree;
                     self.history_click(y, double);
@@ -1612,7 +1740,12 @@ impl App {
                 } else {
                     WHEEL
                 };
-                if self.tree_area.contains(at) && self.history.is_some() {
+                if self.tree_area.contains(at) && self.grep.is_some() {
+                    let height = self.tree_area.height as usize;
+                    if let Some(grep) = &mut self.grep {
+                        grep.scroll = grep.scroll.saturating_add_signed(delta).min(grep.rows().saturating_sub(height));
+                    }
+                } else if self.tree_area.contains(at) && self.history.is_some() {
                     let height = self.tree_area.height as usize;
                     if let Some(h) = &mut self.history {
                         let (scroll, len) = match &mut h.opened {
@@ -1972,13 +2105,23 @@ impl App {
         }
         self.tree_width = self.tree_width.clamp(8, area.width - 20);
         let (tw, body) = (self.tree_width, area.height - 1);
-        let filter = u16::from(self.tree.filter.is_some() && self.history.is_none());
+        if let Some(grep) = &mut self.grep {
+            grep.poll();
+            // The first match shows as soon as it's found
+            let first = !self.grep_shown && grep.current().is_some();
+            if first {
+                self.grep_preview();
+            }
+        }
+        let filter = u16::from(self.tree.filter.is_some() && self.history.is_none() && self.grep.is_none());
         self.divider_x = area.x + tw;
         self.filter_area = Rect::new(area.x, area.y + 1, tw, filter);
         self.tree_area = Rect::new(area.x, area.y + 1 + filter, tw, body - 1 - filter);
         self.content_area = Rect::new(self.divider_x + 1, area.y + 1, area.width - tw - 1, body - 1);
 
-        if self.history.is_some() {
+        if self.grep.is_some() {
+            self.draw_grep(f, Rect::new(area.x, area.y, tw, 1));
+        } else if self.history.is_some() {
             self.draw_history(f, Rect::new(area.x, area.y, tw, 1));
         } else {
             self.draw_tree(f, Rect::new(area.x, area.y, tw, 1));
@@ -2159,6 +2302,86 @@ impl App {
         f.render_widget(Paragraph::new(lines), list);
     }
 
+    fn draw_grep(&mut self, f: &mut Frame, header_area: Rect) {
+        let focused = self.focus == Focus::Tree;
+        let list = self.tree_area;
+        let (height, width) = (list.height as usize, list.width as usize);
+        let root = self.tree.root.clone();
+        let Some(grep) = &mut self.grep else { return };
+        let count = if !grep.done {
+            format!("{} files… ", grep.searched.load(std::sync::atomic::Ordering::Relaxed))
+        } else if grep.cut_short() {
+            format!("first {} ", grep.matches())
+        } else {
+            format!("{} in {} ", grep.matches(), grep.files.len())
+        };
+        header(f, header_area, &format!(" ⌕ “{}”", grep.query), &count, focused);
+        grep.scroll = grep.scroll.min(grep.rows().saturating_sub(height));
+
+        let query = grep.query.clone();
+        let hit_style = Style::new().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+        let mut lines = Vec::new();
+        let mut row = 0;
+        'files: for (f_i, file) in grep.files.iter().enumerate() {
+            for h_i in 0..=file.hits.len() {
+                if row >= grep.scroll + height {
+                    break 'files;
+                }
+                if row >= grep.scroll {
+                    if h_i == 0 {
+                        let name = relative(&file.path, &root);
+                        lines.push(Line::from(vec![
+                            Span::styled(format!(" {name}"), Style::new().fg(Color::Blue).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!(" {}", file.hits.len()), dim()),
+                        ]));
+                    } else {
+                        let hit = &file.hits[h_i - 1];
+                        let selected = grep.selected == (f_i, h_i - 1);
+                        let base = match (selected, focused) {
+                            (true, true) => Style::new().add_modifier(Modifier::REVERSED),
+                            (true, false) => Style::new().add_modifier(Modifier::UNDERLINED),
+                            _ => Style::new(),
+                        };
+                        let number = format!(" {:>4} ", hit.line + 1);
+                        let room = width.saturating_sub(number.len());
+                        // From the start of the text, or from a little before the match
+                        let chars: Vec<char> = hit.text.chars().collect();
+                        let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
+                        let start = lead.max(hit.col.saturating_sub(room / 3));
+                        let hits = find_all(&hit.text, &query);
+                        let mut spans = vec![Span::styled(number, base.add_modifier(Modifier::DIM))];
+                        if start > lead {
+                            push_span(&mut spans, "…", base.add_modifier(Modifier::DIM));
+                        }
+                        let mut used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
+                        for (i, c) in chars.iter().enumerate().skip(start) {
+                            let c = if c.is_control() { ' ' } else { *c };
+                            used += str_width(c.encode_utf8(&mut [0; 4]));
+                            if used > width {
+                                break;
+                            }
+                            let lit = hits.iter().any(|&(s, e)| i >= s && i < e);
+                            push_span(
+                                &mut spans,
+                                c.encode_utf8(&mut [0; 4]),
+                                if lit { base.patch(hit_style) } else { base },
+                            );
+                        }
+                        let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
+                        spans.push(Span::styled(" ".repeat(width.saturating_sub(used)), base));
+                        lines.push(Line::from(spans));
+                    }
+                }
+                row += 1;
+            }
+        }
+        if grep.files.is_empty() {
+            let note = if grep.done { "  (no matches)" } else { "  searching…" };
+            lines.push(Line::styled(note, dim()));
+        }
+        f.render_widget(Paragraph::new(lines), list);
+    }
+
     fn draw_content(&mut self, f: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Content;
         let body = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
@@ -2237,15 +2460,17 @@ impl App {
                     format!(" Move {} into {}? y yes · n no", describe(items), self.dir_name(dir))
                 }
                 Prompt::Rename(_, name) => format!(" Rename to: {name}"),
+                Prompt::Grep(query) => format!(" Find in files: {query}"),
             };
             let style = Style::new().add_modifier(Modifier::BOLD);
-            if let Prompt::Search(_) | Prompt::Rename(..) = prompt {
+            if let Prompt::Search(_) | Prompt::Rename(..) | Prompt::Grep(_) = prompt {
                 f.set_cursor_position(Position::new(area.x + str_width(&text) as u16, area.y));
             }
             f.render_widget(Paragraph::new(Line::styled(text, style)), area);
             return;
         }
         let (mode, color) = match self.focus {
+            Focus::Tree if self.grep.is_some() => (" FIND ", Color::Yellow),
             Focus::Tree if self.history.is_some() => (" GIT ", Color::Magenta),
             Focus::Tree => (" TREE ", Color::Blue),
             Focus::Content if self.editing() => (" EDIT ", Color::Green),
@@ -2273,6 +2498,9 @@ impl App {
 
     fn hints(&self) -> &'static str {
         match (&self.shown, self.focus) {
+            (_, Focus::Tree) if self.grep.is_some() => {
+                "↑↓ matches · ⏎ go to it · n/N within the file · F search again · Esc files"
+            }
             (_, Focus::Tree) if self.history.as_ref().is_some_and(|h| h.opened.is_some()) => {
                 "↑↓ files · d diff/file · a all files · ← commits · ⇥ view · q quit"
             }
@@ -2285,7 +2513,7 @@ impl App {
                 "Space mark · drag onto a folder to move · Del trash · Esc unmark"
             }
             (_, Focus::Tree) => {
-                "↑↓ move · ⏎ open · H git history · / filter · Space mark · Del trash · F2 rename · q quit"
+                "↑↓ move · ⏎ open · F find in files · H git history · / filter · Space mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
@@ -2966,6 +3194,38 @@ mod tests {
         // ← leaves at the top of the repository
         h.key(KeyCode::Left);
         assert!(h.app.history.is_none());
+    }
+
+    #[test]
+    fn find_in_files_lists_matches_and_shows_them() {
+        let mut h = Harness::new(&[
+            ("a.txt", "one\nthe needle here\n"),
+            ("src/b.rs", "fn x() {}\n// needle\n"),
+            ("c.txt", "nothing\n"),
+        ]);
+        h.key(KeyCode::Char('F'));
+        assert!(h.screen().contains("Find in files:"), "{}", h.screen());
+        h.typing("needle");
+        h.key(KeyCode::Enter);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !h.app.grep.as_ref().unwrap().done && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            h.draw();
+        }
+        h.draw();
+        let screen = h.screen();
+        assert!(screen.contains("“needle”") && screen.contains("2 in 2"), "{screen}");
+        assert!(screen.contains("a.txt") && screen.contains("src/b.rs") && !screen.contains("c.txt"), "{screen}");
+        // The first match shows at its line
+        assert!(screen.contains("2  the needle here"), "{screen}");
+        h.key(KeyCode::Down);
+        assert!(h.screen().contains("2  // needle"), "{}", h.screen());
+        h.key(KeyCode::Enter);
+        assert_eq!(h.app.focus, Focus::Content);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Esc);
+        assert!(h.app.grep.is_none());
+        assert!(h.screen().contains("c.txt"), "the tree is back:\n{}", h.screen());
     }
 
     #[test]

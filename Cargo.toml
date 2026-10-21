@@ -17,6 +17,7 @@ bzip2 = "0.6"
 csv = "1"
 flate2 = "1"
 image = "0.25"
+libc = "0.2"
 liblzma = "0.4"
 ratatui-image = { version = "11.1", default-features = false, features = ["crossterm", "image-defaults"] }
 tar = "0.4"

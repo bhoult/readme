@@ -10,8 +10,8 @@ use std::{
 use image::DynamicImage;
 use ratatui::{Frame, layout::Rect};
 use ratatui_image::{
-    FilterType, Resize, StatefulImage,
-    picker::{Picker, ProtocolType, cap_parser::QueryStdioOptions},
+    FilterType, FontSize, Resize, StatefulImage,
+    picker::{Picker, ProtocolType},
     protocol::StatefulProtocol,
 };
 
@@ -35,12 +35,7 @@ pub fn picker() -> Picker {
     let mut picker = match wanted.as_str() {
         "halfblocks" | "blocks" => Picker::halfblocks(),
         "" if multiplexed && !herdr_shows_images => Picker::halfblocks(),
-        // A terminal that doesn't answer would otherwise hold up startup for two seconds
-        _ => Picker::from_query_stdio_with_options(QueryStdioOptions {
-            timeout: Duration::from_millis(400),
-            ..Default::default()
-        })
-        .unwrap_or_else(|_| Picker::halfblocks()),
+        _ => ask_terminal().unwrap_or_else(Picker::halfblocks),
     };
     let forced = match wanted.as_str() {
         "kitty" => Some(ProtocolType::Kitty),
@@ -53,6 +48,86 @@ pub fn picker() -> Picker {
         picker.set_protocol_type(protocol);
     }
     picker
+}
+
+/// Asks the terminal whether it shows Kitty graphics or sixels, and how big its
+/// character cells are. ratatui-image can ask too, but it waits on a thread that's
+/// left reading the keyboard when a terminal never answers; this waits here, with a
+/// deadline, so nothing is left behind.
+#[cfg(unix)]
+fn ask_terminal() -> Option<Picker> {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    // Kitty graphics, the cell size, then the device attributes every terminal answers,
+    // which come back last and end the wait
+    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c").ok()?;
+    out.flush().ok()?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    let mut answers = Vec::new();
+    while answers_end(&answers).is_none() {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut stdin = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd, then a read into a buffer of the length given
+        let ready = unsafe { libc::poll(&mut stdin, 1, left.as_millis() as i32) };
+        if ready <= 0 {
+            return None;
+        }
+        let mut chunk = [0u8; 512];
+        let read = unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
+        if read <= 0 {
+            return None;
+        }
+        answers.extend_from_slice(&chunk[..read as usize]);
+    }
+    let (kitty, sixel, cell) = parse_answers(&answers);
+    // Without the cell size in an answer, the window's size in pixels gives it
+    let cell = cell.or_else(|| {
+        let size = ratatui::crossterm::terminal::window_size().ok()?;
+        (size.width > 0 && size.columns > 0).then(|| (size.width / size.columns, size.height / size.rows.max(1)))
+    });
+    let protocol = if kitty {
+        ProtocolType::Kitty
+    } else if sixel {
+        ProtocolType::Sixel
+    } else if env::var("TERM_PROGRAM").is_ok_and(|p| p == "iTerm.app") {
+        ProtocolType::Iterm2
+    } else {
+        ProtocolType::Halfblocks
+    };
+    let (width, height) = cell.unwrap_or((10, 20));
+    #[allow(deprecated)]
+    let mut picker = Picker::from_fontsize(FontSize::new(width, height));
+    picker.set_protocol_type(protocol);
+    Some(picker)
+}
+
+#[cfg(not(unix))]
+fn ask_terminal() -> Option<Picker> {
+    None
+}
+
+/// Where the device attributes answer (`ESC [ ? … c`) ends, once it has arrived.
+fn answers_end(answers: &[u8]) -> Option<usize> {
+    let start = answers.windows(3).position(|w| w == b"\x1b[?")?;
+    answers[start + 3..].iter().position(|&b| b == b'c').map(|i| start + 3 + i)
+}
+
+/// From the terminal's answers: Kitty graphics, sixels, and the cell size in pixels.
+fn parse_answers(answers: &[u8]) -> (bool, bool, Option<(u16, u16)>) {
+    let text = String::from_utf8_lossy(answers);
+    let kitty = text.contains("\x1b_Gi=31;OK");
+    let sixel = text
+        .split("\x1b[?")
+        .nth(1)
+        .and_then(|rest| rest.split('c').next())
+        .is_some_and(|attrs| attrs.split(';').any(|a| a == "4"));
+    // ESC [ 6 ; height ; width t
+    let cell = text.split("\x1b[6;").nth(1).and_then(|rest| {
+        let (numbers, _) = rest.split_once('t')?;
+        let (height, width) = numbers.split_once(';')?;
+        Some((width.parse().ok()?, height.parse().ok()?))
+    });
+    (kitty, sixel, cell)
 }
 
 /// Whether every herdr window attached to this pane's session runs in a terminal herdr
@@ -253,6 +328,16 @@ mod tests {
 
     fn shows(vars: &[(&'static str, &'static str)]) -> bool {
         terminal_shows_kitty(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))
+    }
+
+    #[test]
+    fn reads_the_terminals_answers() {
+        let ghostty = b"\x1b_Gi=31;OK\x1b\\\x1b[6;21;10t\x1b[?62;22;52c";
+        assert_eq!(parse_answers(ghostty), (true, false, Some((10, 21))));
+        assert!(answers_end(ghostty).is_some());
+        let sixel = b"\x1b[?65;4;6;22c";
+        assert_eq!(parse_answers(sixel), (false, true, None));
+        assert!(answers_end(b"\x1b_Gi=31;OK\x1b\\").is_none(), "still waiting for the last answer");
     }
 
     #[test]

@@ -14,6 +14,11 @@ as they land.
   `.gitignore` leaves out (`target/`, `node_modules/`) stay hidden until you
   press `.`. Press `/` to filter the whole tree by name as you type. It
   refreshes itself every couple of seconds.
+- **Find in files**: `F` searches the text of every file under the tree's
+  folder, on all the CPU cores, skipping binary files and whatever the tree
+  hides (ignored files, `node_modules`, `target`; press `.` first to include
+  them). Matches fill the left pane as they're found; moving through them shows
+  each file at its line, and `n`/`N` step through the rest of that file.
 - **Source**: syntax highlighting for the languages [bat](https://github.com/sharkdp/bat)
   knows, in the terminal's own colors, with line numbers, search, and word wrap
   (`w`).
@@ -91,6 +96,7 @@ readme src/main.rs  # open a file, with its directory in the tree
 | Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `q` quit |
 | Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
+| Find in files | `F` search · `↑↓` matches · `Enter` go to it · `n` `N` within the file · `Esc` back to the tree |
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
