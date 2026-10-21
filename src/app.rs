@@ -391,6 +391,10 @@ struct ImageShown {
 /// of one of them once it's opened.
 struct History {
     repo: PathBuf,
+    /// The file or folder whose history this is
+    scope: PathBuf,
+    /// For a file, its path in the repository
+    file: Option<String>,
     commits: Vec<git::Commit>,
     selected: usize,
     scroll: usize,
@@ -907,13 +911,29 @@ impl App {
         if self.history.take().is_some() {
             return self.say("Back to the files");
         }
-        let Some(repo) = git::repo_root(&self.tree.root) else {
-            return self.say("This folder isn't in a git repository");
+        // The history of what's selected in the tree, or of what's open
+        let picked = match self.focus {
+            Focus::Tree => self.tree.rows.get(self.tree.selected).map(|r| r.path.clone()),
+            Focus::Content => self.shown_path().map(Path::to_path_buf),
         };
-        match git::log(&repo, &self.tree.root) {
-            Ok(commits) if commits.is_empty() => self.say("No commits here yet"),
+        let scope = picked.filter(|p| p.exists()).unwrap_or_else(|| self.tree.root.clone());
+        self.show_history(scope);
+    }
+
+    /// The commits that touched a file or folder.
+    fn show_history(&mut self, scope: PathBuf) {
+        let dir = if scope.is_dir() { scope.clone() } else { scope.parent().unwrap_or(&scope).to_path_buf() };
+        let Some(repo) = git::repo_root(&dir) else {
+            return self.say(format!("{} isn't in a git repository", file_name(&scope)));
+        };
+        // git gives the repository's real path, which may differ from ours by symlinks
+        let scope = scope.canonicalize().unwrap_or(scope);
+        let file = scope.is_file().then(|| scope.strip_prefix(&repo).unwrap_or(&scope).to_string_lossy().into_owned());
+        match git::log(&repo, &scope, file.is_some()) {
+            Ok(commits) if commits.is_empty() => self.say(format!("No commits for {} yet", file_name(&scope))),
             Ok(commits) => {
-                self.history = Some(History { repo, commits, selected: 0, scroll: 0, opened: None, diff: false });
+                self.history =
+                    Some(History { repo, scope, file, commits, selected: 0, scroll: 0, opened: None, diff: false });
                 self.focus = Focus::Tree;
                 self.filtering = false;
                 self.history_preview();
@@ -930,8 +950,24 @@ impl App {
         let (path, bytes, label) = match &h.opened {
             None => {
                 let c = &h.commits[h.selected];
-                let label = format!(" {} {}", c.short, c.subject);
-                (repo.join(format!("{}.diff", c.short)), git::commit_text(&repo, &c.hash), label)
+                match &h.file {
+                    // A file's history shows the file at each commit, or what the commit did to it
+                    Some(file) => {
+                        let then = c.path.as_deref().unwrap_or(file);
+                        if h.diff {
+                            let label = format!(" {then} · diff in {}", c.short);
+                            (repo.join(format!("{then}.diff")), git::file_diff(&repo, c, then), label)
+                        } else {
+                            let label = format!(" {then} @ {} {}", c.short, c.subject);
+                            let bytes = git::show(&repo, &c.hash, then).or_else(|_| git::file_diff(&repo, c, then));
+                            (repo.join(then), bytes, label)
+                        }
+                    }
+                    None => {
+                        let label = format!(" {} {}", c.short, c.subject);
+                        (repo.join(format!("{}.diff", c.short)), git::commit_text(&repo, &c.hash), label)
+                    }
+                }
             }
             Some(opened) => {
                 let Some((status, file)) = opened.files.get(opened.selected) else { return };
@@ -962,7 +998,8 @@ impl App {
             KeyCode::Home | KeyCode::Char('g') => self.history_move(isize::MIN / 2),
             KeyCode::End | KeyCode::Char('G') => self.history_move(isize::MAX / 2),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.history_enter(),
-            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace | KeyCode::Esc => self.history_back(),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => self.history_back(),
+            KeyCode::Esc => self.history_leave(),
             KeyCode::Char('d') => {
                 if let Some(h) = &mut self.history {
                     h.diff = !h.diff;
@@ -1007,23 +1044,40 @@ impl App {
         match git::changes(&h.repo, &h.commits[h.selected]) {
             Ok(changes) if changes.is_empty() => self.say("This commit changed no files"),
             Ok(changes) => {
-                let files = changes.into_iter().map(|c| (c.status, c.path)).collect();
-                h.opened = Some(Opened { commit: h.selected, files, all: false, selected: 0, scroll: 0 });
+                let files: Vec<(char, String)> = changes.into_iter().map(|c| (c.status, c.path)).collect();
+                // In a file's history, start on that file
+                let then = h.commits[h.selected].path.clone().or_else(|| h.file.clone());
+                let start = then.and_then(|f| files.iter().position(|(_, p)| *p == f)).unwrap_or(0);
+                h.opened = Some(Opened { commit: h.selected, files, all: false, selected: start, scroll: 0 });
                 self.history_preview();
             }
             Err(e) => self.say(format!("Couldn't read the commit: {e}")),
         }
     }
 
-    /// Back from a commit's files to the commits, or from the commits to the files on disk.
+    /// Back from a commit's files to the commits; from the commits, out to the folder
+    /// around (up to the whole repository), and from there back to the files.
     fn history_back(&mut self) {
         let Some(h) = &mut self.history else { return };
         if h.opened.take().is_some() {
-            self.history_preview();
-        } else {
-            self.history = None;
-            self.say("Back to the files");
+            return self.history_preview();
         }
+        if h.scope != h.repo
+            && let Some(parent) = h.scope.parent().map(Path::to_path_buf)
+        {
+            return self.show_history(parent);
+        }
+        self.history_leave();
+    }
+
+    /// Out of a commit's files, or else out of the history.
+    fn history_leave(&mut self) {
+        let Some(h) = &mut self.history else { return };
+        if h.opened.take().is_some() {
+            return self.history_preview();
+        }
+        self.history = None;
+        self.say("Back to the files");
     }
 
     /// Switches an opened commit between the files it changed and all of its files.
@@ -1598,10 +1652,7 @@ impl App {
     /// double-click, opens).
     fn history_click(&mut self, y: u16, double: bool) {
         if y < self.tree_area.y {
-            if self.history.as_ref().is_some_and(|h| h.opened.is_some()) {
-                self.history_back();
-            }
-            return;
+            return self.history_back();
         }
         let Some(h) = &self.history else { return };
         let (scroll, selected) = match &h.opened {
@@ -2020,6 +2071,9 @@ impl App {
                 let matched = hits.iter().any(|&(s, e)| idx >= s && idx < e);
                 push_span(&mut spans, c.encode_utf8(&mut [0; 4]), if matched { hit } else { style });
             }
+            if row.repo {
+                spans.push(Span::styled(" ⎇", style.remove_modifier(Modifier::BOLD).fg(Color::Magenta)));
+            }
             let used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
             spans.push(Span::styled(" ".repeat((list.width as usize).saturating_sub(used)), bar));
             lines.push(Line::from(spans));
@@ -2044,8 +2098,13 @@ impl App {
         };
         match &mut h.opened {
             None => {
-                let name = h.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-                header(f, header_area, &format!(" ⎇ {name} history"), &format!("{} ", h.commits.len()), focused);
+                let what = match &h.file {
+                    Some(file) => file.rsplit('/').next().unwrap_or(file).to_string(),
+                    None if h.scope == h.repo => file_name(&h.repo),
+                    None => format!("{}/", h.scope.strip_prefix(&h.repo).unwrap_or(&h.scope).display()),
+                };
+                let back = if h.scope == h.repo { " ⎇ " } else { " ◂ " };
+                header(f, header_area, &format!("{back}{what} history"), &format!("{} ", h.commits.len()), focused);
                 h.scroll = h.scroll.min(h.commits.len().saturating_sub(height));
                 for (i, c) in h.commits.iter().enumerate().skip(h.scroll).take(height) {
                     let base = row_style(i == h.selected);
@@ -2217,12 +2276,17 @@ impl App {
             (_, Focus::Tree) if self.history.as_ref().is_some_and(|h| h.opened.is_some()) => {
                 "↑↓ files · d diff/file · a all files · ← commits · ⇥ view · q quit"
             }
-            (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ open · Esc files · ⇥ view · q quit",
+            (_, Focus::Tree) if self.history.as_ref().is_some_and(|h| h.file.is_some()) => {
+                "↑↓ commits · d diff/file · ⏎ its files · ← whole folder · Esc files · q quit"
+            }
+            (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ its files · ← wider · Esc files · q quit",
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) if !self.tree.marks.is_empty() => {
                 "Space mark · drag onto a folder to move · Del trash · Esc unmark"
             }
-            (_, Focus::Tree) => "↑↓ move · ⏎ open · Space mark · Del trash · F2 rename · / filter · H history · q quit",
+            (_, Focus::Tree) => {
+                "↑↓ move · ⏎ open · H git history · / filter · Space mark · Del trash · F2 rename · q quit"
+            }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
                 "wheel or +/- zoom · 0 fit · drag to move · Esc back to the thumbnails · ← tree"
@@ -2865,6 +2929,46 @@ mod tests {
     }
 
     #[test]
+    fn history_of_a_repository_inside_the_tree() {
+        let h0 = Harness::new(&[("notes.txt", "n\n"), ("proj/src/lib.rs", "one\n"), ("proj/README.md", "# P\n")]);
+        let proj = h0.root.join("proj");
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&proj)
+                .args(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "start"]);
+        fs::write(proj.join("src/lib.rs"), "two\n").unwrap();
+        git(&["commit", "-q", "-am", "change lib"]);
+        let mut h = h0;
+        h.app.tree.refresh();
+        h.draw();
+        // The folder at the top isn't a repository, but proj is, and says so
+        assert!(h.screen().contains("proj ⎇"), "{}", h.screen());
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Char('H'));
+        assert!(h.screen().contains("notes.txt isn't in a git repository"), "{}", h.screen());
+        let (x, y) = h.find("proj");
+        h.click(x, y);
+        h.key(KeyCode::Char('H'));
+        let screen = h.screen();
+        assert!(screen.contains("proj history") && screen.contains("change lib"), "{screen}");
+        assert!(screen.contains("src/lib.rs | 2") && screen.contains("-one"), "the whole commit:\n{screen}");
+        // ← leaves at the top of the repository
+        h.key(KeyCode::Left);
+        assert!(h.app.history.is_none());
+    }
+
+    #[test]
     fn marked_files_go_to_the_trash() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
         h.key(KeyCode::Char(' '));
@@ -3029,11 +3133,12 @@ mod tests {
         git(&["commit", "-q", "-am", "second version"]);
         let mut h = h0;
 
+        // H on a file: its history, and the file as it was
         h.key(KeyCode::Char('H'));
         let screen = h.screen();
         assert!(screen.contains("second versi") && screen.contains("first versi"), "{screen}");
-        // The newest commit, whole, in the right pane
-        assert!(screen.contains("+two"), "{screen}");
+        assert!(screen.contains("a.txt history"), "{screen}");
+        assert!(screen.contains("1  two"), "{screen}");
 
         h.key(KeyCode::Down);
         h.key(KeyCode::Enter);
@@ -3052,8 +3157,9 @@ mod tests {
         h.key(KeyCode::Esc);
         h.key(KeyCode::Esc);
         assert!(h.app.history.is_none());
-        let (x, y) = h.find("a.txt");
-        h.click(x, y);
+        // The tree's row, not the file pane's title
+        let (x, y) = h.find("  a.txt");
+        h.click(x + 2, y);
         assert!(h.screen().contains("1  two"), "the file as it is now:\n{}", h.screen());
     }
 }

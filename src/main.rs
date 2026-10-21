@@ -59,8 +59,9 @@ Keys
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
-  History      ↑↓ commits · Enter its files · d diff or file · a all files
-               ←/Esc back · H leave
+  History      H on a file or folder · ↑↓ commits · Enter its files
+               d diff or file · a all files · ← back, or a wider history
+               Esc leave
   Anywhere     Ctrl+Q quit (q when not editing)
 
 Mouse

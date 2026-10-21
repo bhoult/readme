@@ -18,6 +18,8 @@ pub struct Commit {
     /// Seconds since the epoch
     pub time: u64,
     pub subject: String,
+    /// In a file's history, what the file was called at this commit
+    pub path: Option<String>,
 }
 
 /// A file a commit added (A), modified (M), deleted (D), renamed (R) or copied (C).
@@ -49,20 +51,30 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     Some(PathBuf::from(top.trim_end()))
 }
 
-/// Commits that touched `dir`, newest first.
-pub fn log(repo: &Path, dir: &Path) -> Result<Vec<Commit>> {
+/// Commits that touched `path`, newest first: a folder, or with `follow` a single
+/// file, followed back through renames.
+pub fn log(repo: &Path, path: &Path, follow: bool) -> Result<Vec<Commit>> {
     let max = format!("--max-count={MAX_COMMITS}");
-    let out = git(repo, &["log", &max, "--format=%H%x1f%h%x1f%P%x1f%at%x1f%s%x1e", "--", &dir.to_string_lossy()])?;
+    let path = path.to_string_lossy();
+    let mut args = vec!["log", max.as_str(), "--format=%x1e%H%x1f%h%x1f%P%x1f%at%x1f%s"];
+    if follow {
+        args.extend(["--follow", "--name-only"]);
+    }
+    args.extend(["--", path.as_ref()]);
+    let out = git(repo, &args)?;
     Ok(String::from_utf8_lossy(&out)
         .split('\x1e')
         .filter_map(|record| {
-            let mut f = record.trim_start_matches('\n').split('\x1f');
+            let mut lines = record.lines();
+            let mut f = lines.next()?.split('\x1f');
             Some(Commit {
                 hash: f.next().filter(|h| !h.is_empty())?.to_string(),
                 short: f.next()?.to_string(),
                 parent: f.next()?.split(' ').next().filter(|p| !p.is_empty()).map(String::from),
                 time: f.next()?.parse().unwrap_or(0),
                 subject: f.next()?.to_string(),
+                // --name-only puts the file's name after a blank line
+                path: lines.map(str::trim).find(|l| !l.is_empty()).map(String::from),
             })
         })
         .collect())
@@ -161,7 +173,7 @@ mod tests {
         run(&root, &["commit", "-q", "-m", "second"]);
 
         assert_eq!(repo_root(&root).unwrap(), root);
-        let commits = log(&root, &root).unwrap();
+        let commits = log(&root, &root, false).unwrap();
         let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
         assert_eq!(subjects, vec!["second", "first"]);
         assert!(commits[1].parent.is_none());
@@ -178,5 +190,12 @@ mod tests {
         let diff = String::from_utf8(file_diff(&root, &commits[0], "a.txt").unwrap()).unwrap();
         assert!(diff.contains("-one") && diff.contains("+two"), "{diff}");
         assert!(repo_root(&std::env::temp_dir().join("surely-not-a-repo-xyz")).is_none());
+
+        // A file's history follows it back through a rename
+        run(&root, &["mv", "a.txt", "renamed.txt"]);
+        run(&root, &["commit", "-q", "-m", "rename"]);
+        let file = log(&root, &root.join("renamed.txt"), true).unwrap();
+        let names: Vec<(&str, Option<&str>)> = file.iter().map(|c| (c.subject.as_str(), c.path.as_deref())).collect();
+        assert_eq!(names, vec![("rename", Some("renamed.txt")), ("second", Some("a.txt")), ("first", Some("a.txt"))]);
     }
 }

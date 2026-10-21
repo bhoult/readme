@@ -31,6 +31,8 @@ pub struct Row {
     pub is_dir: bool,
     pub depth: usize,
     pub archive: bool,
+    /// A folder that's a git repository
+    pub repo: bool,
 }
 
 pub struct Tree {
@@ -138,7 +140,8 @@ impl Tree {
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let archive = !is_dir && archive::is_archive(&path);
             let open = (is_dir || archive) && self.expanded.contains(&path);
-            rows.push(Row { path: path.clone(), name, is_dir: is_dir || archive, depth, archive });
+            let repo = is_dir && path.join(".git").exists();
+            rows.push(Row { path: path.clone(), name, is_dir: is_dir || archive, depth, archive, repo });
             if open && archive {
                 self.list_archive(&path, "", depth + 1, rows);
             } else if open {
@@ -157,7 +160,7 @@ impl Tree {
             let path = archive.join(&entry.path);
             let name = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
             let open = entry.is_dir && self.expanded.contains(&path);
-            rows.push(Row { path, name, is_dir: entry.is_dir, depth, archive: false });
+            rows.push(Row { path, name, is_dir: entry.is_dir, depth, archive: false, repo: false });
             if open {
                 self.list_archive(archive, &entry.path, depth + 1, rows);
             }
@@ -206,7 +209,8 @@ impl Tree {
                 let name =
                     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                 let archive = !is_dir && archive::is_archive(path);
-                rows.push(Row { path: path.to_path_buf(), name, is_dir: is_dir || archive, depth, archive });
+                let repo = is_dir && path.join(".git").exists();
+                rows.push(Row { path: path.to_path_buf(), name, is_dir: is_dir || archive, depth, archive, repo });
                 if is_dir {
                     add(path, depth + 1, children, rows);
                 }

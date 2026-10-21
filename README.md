@@ -34,8 +34,12 @@ as they land.
   press `Enter`, to open it, and `Esc` to go back.
 - **Web pages and videos**: clicking an HTML file or a video, or pressing
   `Enter` on it, opens it in your browser or video player.
-- **Git history**: in a repository, `H` lists the commits. Open one to see the
-  files it changed, each as it was at that commit or, with `d`, as a diff.
+- **Git history**: `H` lists the commits behind the selected file or folder,
+  in whatever repository it's in (repositories show a ⎇ in the tree). For a
+  file, each commit shows the file as it was then, or with `d` what changed,
+  following it back through renames; for a folder, each shows the whole commit.
+  Open a commit to go through the files it changed, and `←` widens a file's
+  history to its folder, and on up to the whole repository.
 - **Managing files**: mark files in the tree with `Space` or `Ctrl`+click
   (`Shift`+`↑↓` for a range), then press `Delete` to send them to the trash or
   drag them onto a folder to move them. `F2` renames. Both ask first, nothing
@@ -91,7 +95,7 @@ readme src/main.rs  # open a file, with its directory in the tree
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
-| History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` `Esc` back · `H` leave |
+| History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `Esc` leave |
 
 `Tab` always switches panes, even while editing, so there is no key that
 inserts a tab character. `Enter` keeps the line's indentation. With word wrap
