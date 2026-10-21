@@ -28,8 +28,11 @@ as they land.
 - **Archives**: zip files and tar files (plain, `.gz`, `.bz2`, `.xz`, `.zst`)
   open in the tree like directories, and the files inside them open like any
   other, without unpacking anything.
-- **Web pages**: clicking an HTML file, or pressing `Enter` on it, opens it in
-  your browser as well as showing its source.
+- **Thumbnails**: select a folder with images in it and the right pane shows
+  them as a grid, 100 pixels wide (`+` and `-` change that). Click one, or
+  press `Enter`, to open it, and `Esc` to go back.
+- **Web pages and videos**: clicking an HTML file or a video, or pressing
+  `Enter` on it, opens it in your browser or video player.
 - **Git history**: in a repository, `H` lists the commits. Open one to see the
   files it changed, each as it was at that commit or, with `d`, as a diff.
 - **Editing**: `e` starts editing and `Esc` stops. Selection, undo and redo,
@@ -80,6 +83,7 @@ readme src/main.rs  # open a file, with its directory in the tree
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
+| Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` `Esc` back · `H` leave |
 
 `Tab` always switches panes, even while editing, so there is no key that

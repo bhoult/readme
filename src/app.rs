@@ -20,7 +20,9 @@ use ratatui_image::picker::Picker;
 use crate::{
     archive,
     buffer::{Buffer, Loaded, Pos},
-    clipboard, external, git,
+    clipboard, external,
+    gallery::{self, Gallery},
+    git,
     highlight::{self, LineCache},
     markdown::{self, Rendered},
     picture::{self, Picture},
@@ -369,6 +371,8 @@ enum Shown {
     Note(PathBuf, String),
     Doc(Box<Doc>),
     Image(Box<ImageShown>),
+    /// A folder's images as thumbnails
+    Gallery(Box<Gallery>),
 }
 
 struct ImageShown {
@@ -430,6 +434,8 @@ pub struct App {
     /// The left pane shows git history instead of the files
     history: Option<History>,
     picker: Picker,
+    /// The thumbnails an image was opened from, to go back to
+    gallery_stash: Option<Box<Gallery>>,
     tree_width: u16,
     prompt: Option<Prompt>,
     message: Option<(String, Instant)>,
@@ -463,6 +469,7 @@ impl App {
             wrap: false,
             history: None,
             picker: Picker::halfblocks(),
+            gallery_stash: None,
             tree_width: 0,
             prompt: None,
             message: None,
@@ -483,6 +490,9 @@ impl App {
             if !target.is_dir() {
                 app.focus = Focus::Content;
             }
+        } else {
+            // No README: a folder of images shows them
+            app.show_gallery(&target);
         }
         Ok(app)
     }
@@ -502,6 +512,7 @@ impl App {
         match &self.shown {
             Shown::Doc(doc) => Some(&doc.path),
             Shown::Image(image) => Some(&image.path),
+            Shown::Gallery(gallery) => Some(&gallery.dir),
             Shown::Note(path, _) => Some(path),
             Shown::Nothing => None,
         }
@@ -521,11 +532,17 @@ impl App {
     /// any, is drawn again the new way.
     pub fn set_picker(&mut self, picker: Picker) {
         self.picker = picker;
-        if let Shown::Image(image) = &self.shown
-            && image.source != Source::History
-        {
-            let path = image.path.clone();
-            self.open(&path);
+        match &self.shown {
+            Shown::Image(image) if image.source != Source::History => {
+                let path = image.path.clone();
+                self.open(&path);
+            }
+            Shown::Gallery(gallery) => {
+                let dir = gallery.dir.clone();
+                self.shown = Shown::Nothing;
+                self.show_gallery(&dir);
+            }
+            _ => {}
         }
     }
 
@@ -554,7 +571,10 @@ impl App {
     /// Opens a file on disk, or inside an archive.
     fn open(&mut self, path: &Path) {
         self.shown = if path.exists() {
-            if picture::is_image(path) {
+            if external::is_video(path) && path.is_file() {
+                let size = fs::metadata(path).map_or(0, |m| m.len());
+                Shown::Note(path.into(), format!("Video, {}. Click it, or press Enter, to play it.", human_size(size)))
+            } else if picture::is_image(path) {
                 let bytes = match fs::metadata(path) {
                     Ok(m) if !m.is_file() => Err(anyhow::anyhow!("not a regular file")),
                     Ok(m) if m.len() > 50 << 20 => Err(anyhow::anyhow!("too large ({})", human_size(m.len()))),
@@ -1027,11 +1047,53 @@ impl App {
     /// Shows the selected file as the selection moves, unless that would drop unsaved changes.
     fn preview(&mut self) {
         let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
-        if row.is_dir || self.dirty() || self.showing(&row.path) {
+        let (is_dir, path) = (row.is_dir, row.path.clone());
+        if is_dir {
+            // A folder of images shows its thumbnails
+            return self.show_gallery(&path);
+        }
+        if !self.dirty() && !self.showing(&path) {
+            self.open(&path);
+        }
+    }
+
+    /// Shows the thumbnails of a folder's images, if it has any.
+    fn show_gallery(&mut self, dir: &Path) {
+        if self.dirty() || self.showing(dir) || !dir.is_dir() {
             return;
         }
-        let path = row.path.clone();
+        // Back in the folder an image was opened from: its thumbnails are still there
+        if let Some(gallery) = self.gallery_stash.take_if(|g| g.dir == dir) {
+            self.shown = Shown::Gallery(gallery);
+            return;
+        }
+        let images = gallery::images_in(dir);
+        if !images.is_empty() {
+            self.shown = Shown::Gallery(Box::new(Gallery::new(dir.to_path_buf(), images)));
+        }
+    }
+
+    /// Opens the selected thumbnail's image, keeping the thumbnails to go back to.
+    fn open_from_gallery(&mut self) {
+        if !matches!(self.shown, Shown::Gallery(_)) {
+            return;
+        }
+        let Shown::Gallery(gallery) = std::mem::replace(&mut self.shown, Shown::Nothing) else { return };
+        let path = gallery.images[gallery.selected].clone();
+        self.gallery_stash = Some(gallery);
+        self.tree.reveal(&path);
         self.open(&path);
+        self.focus = Focus::Content;
+    }
+
+    /// From an image back to the thumbnails it was opened from.
+    fn back_to_gallery(&mut self) -> bool {
+        let Shown::Image(image) = &self.shown else { return false };
+        let Some(dir) = image.path.parent().map(Path::to_path_buf) else { return false };
+        let Some(gallery) = self.gallery_stash.take_if(|g| g.dir == dir) else { return false };
+        self.tree.reveal(&dir);
+        self.shown = Shown::Gallery(gallery);
+        true
     }
 
     fn tree_activate(&mut self, enter: bool) {
@@ -1040,7 +1102,7 @@ impl App {
         if !is_dir {
             self.request_open(path.clone());
             self.focus = Focus::Content;
-            self.browse(&path);
+            self.hand_off(&path);
         } else if archive && self.tree.filter.is_some() {
             // The filter doesn't look inside archives, so open it in the full tree
             self.tree.set_filter(None);
@@ -1055,6 +1117,28 @@ impl App {
     }
 
     fn view_key(&mut self, key: KeyEvent) {
+        if let Shown::Gallery(gallery) = &mut self.shown {
+            let (across, rows) = (gallery.per_row as isize, gallery.rows_shown.max(1) as isize);
+            match key.code {
+                KeyCode::Left | KeyCode::Char('h') => gallery.select(-1),
+                KeyCode::Right | KeyCode::Char('l') => gallery.select(1),
+                KeyCode::Up | KeyCode::Char('k') => gallery.select(-across),
+                KeyCode::Down | KeyCode::Char('j') => gallery.select(across),
+                KeyCode::PageUp => gallery.select(-across * rows),
+                KeyCode::PageDown => gallery.select(across * rows),
+                KeyCode::Home | KeyCode::Char('g') => gallery.select(isize::MIN / 2),
+                KeyCode::End | KeyCode::Char('G') => gallery.select(isize::MAX / 2),
+                KeyCode::Char('+' | '=') => gallery.resize(25),
+                KeyCode::Char('-' | '_') => gallery.resize(-25),
+                KeyCode::Enter => self.open_from_gallery(),
+                KeyCode::Char('q') => self.request_quit(),
+                _ => {}
+            }
+            return;
+        }
+        if matches!(key.code, KeyCode::Esc | KeyCode::Backspace) && self.back_to_gallery() {
+            return;
+        }
         let (page, width) = (self.page(), self.text_width());
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -1391,7 +1475,9 @@ impl App {
                     self.tree.scroll = self.tree.scroll.saturating_add_signed(delta).min(max);
                 } else if self.content_area.contains(at) {
                     let (page, width) = (self.page(), self.text_width());
-                    if let Some(doc) = self.doc() {
+                    if let Shown::Gallery(gallery) = &mut self.shown {
+                        gallery.scroll(delta.signum());
+                    } else if let Some(doc) = self.doc() {
                         if sideways {
                             doc.scroll_sideways(delta * 2);
                         } else {
@@ -1437,29 +1523,45 @@ impl App {
             if !double {
                 self.tree.toggle(i);
             }
+            self.show_gallery(&path);
         } else {
             self.request_open(path.clone());
             if double {
                 self.focus = Focus::Content;
             } else {
-                self.browse(&path);
+                self.hand_off(&path);
             }
         }
     }
 
-    /// Opens a web page in the browser as well. Only on a click or Enter, not while the
-    /// selection moves past it, and only for files on disk.
-    fn browse(&mut self, path: &Path) {
-        if !external::is_web_page(path) || !path.is_file() {
+    /// Opens a web page in the browser, or a video in the video player, as well as
+    /// showing it here. Only on a click or Enter, not while the selection moves past,
+    /// and only for files on disk.
+    fn hand_off(&mut self, path: &Path) {
+        let program = if external::is_web_page(path) {
+            "the browser"
+        } else if external::is_video(path) {
+            "the video player"
+        } else {
+            return;
+        };
+        if !path.is_file() {
             return;
         }
         match external::open(path) {
-            Ok(()) => self.say(format!("Opened {} in the browser", file_name(path))),
-            Err(e) => self.say(format!("Couldn't start the browser: {e}")),
+            Ok(()) => self.say(format!("Opened {} in {program}", file_name(path))),
+            Err(e) => self.say(format!("Couldn't open {}: {e}", file_name(path))),
         }
     }
 
     fn content_click(&mut self, x: u16, y: u16, double: bool, shift: bool) {
+        if let Shown::Gallery(gallery) = &mut self.shown {
+            if let Some(i) = gallery.at(x, y) {
+                gallery.selected = i;
+                self.open_from_gallery();
+            }
+            return;
+        }
         let (area, gutter, width) = (self.content_area, self.gutter, self.text_width());
         let Some(doc) = self.doc() else { return };
         if doc.formatted() {
@@ -1707,6 +1809,16 @@ impl App {
                 header(f, area, &title, &format!("{} · {} ", image.picture.info, human_size(image.bytes)), focused);
                 image.picture.draw(f, body);
             }
+            Shown::Gallery(gallery) => {
+                let rel = relative(&gallery.dir, &root);
+                let title = if rel.is_empty() { format!(" {}", tilde(&gallery.dir)) } else { format!(" {rel}/") };
+                let count = gallery.images.len();
+                let plural = if count == 1 { "" } else { "s" };
+                header(f, area, &title, &format!("{count} image{plural} · {} px ", gallery.width_px), focused);
+                let grid =
+                    Rect::new(body.x + 1, body.y + 1, body.width.saturating_sub(2), body.height.saturating_sub(1));
+                gallery.draw(f, grid, &self.picker, focused);
+            }
             Shown::Doc(doc) => {
                 let mut flags = Vec::new();
                 if doc.disk_changed {
@@ -1791,6 +1903,8 @@ impl App {
             (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ open · Esc files · ⇥ view · q quit",
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) => "↑↓ move · ⏎ open · ←→ fold · / filter · H history · ⇥ file · q quit",
+            (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
+            (Shown::Image(_), _) if self.gallery_stash.is_some() => "Esc back to the thumbnails · ⇥ tree · q quit",
             (Shown::Doc(doc), _) if doc.editing => {
                 "Esc done · ^S save · ^Z/^Y undo/redo · ^C ^X ^V copy/cut/paste · ^F find · Alt+Z wrap · ⇥ tree"
             }
@@ -1807,6 +1921,9 @@ impl App {
     }
 
     fn position(&self) -> String {
+        if let Shown::Gallery(gallery) = &self.shown {
+            return format!("{}/{}", gallery.selected + 1, gallery.images.len());
+        }
         let Shown::Doc(doc) = &self.shown else { return String::new() };
         if self.editing() {
             let c = doc.buf.cursor;
@@ -2351,6 +2468,65 @@ mod tests {
         let opened = external::OPENED.with(|o| o.borrow().clone());
         assert_eq!(opened, vec![h.root.join("page.html")]);
         assert!(h.screen().contains("Opened page.html in the browser"), "{}", h.screen());
+    }
+
+    fn write_png(path: &Path, width: u32, height: u32) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut image = image::RgbImage::new(width, height);
+        for (x, y, pixel) in image.enumerate_pixels_mut() {
+            *pixel = image::Rgb([(x * 20) as u8, (y * 20) as u8, 180]);
+        }
+        image.save(path).unwrap();
+    }
+
+    #[test]
+    fn a_folder_of_images_shows_thumbnails() {
+        let mut h = Harness::new(&[("notes.txt", "notes\n")]);
+        for name in ["c.png", "a.png", "b.jpg"] {
+            write_png(&h.root.join("pics").join(name), 12, 8);
+        }
+        h.app.tree.refresh();
+        h.draw();
+        // Arrowing onto the folder shows its images, by name
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Up);
+        assert!(h.screen().contains("3 images"), "{}", h.screen());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.screen().contains('…') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            h.draw();
+        }
+        let screen = h.screen();
+        assert!(!screen.contains('…'), "all thumbnails decoded:\n{screen}");
+        let (a, b, c) = (h.find("a.png"), h.find("b.jpg"), h.find("c.png"));
+        // Two fit across this pane; the third starts the next row
+        assert!(a.1 == b.1 && a.0 < b.0 && c.1 > a.1 && c.0 == a.0, "a grid, sorted by name:\n{screen}");
+
+        // A click opens one; Esc goes back to the thumbnails
+        h.click(b.0, b.1);
+        assert!(h.screen().contains("12×8 JPG"), "{}", h.screen());
+        assert!(h.screen().contains("pics/b.jpg"), "{}", h.screen());
+        h.key(KeyCode::Esc);
+        assert!(h.screen().contains("3 images"), "{}", h.screen());
+        assert_eq!(h.app.position(), "2/3");
+
+        // Keys move between them and open the selected one
+        h.key(KeyCode::Right);
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("pics/c.png"), "{}", h.screen());
+    }
+
+    #[test]
+    fn clicking_a_video_plays_it() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "\0\0\0\x18ftypmp42")]);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Down);
+        assert!(h.screen().contains("Video, "), "{}", h.screen());
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        let (x, y) = h.find("  clip.mp4");
+        h.click(x + 2, y);
+        assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
+        assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
     }
 
     #[test]

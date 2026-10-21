@@ -1,4 +1,4 @@
-//! Handing files to other programs: web pages to the browser.
+//! Handing files to other programs: web pages to the browser, videos to the player.
 
 use std::{io, path::Path};
 
@@ -9,6 +9,28 @@ thread_local! {
 
 pub fn is_web_page(path: &Path) -> bool {
     path.extension().is_some_and(|e| matches!(e.to_string_lossy().to_lowercase().as_str(), "html" | "htm" | "xhtml"))
+}
+
+pub fn is_video(path: &Path) -> bool {
+    path.extension().is_some_and(|e| {
+        matches!(
+            e.to_string_lossy().to_lowercase().as_str(),
+            "mp4"
+                | "m4v"
+                | "mkv"
+                | "webm"
+                | "mov"
+                | "avi"
+                | "wmv"
+                | "flv"
+                | "mpg"
+                | "mpeg"
+                | "ogv"
+                | "3gp"
+                | "mts"
+                | "m2ts"
+        )
+    })
 }
 
 /// Opens `path` in the desktop's default program for it, which for HTML is the browser.

@@ -6,6 +6,7 @@ mod archive;
 mod buffer;
 mod clipboard;
 mod external;
+mod gallery;
 mod git;
 mod highlight;
 mod markdown;
@@ -64,8 +65,10 @@ Mouse
   divider to resize the tree.
 
 Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
-archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, and
-clicking an HTML file (or Enter on it) opens it in the browser too.
+archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, a
+folder with images in it shows them as thumbnails (+/- to resize, Enter or a
+click to open one, Esc to go back), and clicking an HTML file or a video (or
+Enter on it) opens it in the browser or the video player.
 
 Environment
   README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)
