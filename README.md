@@ -1,85 +1,203 @@
 # readme
 
-A terminal file viewer and basic editor: a directory tree on the left, the file
-on the right, and the mouse works everywhere. It reads source code, Markdown,
-CSV, images, archives and git history, and it was made for a
-[herdr](https://herdr.dev) pane next to coding agents, picking up their edits
-as they land.
+**A file viewer and basic editor for the terminal.** A directory tree on the left, the
+file on the right, and the mouse works everywhere. It reads source code, Markdown, CSV,
+images, archives and git history, finds text across a whole project, and keeps up with
+files as other programs change them.
 
-![Markdown rendered, next to the directory tree](docs/screenshots/markdown.png)
+It was made for a [herdr](https://herdr.dev) pane next to coding agents: you watch
+their edits land, read what they wrote, look back through the history, and fix a line
+yourself, without leaving the terminal.
 
-## Features
+![readme showing a project's README rendered, next to the directory tree](docs/screenshots/markdown.png)
 
-- **Tree**: directories first, folding as you click them. Dotfiles and anything
-  `.gitignore` leaves out (`target/`, `node_modules/`) stay hidden until you
-  press `.`. Press `/` to filter the whole tree by name as you type. It
-  refreshes itself every couple of seconds.
-- **Find in files**: `F` searches the text of every file under the tree's
-  folder, on all the CPU cores, skipping binary files, text files over 10 MB
-  (the list ends by saying how many), and whatever the tree hides (ignored
-  files, `node_modules`, `target`; press `.` first to include them). Matches fill the left pane as they're found; moving through them shows
-  each file at its line, and `n`/`N` step through the rest of that file.
-- **Source**: syntax highlighting for the languages [bat](https://github.com/sharkdp/bat)
-  knows, in the terminal's own colors, with line numbers, search, and word wrap
-  (`w`).
-- **Markdown** shows rendered: headings, lists, task lists, tables, quotes,
-  links, and code blocks with highlighting. `m` switches to the raw text and
-  back, keeping your place.
-- **CSV and TSV** show as a table, with aligned columns, numbers lined up on the
-  right, and the header row kept on screen as you scroll.
-- **Images** (PNG, JPEG, GIF, WebP, BMP, TIFF and more) show in the terminal:
-  with real pixels where the terminal has a graphics protocol (Kitty, Sixel,
-  iTerm2), and with colored half-blocks anywhere else. The wheel (or `+` and
-  `-`) zooms, dragging or the arrow keys move around, and `0` fits it again.
-- **Archives**: zip files and tar files (plain, `.gz`, `.bz2`, `.xz`, `.zst`)
-  open in the tree like directories, and the files inside them open like any
-  other, without unpacking anything. A tar file has no index, so a very big
-  compressed one is listed as far as readme gets through it in a few seconds.
-- **Thumbnails**: select a folder with images in it and the right pane shows
-  them as a grid, 100 pixels wide (`+` and `-` change that). Click one, or
-  press `Enter`, to open it, and `Esc` to go back.
-- **Web pages and videos**: clicking an HTML file or a video, or pressing
-  `Enter` on it, opens it in your browser or video player.
-- **Git history**: `H` lists the commits behind the selected file or folder,
-  in whatever repository it's in (repositories show a ⎇ in the tree). For a
-  file, each commit shows the file as it was then, or with `d` what changed,
-  following it back through renames; for a folder, each shows the whole commit.
-  Open a commit to go through the files it changed, and `←` widens a file's
-  history to its folder, and on up to the whole repository.
-- **Managing files**: mark files in the tree with `Space` or `Ctrl`+click
-  (`Shift`+`↑↓` for a range), then press `Delete` to send them to the trash or
-  drag them onto a folder to move them. `F2` renames. Both ask first, nothing
-  gets overwritten, and an open file follows its new name.
-- **Editing**: `e` starts editing and `Esc` stops. Selection, undo and redo,
-  clipboard, auto-indent, and a prompt before unsaved changes would be lost.
-- **Live**: when something else changes the open file, it reloads. If you have
-  unsaved changes, it marks the file as changed on disk instead.
-- **Clipboard**: selecting text with the mouse copies it, to the clipboard and
-  to the primary selection. Uses `wl-copy` on Wayland, `xclip` or `xsel` on X11,
-  and OSC 52 otherwise, which also works over ssh.
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
 
-| | |
-|---|---|
-| ![Source with highlighting and a search](docs/screenshots/code.png) | ![Editing, with a mouse selection](docs/screenshots/edit.png) |
-| Source, with a search | Editing, with a mouse selection |
-| ![A CSV file as a table](docs/screenshots/table.png) | ![An image in half-blocks](docs/screenshots/image.png) |
-| CSV as a table | An image, in half-blocks |
-| ![Git history, with a commit's diff](docs/screenshots/history.png) | ![The tree filtered by name](docs/screenshots/filter.png) |
-| A commit's diff | The tree filtered by name |
-| ![A file inside a tar.gz](docs/screenshots/archive.png) | |
-| Inside a `.tar.gz` | |
+```
+cargo install --git https://github.com/bhoult/readme
+readme ~/src/project
+```
+
+Or let your AI coding agent do it: point Claude Code, Codex or the like at
+`https://github.com/bhoult/readme` and say "install this on my machine". readme was
+designed to be [customized the same way](#make-it-yours). So far it has only been tested
+on Linux.
+
+## At a glance
+
+- [**Tree**](#the-tree) of the folder, with folding, a name filter, and hidden and ignored files kept out of the way
+- [**Markdown**](#markdown) rendered: headings, lists, task lists, tables, quotes, links, highlighted code
+- [**Source code**](#source-code) highlighted for every language [bat](https://github.com/sharkdp/bat) knows, with search, word wrap and sideways scrolling
+- [**Editing**](#editing) with selection, undo, the system clipboard, and each line's own line ending kept
+- [**CSV and TSV**](#csv-and-tsv-tables) as aligned tables with the header kept on screen
+- [**Images**](#images) with real pixels in terminals that can show them, and colored half-blocks anywhere else
+- [**Thumbnails**](#thumbnails) of a folder of images, in a grid
+- [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
+- [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
+- [**Find in files**](#find-in-files) across the whole tree, on every CPU core
+- [**Managing files**](#managing-files): mark, drag to move, rename, send to the trash
+- [**Live reload**](#live-reload) when another program changes the open file
+- [**Web pages and videos**](#web-pages-and-videos) open in the browser and the video player
+
+## The tree
+
+Directories come first and fold open as you click them. Dotfiles and whatever
+`.gitignore` leaves out (`target/`, `node_modules/`) stay hidden until you press `.`.
+Git repositories show a ⎇. The tree reads the disk again every couple of seconds, so new
+files appear on their own.
+
+Press `/` and type to filter the whole tree by name. Every word has to match somewhere in
+the path, so `src ar` finds `src/archive.rs` and `src/markdown.rs` but not
+`docs/archive.png`.
+
+![The tree filtered to the files whose paths match "src" and "ar"](docs/screenshots/filter.png)
+
+## Markdown
+
+Markdown shows rendered: headings, lists, task lists, tables, block quotes, links with
+their targets, and fenced code with syntax highlighting (the screenshot at the top). `m`
+switches to the raw text and back, keeping your place, even inside a long paragraph or a
+table. Wide tables and long code lines keep their shape and scroll sideways rather than
+being squeezed.
+
+## Source code
+
+Highlighting covers every language bat knows, in the terminal's own colors, so it suits
+light and dark themes alike. Line numbers, `/` search with `n` and `N`, and `w` for word
+wrap. Without wrap, `←` and `→` scroll sideways, and the title says `more →` when a line
+on screen runs past the edge.
+
+Big files open straight away: colors are worked out a slice at a time, as far down as
+you look.
+
+![Source code with syntax highlighting and a search for "fn wrap"](docs/screenshots/code.png)
+
+## Editing
+
+Press `e` to edit and `Esc` to stop; `Ctrl+S` saves. Select with the mouse or
+`Shift`+arrows, jump by words with `Ctrl`, undo and redo, and cut, copy and paste with
+the system clipboard. New lines keep their indentation. Dragging across text copies it
+straight away, the way terminals do. If you try to leave with unsaved changes, readme
+asks first.
+
+Files come back the way they went in: tabs stay tabs, a missing newline at the end stays
+missing, and a file that mixes Windows and Unix line endings keeps each line's own.
+
+![Editing a Rust file, with a word selected by the mouse](docs/screenshots/edit.png)
+
+## CSV and TSV tables
+
+CSV and TSV files show as tables: aligned columns, numbers lined up on the right, row
+numbers down the side, and the header row kept on screen as you scroll. `m` shows the raw
+text.
+
+![A CSV file of sales figures shown as a table](docs/screenshots/table.png)
+
+A table wider than the pane scrolls sideways with `←` and `→`, while the row numbers stay
+put.
+
+![A wide CSV table scrolled sideways, with "← more →" in the title](docs/screenshots/sideways.png)
+
+## Images
+
+PNG, JPEG, GIF, WebP, BMP, TIFF, TGA, QOI, ICO, PNM and HDR images show in the terminal:
+with real pixels where it has a graphics protocol (Kitty, Ghostty, WezTerm, Konsole,
+iTerm2, Sixel terminals), and with colored half-blocks anywhere else, as in these
+screenshots. The wheel or `+` and `-` zoom (toward the pointer), dragging or the arrow
+keys move around, and `0` or a double-click fits the image again.
+
+![A Mandelbrot set image drawn in half-blocks](docs/screenshots/image.png)
+
+## Thumbnails
+
+Select a folder with images in it and the right pane shows them as a grid. They load in
+the background, on every core but one, as they come into view. `+` and `-` (or
+`Ctrl`+wheel) change their size, and a click or `Enter` opens one; `Esc` goes back to the
+grid.
+
+![A folder of nine images shown as thumbnails](docs/screenshots/thumbnails.png)
+
+## Archives
+
+Zip files (and `.jar`, `.whl`, `.epub`) and tar files, plain or compressed with gzip,
+bzip2, xz or zstd, open in the tree like folders. The files inside open like any other,
+highlighted or rendered, without anything being unpacked to disk. A tar file has no
+index, so a very big compressed one is listed as far as readme gets through it in a few
+seconds.
+
+![A Python file inside a .tar.gz, open in the viewer](docs/screenshots/archive.png)
+
+## Git history
+
+Press `H` on any file or folder in a git repository. For a file, you get the commits that
+touched it, following it back through renames. Each one shows the file as it was then,
+or with `d`, what that commit changed. `Enter` opens a commit to go through every file it
+changed, `a` lists all the files as of that commit, and `←` widens a file's history to its
+folder and on up to the whole repository.
+
+![The history of report.py, with one commit's diff](docs/screenshots/history.png)
+
+## Find in files
+
+`F` searches the text of every file under the tree's folder, on all the CPU cores.
+Matches fill the left pane as they're found, grouped by file. Moving through them shows
+each file at its line with the match marked, and `n` and `N` step through the rest of
+that file. Binary files are skipped, as is whatever the tree hides (press `.` first to
+include it). Text files over 10 MB are skipped too, and the list ends by saying how many.
+Case doesn't matter unless the search has a capital letter in it.
+
+![Find in files: matches for "region" in four files, one shown on the right](docs/screenshots/grep.png)
+
+## Managing files
+
+Mark files with `Space` or `Ctrl`+click (`Shift`+`↑`/`↓` or `Shift`+click for a range).
+Then drag them onto a folder to move them there, or press `Delete` to send them to the
+trash. `F2` renames. Each of these asks before it does anything, nothing gets
+overwritten, and an open file follows its new name.
+
+![Two marked CSV files being dragged onto the src folder](docs/screenshots/files.png)
+
+## Live reload
+
+When something else changes the open file, readme reloads it and keeps your place, so
+you can watch a log grow or an agent write. If you have unsaved changes of your own, it
+keeps them and marks the file as changed on disk instead.
+
+## Web pages and videos
+
+Clicking an HTML file, or pressing `Enter` on it, opens it in your browser; a video opens
+in your video player.
+
+## Make it yours
+
+readme was designed to be customized by your favorite LLM. Want different keys, other
+colors, a file type it doesn't show yet, or a feature only you need? Open the project in
+Claude Code, Codex or whatever agent you use and ask for it.
+
+It's built to make that easy. It's plain Rust in a handful of files, one job each (listed
+under [Building](#building)), with comments that say why things are the way they are. The
+tests drive the whole app, keys, mouse and all, so an agent can check that its change
+didn't break anything else.
 
 ## Install
 
-You need Rust 1.90 or newer and a C compiler (for the xz and zstd decoders), plus
-`git` for the history view.
+So far readme has only been tested on Linux. Other systems may need changes, which is a
+good first job for your LLM.
+
+The easy way: point Claude Code, Codex or another coding agent at
+`https://github.com/bhoult/readme` and say "install this on my machine". It will sort
+out what's needed.
+
+By hand, you need Rust 1.90 or newer and a C compiler (for the xz and zstd decoders),
+plus `git` for the history view.
 
 ```
 cargo install --git https://github.com/bhoult/readme
 ```
 
-Or clone it and run `./install.sh`, which builds a release binary and puts it
-in `~/.local/bin/readme`.
+Or clone it and run `./install.sh`, which builds a release binary and puts it in
+`~/.local/bin/readme`.
 
 ## Use
 
@@ -94,60 +212,72 @@ readme src/main.rs  # open a file, with its directory in the tree
 | Where | Keys |
 |---|---|
 | Anywhere | `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` quit |
-| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `q` quit |
+| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `F` find in files · `q` quit |
 | Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
-| Find in files | `F` search · `↑↓` matches · `Enter` go to it · `n` `N` within the file · `Esc` back to the tree |
+| Find in files | `↑↓` matches · `Enter` go to it · `n` `N` within the file · `F` search again · `Esc` back to the tree |
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `Esc` leave |
 
-`Tab` always switches panes, even while editing, so there is no key that
-inserts a tab character. `Enter` keeps the line's indentation. With word wrap
-on, the arrow keys move by screen row.
+`Tab` always switches panes, even while editing, so there is no key that inserts a tab
+character. `Enter` keeps the line's indentation. With word wrap on, the arrow keys move
+by screen row.
 
 ### Mouse
 
-- Click a directory or an archive to fold or unfold it; click a file to open
-  it (an HTML file opens in the browser too); double-click a file to move into it.
+- Click a directory or an archive to fold or unfold it; click a file to open it (an HTML
+  file or a video opens in its own program too); double-click a file to move into it.
 - The wheel scrolls whichever pane it's over; `Shift`+wheel scrolls sideways.
-- Drag across text to select and copy it. While editing, a click moves the
-  cursor and a double-click selects a word; while viewing, a double-click
-  starts editing there. Middle-click pastes the primary selection while editing.
-- In the history, click a commit or file to show it, double-click to open it,
-  and click the title to go back.
-- `Ctrl`+click marks files in the tree; drag a file, or marked files, onto a
-  folder to move them there.
-- On an image, the wheel zooms toward the pointer, dragging moves it, and a
-  double-click fits it again. Over thumbnails, `Ctrl`+wheel resizes them.
+- Drag across text to select and copy it. While editing, a click moves the cursor and a
+  double-click selects a word; while viewing, a double-click starts editing there.
+  Middle-click pastes the primary selection while editing.
+- In the history, click a commit or file to show it, double-click to open it, and click
+  the title to go back.
+- `Ctrl`+click marks files in the tree; drag a file, or marked files, onto a folder to
+  move them there.
+- On an image, the wheel zooms toward the pointer, dragging moves it, and a double-click
+  fits it again. Over thumbnails, `Ctrl`+wheel resizes them.
 - Drag the divider between the panes to resize the tree.
+
+### Clipboard
+
+Selecting text with the mouse copies it, to the clipboard and to the primary selection.
+readme uses `wl-copy` and `wl-paste` on Wayland, `xclip` or `xsel` on X11, and the OSC 52
+escape sequence otherwise, which also reaches your own clipboard over ssh.
 
 ### Images and terminal multiplexers
 
-Outside a multiplexer, readme asks the terminal what it can draw and uses real
-graphics if it can (Kitty, Ghostty, WezTerm, Konsole, iTerm2, and Sixel
-terminals). Inside tmux, zellij or screen it draws half-blocks, because those
-answer the question themselves even when the terminal around them can't show
-the result.
+Outside a multiplexer, readme asks the terminal what it can draw and uses real graphics
+if it can. Inside tmux, zellij or screen it draws half-blocks, because those answer the
+question themselves even when the terminal around them can't show the result.
 
-Inside [herdr](https://herdr.dev), which passes Kitty graphics on only to
-Ghostty, WezTerm and kitty, readme looks at the terminal each herdr window runs
-in, the way herdr does. When every window attached to the session is in one of
-those, images use real pixels; otherwise half-blocks (Linux only). So run herdr
-in Ghostty, say, rather than GNOME Terminal, and keep any other windows on that
-session in such a terminal too.
+Inside [herdr](https://herdr.dev), which passes Kitty graphics on only to Ghostty,
+WezTerm and kitty, readme looks at the terminal each herdr window runs in, the way herdr
+does. When every window attached to the session is in one of those, images use real
+pixels; otherwise half-blocks (Linux only). So run herdr in Ghostty, say, rather than
+GNOME Terminal, and keep any other windows on that session in such a terminal too.
 
-`README_IMAGES` overrides the choice: `kitty`, `sixel`, `iterm2`, `halfblocks`,
-or `auto` to ask the terminal.
+`README_IMAGES` overrides the choice: `kitty`, `sixel`, `iterm2`, `halfblocks`, or `auto`
+to ask the terminal.
 
 ### Colors
 
-Highlighting uses bat's `ansi` theme by default, which draws with the
-terminal's own palette, so it suits light and dark themes alike. Set
-`README_THEME` to use another of bat's themes, for example `Nord`,
+Highlighting uses bat's `ansi` theme by default, which draws with the terminal's own
+palette. Set `README_THEME` to use another of bat's themes, for example `Nord`,
 `Monokai Extended` or `GitHub`.
+
+## Built to stay quick
+
+- Searching, filtering and thumbnails use every CPU core.
+- Syntax colors are worked out only as far as you've looked, a slice per frame, and kept
+  across reloads down to the first line that changed.
+- Memory stays bounded: files over 50 MB aren't opened, Markdown over 5 MB shows as text,
+  thumbnails decode within a shared 1 GB budget, and git output is capped.
+- Nothing waits forever: a stuck clipboard program, a terminal that never answers, and a
+  huge archive each get a time limit.
 
 ## Building
 
@@ -156,21 +286,25 @@ cargo build --release
 cargo test
 ```
 
-The tests include the whole app driven through ratatui's test backend, mouse
-clicks and drags included.
+The tests include the whole app driven through ratatui's test backend, mouse clicks and
+drags included.
 
 | File | |
 |---|---|
 | `src/main.rs` | terminal setup and the event loop |
 | `src/app.rs` | state, keys, mouse, drawing |
 | `src/tree.rs` | the directory tree and its filter |
-| `src/buffer.rs` | the text being edited: cursor, selection, undo |
+| `src/buffer.rs` | the text being edited: cursor, selection, undo, line endings |
 | `src/highlight.rs` | syntect highlighting, cached and computed only as far as shown |
 | `src/markdown.rs` | the Markdown renderer |
 | `src/table.rs` | CSV and TSV as tables |
-| `src/picture.rs` | images |
+| `src/picture.rs` | images, and asking the terminal how to draw them |
+| `src/gallery.rs` | the thumbnail grid |
 | `src/archive.rs` | reading zip and tar archives |
 | `src/git.rs` | history, through the `git` command |
+| `src/grep.rs` | find in files |
+| `src/fileops.rs` | trash, rename and move |
+| `src/external.rs` | opening web pages and videos in other programs |
 | `src/text.rs` | column math, wrapping, search, styled line slices |
 | `src/clipboard.rs` | copy and paste |
 
@@ -180,9 +314,9 @@ Built with [ratatui](https://ratatui.rs) and
 [two-face](https://github.com/CosmicHorrorDev/two-face) for bat's syntaxes,
 [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark),
 [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore),
-[csv](https://github.com/BurntSushi/rust-csv), [zip](https://github.com/zip-rs/zip2)
-and [tar](https://github.com/alexcrichton/tar-rs).
+[csv](https://github.com/BurntSushi/rust-csv), [image](https://github.com/image-rs/image),
+[zip](https://github.com/zip-rs/zip2) and [tar](https://github.com/alexcrichton/tar-rs).
 
 ## License
 
-MIT
+[MIT](LICENSE)
