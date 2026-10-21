@@ -38,6 +38,8 @@ const MESSAGE_FOR: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const TREE_REFRESH: Duration = Duration::from_secs(2);
 const WHEEL: isize = 3;
+/// Columns an arrow key scrolls sideways
+const SIDEWAYS: isize = 8;
 /// Markdown bigger than this opens as plain text
 const MAX_RENDERED: usize = 5 << 20;
 
@@ -97,7 +99,7 @@ struct Doc {
     /// Column within a wrapped row, kept while moving up and down
     wrap_x: Option<usize>,
     /// The formatted view, with the buffer version, width and highlighting it was made for
-    rendered: Option<((u64, u16, bool), Rendered)>,
+    rendered: Option<((u64, u16, bool, bool), Rendered)>,
     /// First formatted line below the pinned ones, and how far it's scrolled sideways
     fmt_top: usize,
     fmt_left: usize,
@@ -108,6 +110,10 @@ struct Doc {
     disk: (Option<SystemTime>, u64),
     /// Changed on disk while it had unsaved changes here
     disk_changed: bool,
+    /// The longest line's width, roughly, for the buffer version it was measured on
+    widest: Option<(u64, usize)>,
+    /// Whether the view's cut off anything to the left, and to the right
+    more: (bool, bool),
 }
 
 fn disk_stamp(path: &Path) -> (Option<SystemTime>, u64) {
@@ -138,6 +144,8 @@ impl Doc {
             left: 0,
             wrap_x: None,
             rendered: None,
+            widest: None,
+            more: (false, false),
             fmt_top: 0,
             fmt_left: 0,
             fmt_sync: None,
@@ -155,12 +163,12 @@ impl Doc {
     fn render(&mut self, width: u16) -> &Rendered {
         // Tables don't depend on the width, so resizing doesn't redo them
         let width = if let Kind::Table(_) = self.kind { 0 } else { width };
-        let key = (self.buf.version, width, highlight::get().is_some());
+        let key = (self.buf.version, width, highlight::get().is_some(), self.wrap);
         if self.rendered.as_ref().is_none_or(|(k, _)| *k != key) {
             let text = self.buf.lines.join("\n");
             let rendered = match self.kind {
                 Kind::Table(delimiter) => table::render(&text, delimiter),
-                _ => markdown::render(&text, width),
+                _ => markdown::render(&text, width, self.wrap),
             };
             self.rendered = Some((key, rendered));
         }
@@ -1439,9 +1447,9 @@ impl App {
             KeyCode::PageDown | KeyCode::Char(' ') => doc.scroll(p, page, width),
             KeyCode::Home | KeyCode::Char('g') => doc.scroll_to(false, page, width),
             KeyCode::End | KeyCode::Char('G') => doc.scroll_to(true, page, width),
-            KeyCode::Left | KeyCode::Char('h') if doc.scrolled_sideways() => doc.scroll_sideways(-4),
+            KeyCode::Left | KeyCode::Char('h') if doc.scrolled_sideways() => doc.scroll_sideways(-SIDEWAYS),
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
-            KeyCode::Right | KeyCode::Char('l') => doc.scroll_sideways(4),
+            KeyCode::Right | KeyCode::Char('l') => doc.scroll_sideways(SIDEWAYS),
             KeyCode::Char('m') if doc.kind != Kind::Text => doc.toggle_raw(),
             _ => {}
         }
@@ -2438,13 +2446,20 @@ impl App {
                     Some(label) => label.clone(),
                     None => format!(" {}{dirty}", relative(&doc.path, &root)),
                 };
-                let flags = if flags.is_empty() { String::new() } else { format!("{} ", flags.join(" · ")) };
-                header(f, area, &title, &flags, focused);
                 if doc.formatted() {
                     draw_formatted(f, doc, body, search.as_deref());
                 } else {
                     self.gutter = draw_source(f, doc, body, focused, search.as_deref());
                 }
+                let more = match doc.more {
+                    (true, true) => Some("← more →"),
+                    (true, false) => Some("← more"),
+                    (false, true) => Some("more →"),
+                    _ => None,
+                };
+                flags.extend(more);
+                let flags = if flags.is_empty() { String::new() } else { format!("{} ", flags.join(" · ")) };
+                header(f, area, &title, &flags, focused);
             }
         }
     }
@@ -2573,6 +2588,7 @@ fn draw_formatted(f: &mut Frame, doc: &mut Doc, area: Rect, search: Option<&str>
     let max_top = rendered.lines.len().saturating_sub(body).max(rendered.pinned);
     doc.fmt_top = doc.fmt_top.clamp(rendered.pinned, max_top);
     doc.fmt_left = doc.fmt_left.min(rendered.width.saturating_sub(text.width as usize));
+    doc.more = (doc.fmt_left > 0, doc.fmt_left + (text.width as usize) < rendered.width);
     let (top, left, gutter) = (doc.fmt_top, doc.fmt_left, rendered.gutter);
     let lines: Vec<Line> = rendered.lines[..pinned]
         .iter()
@@ -2601,6 +2617,19 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     doc.top = doc.top.min(total - 1);
     if !doc.wrap {
         doc.top_row = 0;
+        // No scrolling past the end of the longest line (tabs count at their widest)
+        let version = doc.buf.version;
+        let widest = match doc.widest {
+            Some((v, widest)) if v == version => widest,
+            _ => {
+                let widest =
+                    doc.buf.lines.iter().map(|l| l.len() + 3 * l.bytes().filter(|&b| b == b'\t').count()).max();
+                let widest = widest.unwrap_or(0);
+                doc.widest = Some((version, widest));
+                widest
+            }
+        };
+        doc.left = doc.left.min((widest + 1).saturating_sub(width));
     }
 
     // The screen rows: (line, row within it, first char, first char of the next row)
@@ -2619,6 +2648,12 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     }
     let bottom = rows.last().map_or(doc.top, |r| r.0 + 1);
     doc.colors.ensure(&doc.buf.lines, bottom);
+    doc.more = if doc.wrap {
+        (false, false)
+    } else {
+        let cut_off = rows.iter().any(|&(i, ..)| str_width(&doc.buf.lines[i]) > doc.left + width);
+        (doc.left > 0, cut_off)
+    };
 
     let selection = doc.buf.selection();
     let current = doc.last_match;
@@ -3004,6 +3039,44 @@ mod tests {
     }
 
     const LONG: &str = "one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen\nshort\n";
+
+    #[test]
+    fn arrows_scroll_long_lines_sideways() {
+        let line = format!("start {} END", "x".repeat(150));
+        let mut h = Harness::new(&[("wide.txt", &format!("{line}\nshort\n"))]);
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("more →"), "{}", h.screen());
+        assert!(!h.screen().contains("END"));
+        for _ in 0..30 {
+            h.key(KeyCode::Right);
+        }
+        // It stops at the end of the longest line, and says there's more to the left
+        let screen = h.screen();
+        assert!(screen.contains("END") && screen.contains("← more"), "{screen}");
+        assert!(!screen.contains("more →"), "{screen}");
+        // ← scrolls back first, then returns to the tree
+        for _ in 0..30 {
+            h.key(KeyCode::Left);
+        }
+        assert!(h.screen().contains("start"), "{}", h.screen());
+        assert_eq!(h.app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn wide_markdown_tables_scroll_sideways() {
+        let md = format!(
+            "# T\n\n| {} |\n|---|\n| last |\n",
+            "a heading that is far too wide for the pane ".repeat(2).trim()
+        );
+        let mut h = Harness::new(&[("README.md", &md)]);
+        h.key(KeyCode::Tab);
+        assert!(h.screen().contains("more →"), "{}", h.screen());
+        assert!(!h.screen().contains('…'), "the table isn't squeezed:\n{}", h.screen());
+        for _ in 0..10 {
+            h.key(KeyCode::Right);
+        }
+        assert!(h.screen().contains("for the pane"), "{}", h.screen());
+    }
 
     #[test]
     fn word_wrap_toggles() {

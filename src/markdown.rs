@@ -37,6 +37,9 @@ impl Rendered {
 
 type Frag = (String, Style);
 
+/// Table cells wider than this are cut short with "…"
+const MAX_CELL: usize = 60;
+
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
 }
@@ -78,9 +81,13 @@ struct Renderer {
     links: Vec<(usize, String)>,
     /// Source line of the block being rendered
     src: usize,
+    /// Wrap long code lines; otherwise they run on, to scroll to sideways
+    wrap_code: bool,
 }
 
-pub fn render(src: &str, width: u16) -> Rendered {
+/// Markdown laid out for `width` columns. Text wraps to fit; tables keep their widths
+/// and code its lines (unless `wrap_code`), and the view scrolls sideways to them.
+pub fn render(src: &str, width: u16, wrap_code: bool) -> Rendered {
     let mut line_starts = vec![0];
     line_starts.extend(src.match_indices('\n').map(|(i, _)| i + 1));
     let mut r = Renderer {
@@ -98,6 +105,7 @@ pub fn render(src: &str, width: u16) -> Rendered {
         table: None,
         links: Vec::new(),
         src: 0,
+        wrap_code,
     };
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
@@ -107,6 +115,7 @@ pub fn render(src: &str, width: u16) -> Rendered {
         r.event(event, range.start);
     }
     r.flush();
+    r.out.width = r.out.lines.iter().map(Line::width).max().unwrap_or(0);
     r.out
 }
 
@@ -394,7 +403,8 @@ impl Renderer {
                 None => vec![(line.replace('\t', "    "), Style::new().fg(Color::Yellow))],
             };
             self.src = first + i;
-            for piece in hard_wrap(&frags, room) {
+            let pieces = if self.wrap_code { hard_wrap(&frags, room) } else { vec![frags] };
+            for piece in pieces {
                 let mut out = self.prefix();
                 out.push(bar.clone());
                 out.extend(piece);
@@ -416,14 +426,10 @@ impl Renderer {
                 widths[i] = widths[i].max(cell_width(cell));
             }
         }
-        // Shrink the widest columns until the table fits
-        let room = self.room(3 * (cols - 1));
-        while widths.iter().sum::<usize>() > room {
-            let (i, &w) = widths.iter().enumerate().max_by_key(|(_, w)| **w).unwrap();
-            if w <= 3 {
-                break;
-            }
-            widths[i] -= 1;
+        // A wide table runs off to the side rather than squeezing its cells; only
+        // very long cells are cut short
+        for width in &mut widths {
+            *width = (*width).min(MAX_CELL);
         }
         for (r, row) in table.rows.iter().enumerate() {
             let mut out = self.prefix();
@@ -615,7 +621,7 @@ mod tests {
     use super::*;
 
     fn plain(md: &str, width: u16) -> Vec<String> {
-        let r = render(md, width);
+        let r = render(md, width, true);
         (0..r.lines.len()).map(|i| r.text(i)).collect()
     }
 
@@ -654,10 +660,23 @@ mod tests {
 
     #[test]
     fn source_lines_are_tracked() {
-        let r = render("# A\n\npara\n\n```\nx\ny\n```\n", 40);
+        let r = render("# A\n\npara\n\n```\nx\ny\n```\n", 40, true);
         let y = (0..r.lines.len()).find(|&i| r.text(i).contains('y')).unwrap();
         assert_eq!(r.src[y], 6);
         assert_eq!(r.line_for_src(2), 3);
+    }
+
+    #[test]
+    fn wide_tables_and_code_run_off_to_the_side() {
+        let md = "| a long heading | another long heading |\n|---|---|\n| 1 | 2 |\n\n```\nfn main() { let x = 1; let y = 2; }\n```\n";
+        let r = render(md, 20, false);
+        let lines: Vec<String> = (0..r.lines.len()).map(|i| r.text(i)).collect();
+        assert!(lines[0].contains("a long heading │ another long heading"), "{lines:?}");
+        assert!(lines.iter().any(|l| l.contains("fn main() { let x = 1; let y = 2; }")), "{lines:?}");
+        assert!(r.width > 20);
+        // With word wrap on, code still wraps
+        let wrapped = render(md, 20, true);
+        assert!(!(0..wrapped.lines.len()).any(|i| wrapped.text(i).contains("fn main() { let x = 1; let y = 2; }")));
     }
 
     #[test]
