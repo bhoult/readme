@@ -5,6 +5,7 @@ mod app;
 mod archive;
 mod buffer;
 mod clipboard;
+mod external;
 mod git;
 mod highlight;
 mod markdown;
@@ -62,14 +63,16 @@ Mouse
   select and copy it. Double-click text to start editing there. Drag the
   divider to resize the tree.
 
-Also: CSV/TSV files show as tables, images show in the terminal, and zip and
-tar archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories.
+Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
+archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, and
+clicking an HTML file (or Enter on it) opens it in the browser too.
 
 Environment
   README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)
-  README_IMAGES  halfblocks, kitty, sixel, iterm2 or auto. Inside herdr, tmux or
-                 zellij the default is halfblocks, since they claim graphics
-                 support the terminal around them may not have.
+  README_IMAGES  halfblocks, kitty, sixel, iterm2 or auto. Inside tmux or zellij
+                 the default is halfblocks, since they claim graphics support the
+                 terminal around them may not have. Inside herdr, images use real
+                 pixels when every herdr window runs in Ghostty, WezTerm or kitty.
 ";
 
 /// Raw mode, the alternate screen and mouse capture, undone however the program ends.

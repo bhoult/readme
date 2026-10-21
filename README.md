@@ -28,6 +28,8 @@ as they land.
 - **Archives**: zip files and tar files (plain, `.gz`, `.bz2`, `.xz`, `.zst`)
   open in the tree like directories, and the files inside them open like any
   other, without unpacking anything.
+- **Web pages**: clicking an HTML file, or pressing `Enter` on it, opens it in
+  your browser as well as showing its source.
 - **Git history**: in a repository, `H` lists the commits. Open one to see the
   files it changed, each as it was at that commit or, with `d`, as a diff.
 - **Editing**: `e` starts editing and `Esc` stops. Selection, undo and redo,
@@ -87,7 +89,7 @@ on, the arrow keys move by screen row.
 ### Mouse
 
 - Click a directory or an archive to fold or unfold it; click a file to open
-  it; double-click a file to move into it.
+  it (an HTML file opens in the browser too); double-click a file to move into it.
 - The wheel scrolls whichever pane it's over; `Shift`+wheel scrolls sideways.
 - Drag across text to select and copy it. While editing, a click moves the
   cursor and a double-click selects a word; while viewing, a double-click
@@ -100,11 +102,19 @@ on, the arrow keys move by screen row.
 
 Outside a multiplexer, readme asks the terminal what it can draw and uses real
 graphics if it can (Kitty, Ghostty, WezTerm, Konsole, iTerm2, and Sixel
-terminals). Inside herdr, tmux, zellij or screen it draws half-blocks, because
-those answer the question themselves even when the terminal around them can't
-show the result. herdr, for one, passes Kitty graphics through only to an
-outer terminal that supports them. If yours does, set `README_IMAGES=kitty`
-(or `sixel`, `iterm2`, `auto`, `halfblocks`).
+terminals). Inside tmux, zellij or screen it draws half-blocks, because those
+answer the question themselves even when the terminal around them can't show
+the result.
+
+Inside [herdr](https://herdr.dev), which passes Kitty graphics on only to
+Ghostty, WezTerm and kitty, readme looks at the terminal each herdr window runs
+in, the way herdr does. When every window attached to the session is in one of
+those, images use real pixels; otherwise half-blocks (Linux only). So run herdr
+in Ghostty, say, rather than GNOME Terminal, and keep any other windows on that
+session in such a terminal too.
+
+`README_IMAGES` overrides the choice: `kitty`, `sixel`, `iterm2`, `halfblocks`,
+or `auto` to ask the terminal.
 
 ### Colors
 

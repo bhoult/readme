@@ -20,7 +20,7 @@ use ratatui_image::picker::Picker;
 use crate::{
     archive,
     buffer::{Buffer, Loaded, Pos},
-    clipboard, git,
+    clipboard, external, git,
     highlight::{self, LineCache},
     markdown::{self, Rendered},
     picture::{self, Picture},
@@ -1038,8 +1038,9 @@ impl App {
         let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
         let (is_dir, archive, open, path) = (row.is_dir, row.archive, self.tree.is_open(row), row.path.clone());
         if !is_dir {
-            self.request_open(path);
+            self.request_open(path.clone());
             self.focus = Focus::Content;
+            self.browse(&path);
         } else if archive && self.tree.filter.is_some() {
             // The filter doesn't look inside archives, so open it in the full tree
             self.tree.set_filter(None);
@@ -1437,10 +1438,24 @@ impl App {
                 self.tree.toggle(i);
             }
         } else {
-            self.request_open(path);
+            self.request_open(path.clone());
             if double {
                 self.focus = Focus::Content;
+            } else {
+                self.browse(&path);
             }
+        }
+    }
+
+    /// Opens a web page in the browser as well. Only on a click or Enter, not while the
+    /// selection moves past it, and only for files on disk.
+    fn browse(&mut self, path: &Path) {
+        if !external::is_web_page(path) || !path.is_file() {
+            return;
+        }
+        match external::open(path) {
+            Ok(()) => self.say(format!("Opened {} in the browser", file_name(path))),
+            Err(e) => self.say(format!("Couldn't start the browser: {e}")),
         }
     }
 
@@ -2320,6 +2335,22 @@ mod tests {
         let screen = h.screen();
         assert!(screen.contains("notes.txt"), "{screen}");
         assert!(!screen.contains("/ needle"), "{screen}");
+    }
+
+    #[test]
+    fn clicking_a_web_page_opens_the_browser() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("page.html", "<h1>Hi</h1>\n")]);
+        // Arrowing past it only shows the source
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Down);
+        assert!(h.screen().contains("<h1>Hi</h1>"), "{}", h.screen());
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        // The tree's row, not the file pane's title
+        let (x, y) = h.find("  page.html");
+        h.click(x + 2, y);
+        let opened = external::OPENED.with(|o| o.borrow().clone());
+        assert_eq!(opened, vec![h.root.join("page.html")]);
+        assert!(h.screen().contains("Opened page.html in the browser"), "{}", h.screen());
     }
 
     #[test]
