@@ -3,6 +3,7 @@
 
 use std::{
     fs,
+    panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, mpsc},
     thread,
@@ -125,7 +126,9 @@ impl Gallery {
                         Err(_) => None,
                     };
                     let Some((i, path)) = job else { break };
-                    if finished.send((i, decode(&path, &budget))).is_err() {
+                    // A decoder that panics on a broken file fails just that thumbnail
+                    let image = panic::catch_unwind(AssertUnwindSafe(|| decode(&path, &budget))).ok().flatten();
+                    if finished.send((i, image)).is_err() {
                         break;
                     }
                 }
@@ -224,9 +227,19 @@ impl Gallery {
             if row < self.top {
                 self.top = row;
             }
-            while self.top < row && (self.top..=row).map(|r| height(self, r)).sum::<u16>() > area.height {
-                self.top += 1;
+            // The highest top (no higher than now) that still shows the selected row: up from
+            // that row while the rows above it fit, so a jump to the end costs one screenful
+            let mut first = row;
+            let mut used = usize::from(height(self, row));
+            while first > self.top {
+                let above = usize::from(height(self, first - 1));
+                if used + above > usize::from(area.height) {
+                    break;
+                }
+                used += above;
+                first -= 1;
             }
+            self.top = first;
         }
 
         let mut y = area.y;

@@ -343,6 +343,8 @@ impl Buffer {
             self.delete_selection();
             return;
         }
+        // An empty selection (a click leaves one) would become a real one once the cursor moves
+        self.anchor = None;
         let Pos { line, col } = self.cursor;
         if col == 0 && line == 0 {
             return;
@@ -366,6 +368,7 @@ impl Buffer {
             self.delete_selection();
             return;
         }
+        self.anchor = None;
         let Pos { line, col } = self.cursor;
         let at_end = col >= self.line_len(line);
         if at_end && line + 1 >= self.lines.len() {
@@ -516,6 +519,25 @@ mod tests {
         }
         b.undo();
         assert_eq!(b.lines, vec![""]);
+    }
+
+    #[test]
+    fn deleting_after_a_click_deletes_one_character_at_a_time() {
+        // A click leaves the selection's other end where the cursor is
+        let mut b = buf("hello world\n");
+        b.move_to(Pos::new(0, 5), false);
+        b.anchor = Some(b.cursor);
+        b.backspace();
+        b.backspace();
+        assert_eq!(b.lines, vec!["hel world"]);
+        // Joining lines doesn't leave it on a line that's gone
+        let mut b = buf("one\ntwo\n");
+        b.move_to(Pos::new(1, 0), false);
+        b.anchor = Some(b.cursor);
+        b.backspace();
+        b.backspace();
+        b.insert("e");
+        assert_eq!(b.lines, vec!["onetwo"]);
     }
 
     #[test]

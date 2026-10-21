@@ -94,7 +94,14 @@ struct Tui {
 impl Tui {
     fn start() -> Result<Self> {
         let previous = panic::take_hook();
+        // Only a panic on this thread ends the program. One on another thread (an image
+        // decoder on a broken file, say) ends just that thread, so the screen stays as it
+        // is, without the message written over it.
+        let main = std::thread::current().id();
         panic::set_hook(Box::new(move |info| {
+            if std::thread::current().id() != main {
+                return;
+            }
             restore();
             previous(info);
         }));

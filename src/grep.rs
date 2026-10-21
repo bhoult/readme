@@ -46,6 +46,9 @@ pub struct Grep {
     found: mpsc::Receiver<Option<FileHits>>,
     /// The selected match: which file, and which of its lines
     pub selected: (usize, usize),
+    /// Whether the selected match has been shown; from then on it stays selected as files
+    /// arrive ahead of it, and until then the selection is the first match
+    pub shown: bool,
     pub scroll: usize,
 }
 
@@ -104,20 +107,26 @@ impl Grep {
             stop,
             found,
             selected: (0, 0),
+            shown: false,
             scroll: 0,
         }
     }
 
     /// Takes in what's been found since last time.
     pub fn poll(&mut self) {
-        while let Ok(found) = self.found.try_recv() {
-            let Some(file) = found else {
-                self.done = true;
-                continue;
+        loop {
+            let file = match self.found.try_recv() {
+                Ok(Some(file)) => file,
+                // The end of the search, or of its thread
+                Ok(None) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.done = true;
+                    break;
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
             };
             let at = self.files.partition_point(|f| f.path < file.path);
-            // Keep the same match selected as files arrive ahead of it
-            if !self.files.is_empty() && at <= self.selected.0 {
+            // Keep a match that's been shown selected as files arrive ahead of it
+            if self.shown && at <= self.selected.0 {
                 self.selected.0 += 1;
             }
             self.files.insert(at, file);

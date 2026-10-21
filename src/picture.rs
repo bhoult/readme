@@ -56,7 +56,17 @@ pub fn picker() -> Picker {
 /// deadline, so nothing is left behind.
 #[cfg(unix)]
 fn ask_terminal() -> Option<Picker> {
-    use std::io::Write;
+    use std::{io::Write, os::fd::AsRawFd};
+    // The answers come back where crossterm reads the keys: stdin when it's the terminal,
+    // /dev/tty when it isn't (`readme notes.md < /dev/null`). Waited for anywhere else,
+    // they'd arrive later as keystrokes.
+    // SAFETY: isatty only looks at the descriptor
+    let tty = if unsafe { libc::isatty(libc::STDIN_FILENO) } == 1 {
+        None
+    } else {
+        Some(std::fs::File::open("/dev/tty").ok()?)
+    };
+    let input = tty.as_ref().map_or(libc::STDIN_FILENO, |tty| tty.as_raw_fd());
     let mut out = std::io::stdout();
     // Kitty graphics, the cell size, then the device attributes every terminal answers,
     // which come back last and end the wait
@@ -66,14 +76,14 @@ fn ask_terminal() -> Option<Picker> {
     let mut answers = Vec::new();
     while answers_end(&answers).is_none() {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
-        let mut stdin = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+        let mut waiting = libc::pollfd { fd: input, events: libc::POLLIN, revents: 0 };
         // SAFETY: one valid pollfd, then a read into a buffer of the length given
-        let ready = unsafe { libc::poll(&mut stdin, 1, left.as_millis() as i32) };
+        let ready = unsafe { libc::poll(&mut waiting, 1, left.as_millis() as i32) };
         if ready <= 0 {
             return None;
         }
         let mut chunk = [0u8; 512];
-        let read = unsafe { libc::read(libc::STDIN_FILENO, chunk.as_mut_ptr().cast(), chunk.len()) };
+        let read = unsafe { libc::read(input, chunk.as_mut_ptr().cast(), chunk.len()) };
         if read <= 0 {
             return None;
         }
@@ -229,6 +239,14 @@ struct View {
 
 const ZOOMS: (f32, f32) = (0.1, 50.0);
 
+/// The size of a `(w, h)` image scaled to fit a `room` of screen pixels, keeping its shape.
+/// The room is whole cells, so it's a little off the image's own shape.
+fn fit_within((w, h): (u32, u32), room: (f32, f32)) -> (u32, u32) {
+    let (w, h) = (w.max(1) as f32, h.max(1) as f32);
+    let k = (room.0 / w).min(room.1 / h);
+    (((w * k).round() as u32).max(1), ((h * k).round() as u32).max(1))
+}
+
 impl Picture {
     pub fn new(image: DynamicImage, format: &str, picker: &Picker) -> Self {
         let info = format!("{}×{} {}", image.width(), image.height(), format.to_uppercase());
@@ -282,10 +300,7 @@ impl Picture {
             // isn't copied whole for every view of it
             let (x, y, w, h) = view.crop;
             let (cell_w, cell_h) = self.cell();
-            let size = (
-                ((view.at.width as f32 * cell_w) as u32).clamp(1, w.max(1) * 50),
-                ((view.at.height as f32 * cell_h) as u32).clamp(1, h.max(1) * 50),
-            );
+            let size = fit_within((w, h), (view.at.width as f32 * cell_w, view.at.height as f32 * cell_h));
             let part = image::imageops::crop_imm(&self.image, x, y, w, h);
             let screen = image::imageops::resize(&*part, size.0, size.1, FilterType::Triangle);
             self.view = Some((view, self.picker.new_resize_protocol(DynamicImage::ImageRgba8(screen))));
@@ -351,6 +366,14 @@ mod tests {
 
     fn shows(vars: &[(&'static str, &'static str)]) -> bool {
         terminal_shows_kitty(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))
+    }
+
+    #[test]
+    fn small_images_keep_their_shape() {
+        // 30×10 drawn 1:1 takes 3×1 cells of 10×20, a room twice as tall as the image
+        assert_eq!(fit_within((30, 10), (30.0, 20.0)), (30, 10));
+        assert_eq!(fit_within((3, 3), (10.0, 20.0)), (10, 10));
+        assert_eq!(fit_within((1000, 500), (400.0, 400.0)), (400, 200));
     }
 
     #[test]

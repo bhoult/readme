@@ -80,7 +80,12 @@ fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
 fn git_text(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
     let (mut out, cut) = git_capped(repo, args)?;
     if cut {
-        out.extend_from_slice(format!("\n… cut short at {} MB\n", MAX_OUTPUT >> 20).as_bytes());
+        let note = format!("\n… cut short at {} MB\n", MAX_OUTPUT >> 20);
+        // Cut at the end of a line and leave room for the note, so the whole stays within
+        // MAX_OUTPUT, which is also the most a buffer takes
+        out.truncate(out.len().saturating_sub(note.len()));
+        out.truncate(out.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1));
+        out.extend_from_slice(note.as_bytes());
     }
     Ok(out)
 }
@@ -99,23 +104,25 @@ pub fn log(repo: &Path, path: &Path, follow: bool) -> Result<Vec<Commit>> {
     let path = path.to_string_lossy();
     let mut args = vec!["log", max.as_str(), "--format=%x1e%H%x1f%h%x1f%P%x1f%at%x1f%s"];
     if follow {
-        args.extend(["--follow", "--name-only"]);
+        // -z gives the file's name as it is; otherwise git quotes names with accents and the like
+        args.extend(["--follow", "--name-only", "-z"]);
     }
     args.extend(["--", path.as_ref()]);
     let out = git(repo, &args)?;
     Ok(String::from_utf8_lossy(&out)
         .split('\x1e')
         .filter_map(|record| {
-            let mut lines = record.lines();
-            let mut f = lines.next()?.split('\x1f');
+            // The commit's line ends in a newline, or with -z in a NUL, and the file's name
+            // follows on a line of its own
+            let (head, names) = record.split_once(['\n', '\0']).unwrap_or((record, ""));
+            let mut f = head.split('\x1f');
             Some(Commit {
                 hash: f.next().filter(|h| !h.is_empty())?.to_string(),
                 short: f.next()?.to_string(),
                 parent: f.next()?.split(' ').next().filter(|p| !p.is_empty()).map(String::from),
                 time: f.next()?.parse().unwrap_or(0),
                 subject: f.next()?.to_string(),
-                // --name-only puts the file's name after a blank line
-                path: lines.map(str::trim).find(|l| !l.is_empty()).map(String::from),
+                path: names.split('\0').map(|n| n.trim_start_matches('\n')).find(|n| !n.is_empty()).map(String::from),
             })
         })
         .collect())
@@ -238,5 +245,14 @@ mod tests {
         let file = log(&root, &root.join("renamed.txt"), true).unwrap();
         let names: Vec<(&str, Option<&str>)> = file.iter().map(|c| (c.subject.as_str(), c.path.as_deref())).collect();
         assert_eq!(names, vec![("rename", Some("renamed.txt")), ("second", Some("a.txt")), ("first", Some("a.txt"))]);
+
+        // Names git would quote (accents, quote marks) come back as they are
+        let odd = "café \"x\".txt";
+        run(&root, &["mv", "renamed.txt", odd]);
+        run(&root, &["commit", "-q", "-m", "accents"]);
+        let file = log(&root, &root.join(odd), true).unwrap();
+        assert_eq!(file[0].path.as_deref(), Some(odd));
+        assert_eq!(file[1].path.as_deref(), Some("renamed.txt"));
+        assert_eq!(show(&root, &file[0].hash, odd).unwrap(), b"two\n");
     }
 }

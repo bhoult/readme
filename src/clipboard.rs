@@ -47,23 +47,53 @@ pub fn paste(primary: bool) -> Option<String> {
     if cfg!(test) {
         return None;
     }
-    let run = |program: &str, args: &[&str]| {
-        Command::new(program).args(args).stderr(Stdio::null()).output().ok().filter(|o| o.status.success())
-    };
     let output = if wayland() {
         let mut args = vec!["--no-newline"];
         if primary {
             args.push("--primary");
         }
-        run("wl-paste", &args)
+        read("wl-paste", &args)
     } else if x11() {
         // Either tool, as copy uses
         let (which, flag) = if primary { ("primary", "-p") } else { ("clipboard", "-b") };
-        run("xclip", &["-o", "-selection", which]).or_else(|| run("xsel", &["-o", flag]))
+        read("xclip", &["-o", "-selection", which]).or_else(|| read("xsel", &["-o", flag]))
     } else {
         None
     }?;
-    String::from_utf8(output.stdout).ok().filter(|s| !s.is_empty())
+    String::from_utf8(output).ok().filter(|s| !s.is_empty())
+}
+
+/// What a clipboard tool prints, if it's done within a couple of seconds. The text comes
+/// from whichever program holds the clipboard, and one that has hung would hang the
+/// tool, and readme waiting on it, for good.
+fn read(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+    use std::{io::Read, sync::mpsc, time::Duration};
+
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    let (sender, received) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let _ = sender.send(stdout.read_to_end(&mut out).map(|_| out));
+    });
+    match received.recv_timeout(Duration::from_secs(2)) {
+        Ok(Ok(out)) if child.wait().is_ok_and(|status| status.success()) => Some(out),
+        Ok(_) => {
+            let _ = child.wait();
+            None
+        }
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            None
+        }
+    }
 }
 
 fn wayland() -> bool {

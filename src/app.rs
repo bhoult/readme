@@ -127,16 +127,14 @@ impl Doc {
             "md" | "markdown" | "mdx" => Kind::Markdown,
             ext => table::delimiter(ext).map_or(Kind::Text, Kind::Table),
         };
-        // Rendering Markdown takes many times the text's size, so a huge file shows as text
-        let huge = kind == Kind::Markdown && buf.lines.iter().map(|l| l.len() + 1).sum::<usize>() > MAX_RENDERED;
-        Self {
+        let mut doc = Self {
             path: path.into(),
             source,
             label,
             colors: LineCache::new(path, &buf.lines),
             buf,
             kind,
-            raw: huge,
+            raw: false,
             editing: false,
             wrap,
             top: 0,
@@ -152,7 +150,28 @@ impl Doc {
             last_match: None,
             disk: disk_stamp(path),
             disk_changed: false,
+        };
+        doc.raw = doc.too_big_to_render();
+        doc
+    }
+
+    /// Markdown too big to render, which shows as text: rendering takes many times the
+    /// text's size.
+    fn too_big_to_render(&self) -> bool {
+        self.kind == Kind::Markdown && self.buf.lines.iter().map(|l| l.len() + 1).sum::<usize>() > MAX_RENDERED
+    }
+
+    /// Back to the text if the Markdown has grown too big to render (reloaded, or edited),
+    /// as it would show if it were opened now.
+    fn keep_renderable(&mut self) {
+        if self.raw || !self.too_big_to_render() {
+            return;
         }
+        if self.formatted() {
+            (self.top, self.top_row) = (self.formatted_top_src(), 0);
+        }
+        self.raw = true;
+        self.rendered = None;
     }
 
     /// Showing the formatted view rather than the text.
@@ -196,6 +215,10 @@ impl Doc {
     /// `delta` screen rows on from (line, row), stopping at either end of the file.
     fn step_rows(&self, mut at: (usize, usize), delta: isize, width: usize) -> (usize, usize) {
         let last = self.buf.lines.len() - 1;
+        // A kept place can be out of date: the file got shorter, or a wider pane wraps a
+        // line into fewer rows
+        at.0 = at.0.min(last);
+        at.1 = at.1.min(self.rows(at.0, width).len() - 1);
         for _ in 0..delta.unsigned_abs() {
             if delta > 0 {
                 if at.1 + 1 < self.rows(at.0, width).len() {
@@ -358,6 +381,8 @@ impl Doc {
     }
 
     fn stop_editing(&mut self) {
+        // While still editing, so the place kept is the text's
+        self.keep_renderable();
         self.editing = false;
         self.buf.anchor = None;
         if self.kind != Kind::Text && !self.raw {
@@ -376,6 +401,7 @@ impl Doc {
         }
         self.colors = LineCache::new(&self.path, &buf.lines);
         self.buf = buf;
+        self.keep_renderable();
         self.top = self.top.min(self.buf.lines.len() - 1);
         self.top_row = 0;
         self.last_match = None;
@@ -489,8 +515,6 @@ pub struct App {
     grep: Option<Grep>,
     /// The last thing searched for in all the files, to start from next time
     last_grep: String,
-    /// Whether a match has been shown yet, since the search started
-    grep_shown: bool,
     tree_width: u16,
     prompt: Option<Prompt>,
     message: Option<(String, Instant)>,
@@ -527,7 +551,6 @@ impl App {
             gallery_stash: None,
             grep: None,
             last_grep: String::new(),
-            grep_shown: false,
             tree_width: 0,
             prompt: None,
             message: None,
@@ -666,7 +689,14 @@ impl App {
         let size = bytes.len() as u64;
         if picture::is_image(path) {
             let format = path.extension().map(|e| e.to_string_lossy().into_owned()).unwrap_or_default();
-            return match image::load_from_memory(&bytes) {
+            // The format by the file's name, unless its first bytes say otherwise (TGA has
+            // no signature, only its name)
+            let mut reader = image::ImageReader::new(std::io::Cursor::new(&bytes));
+            if let Ok(format) = image::ImageFormat::from_path(path) {
+                reader.set_format(format);
+            }
+            let decoded = reader.with_guessed_format().map_err(image::ImageError::IoError).and_then(|r| r.decode());
+            return match decoded {
                 Ok(image) => Shown::Image(Box::new(ImageShown {
                     path: path.into(),
                     source,
@@ -771,7 +801,8 @@ impl App {
                 }
             }
         }
-        if self.last_refresh.elapsed() >= TREE_REFRESH {
+        // Not while a row is held down: the press, and a drag from it, go by its place in the rows
+        if self.last_refresh.elapsed() >= TREE_REFRESH && !matches!(self.drag, Drag::Tree { .. }) {
             self.tree.rebuild();
             self.last_refresh = Instant::now();
         }
@@ -954,7 +985,6 @@ impl App {
         self.history = None;
         self.filtering = false;
         self.grep = Some(Grep::start(&self.tree.root, &query, self.tree.show_hidden));
-        self.grep_shown = false;
         self.focus = Focus::Tree;
     }
 
@@ -1011,7 +1041,9 @@ impl App {
         else {
             return;
         };
-        self.grep_shown = true;
+        if let Some(grep) = &mut self.grep {
+            grep.shown = true;
+        }
         if !self.showing(&path) {
             if self.dirty() {
                 return self.say("Save or discard your changes first, to see other files");
@@ -1070,6 +1102,8 @@ impl App {
             Ok(commits) => {
                 self.history =
                     Some(History { repo, scope, file, commits, selected: 0, scroll: 0, opened: None, diff: false });
+                // It takes the left pane, which find-in-files' results would otherwise keep
+                self.grep = None;
                 self.focus = Focus::Tree;
                 self.filtering = false;
                 self.history_preview();
@@ -1081,6 +1115,10 @@ impl App {
     /// Shows the selected commit, or the selected file of the opened commit, as it was
     /// or as a diff.
     fn history_preview(&mut self) {
+        // The history still opens, but a file with unsaved changes stays on screen
+        if self.dirty() {
+            return self.say("Save or discard your changes first, to see other files");
+        }
         let Some(h) = &self.history else { return };
         let repo = h.repo.clone();
         let (path, bytes, label) = match &h.opened {
@@ -1094,9 +1132,17 @@ impl App {
                             let label = format!(" {then} · diff in {}", c.short);
                             (repo.join(format!("{then}.diff")), git::file_diff(&repo, c, then), label)
                         } else {
-                            let label = format!(" {then} @ {} {}", c.short, c.subject);
-                            let bytes = git::show(&repo, &c.hash, then).or_else(|_| git::file_diff(&repo, c, then));
-                            (repo.join(then), bytes, label)
+                            match git::show(&repo, &c.hash, then) {
+                                Ok(bytes) => {
+                                    (repo.join(then), Ok(bytes), format!(" {then} @ {} {}", c.short, c.subject))
+                                }
+                                // Not there at that commit (it was deleted, say) or too big to show:
+                                // what the commit did to it instead, shown as the diff it is
+                                Err(_) => {
+                                    let label = format!(" {then} · diff in {}", c.short);
+                                    (repo.join(format!("{then}.diff")), git::file_diff(&repo, c, then), label)
+                                }
+                            }
                         }
                     }
                     None => {
@@ -1826,10 +1872,16 @@ impl App {
             self.tree.marks.clear();
             return;
         };
+        let before = self.tree.rows.get(self.tree.selected).map(|r| r.path.clone());
         self.tree.selected = i;
         if modifiers.contains(KeyModifiers::CONTROL) {
             self.tree.toggle_mark(i);
         } else if modifiers.contains(KeyModifiers::SHIFT) {
+            // With nothing marked, the range starts from the row selected before, as with
+            // Shift+↑↓, rather than from wherever an earlier range started
+            if self.tree.marks.is_empty() {
+                self.tree.anchor = before;
+            }
             self.tree.mark_range();
         } else {
             self.drag = Drag::Tree { from: i, double, to: None };
@@ -2120,7 +2172,7 @@ impl App {
         if let Some(grep) = &mut self.grep {
             grep.poll();
             // The first match shows as soon as it's found
-            let first = !self.grep_shown && grep.current().is_some();
+            let first = !grep.shown && grep.current().is_some();
             if first {
                 self.grep_preview();
             }
@@ -3446,6 +3498,11 @@ mod tests {
         let screen = h.screen();
         assert!(screen.contains("8×8 PNG"), "{screen}");
         assert!(screen.contains('▀') || screen.contains('▄'), "{screen}");
+        // TGA has no signature to know it by, only its name
+        image.save(h.root.join("dot.tga")).unwrap();
+        h.app.open(&h.root.join("dot.tga"));
+        h.draw();
+        assert!(h.screen().contains("8×8 TGA"), "{}", h.screen());
     }
 
     #[test]
@@ -3470,7 +3527,15 @@ mod tests {
         git(&["commit", "-q", "-am", "second version"]);
         let mut h = h0;
 
-        // H on a file: its history, and the file as it was
+        // H on a file: its history, and the file as it was. From the file, with
+        // find-in-files' results in the left pane, the history takes their place.
+        h.key(KeyCode::Char('F'));
+        h.typing("two");
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('H'));
+        assert!(h.app.grep.is_none() && h.app.history.is_some());
+        h.key(KeyCode::Char('H'));
         h.key(KeyCode::Char('H'));
         let screen = h.screen();
         assert!(screen.contains("second versi") && screen.contains("first versi"), "{screen}");
@@ -3498,5 +3563,52 @@ mod tests {
         let (x, y) = h.find("  a.txt");
         h.click(x + 2, y);
         assert!(h.screen().contains("1  two"), "the file as it is now:\n{}", h.screen());
+    }
+
+    #[test]
+    fn history_leaves_unsaved_changes_on_screen() {
+        let h0 = Harness::new(&[("a.txt", "one\n")]);
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&h0.root)
+                .args(["-c", "user.name=T", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "first version"]);
+        let mut h = h0;
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.typing("new ");
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Char('H'));
+        assert!(h.app.history.is_some(), "the history still opens");
+        assert!(h.app.dirty(), "{}", h.screen());
+        assert!(h.screen().contains("new one"), "{}", h.screen());
+    }
+
+    #[test]
+    fn a_click_after_the_pane_widens_while_wrapping() {
+        let mut h = Harness::new(&[("a.txt", &LONG.repeat(10))]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('w'));
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Down);
+        assert_eq!(h.app.doc().unwrap().top_row, 2, "the third row of the first line is at the top");
+        // A wider pane wraps that line into two rows
+        let x = h.app.divider_x;
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x, 3);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), 8, 3);
+        h.mouse(MouseEventKind::Up(MouseButton::Left), 8, 3);
+        let area = h.app.content_area;
+        h.click(area.x + 10, area.y);
+        assert!(h.app.doc().is_some());
     }
 }

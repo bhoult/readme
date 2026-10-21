@@ -122,12 +122,17 @@ impl Tree {
     }
 
     /// What a move or delete applies to: the marked rows in tree order, or else the
-    /// selected one.
+    /// selected one. A marked folder takes everything in it along, so marked rows inside
+    /// it aren't listed again (they'd be gone by the time their turn came).
     pub fn marked_or_selected(&self) -> Vec<PathBuf> {
         if self.marks.is_empty() {
             return self.rows.get(self.selected).map(|r| r.path.clone()).into_iter().collect();
         }
-        self.rows.iter().filter(|r| self.marks.contains(&r.path)).map(|r| r.path.clone()).collect()
+        self.rows
+            .iter()
+            .filter(|r| self.marks.contains(&r.path) && !r.path.ancestors().skip(1).any(|a| self.marks.contains(a)))
+            .map(|r| r.path.clone())
+            .collect()
     }
 
     /// Carries open folders and marks over to where something was moved or renamed.
@@ -391,6 +396,19 @@ mod tests {
 
         tree.collapse_or_parent();
         assert!(tree.rows.iter().all(|r| r.name != "main.rs"));
+    }
+
+    #[test]
+    fn a_marked_folder_takes_its_marked_contents_along() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("docs")).unwrap();
+        fs::write(root.join("docs/a.md"), "").unwrap();
+        fs::write(root.join("z.txt"), "").unwrap();
+        let mut tree = Tree::new(root.to_path_buf());
+        tree.reveal(&root.join("docs/a.md"));
+        tree.marks = tree.rows.iter().map(|r| r.path.clone()).collect();
+        assert_eq!(tree.marked_or_selected(), vec![root.join("docs"), root.join("z.txt")]);
     }
 
     #[test]
