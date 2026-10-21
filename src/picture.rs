@@ -83,7 +83,7 @@ fn ask_terminal() -> Option<Picker> {
     // Without the cell size in an answer, the window's size in pixels gives it
     let cell = cell.or_else(|| {
         let size = ratatui::crossterm::terminal::window_size().ok()?;
-        (size.width > 0 && size.columns > 0).then(|| (size.width / size.columns, size.height / size.rows.max(1)))
+        (size.columns > 0 && size.rows > 0).then(|| (size.width / size.columns, size.height / size.rows))
     });
     let protocol = if kitty {
         ProtocolType::Kitty
@@ -94,7 +94,7 @@ fn ask_terminal() -> Option<Picker> {
     } else {
         ProtocolType::Halfblocks
     };
-    let (width, height) = cell.unwrap_or((10, 20));
+    let (width, height) = cell.filter(|&c| sane_cell(c)).unwrap_or((10, 20));
     #[allow(deprecated)]
     let mut picker = Picker::from_fontsize(FontSize::new(width, height));
     picker.set_protocol_type(protocol);
@@ -127,7 +127,14 @@ fn parse_answers(answers: &[u8]) -> (bool, bool, Option<(u16, u16)>) {
         let (height, width) = numbers.split_once(';')?;
         Some((width.parse().ok()?, height.parse().ok()?))
     });
-    (kitty, sixel, cell)
+    (kitty, sixel, cell.filter(|&c| sane_cell(c)))
+}
+
+/// A character cell's size in pixels that's worth believing. Terminals that don't know
+/// answer 0×0, and the image code's arithmetic runs away with a zero (a test once had
+/// it allocating until the machine ran out of memory).
+fn sane_cell((width, height): (u16, u16)) -> bool {
+    (2..=200).contains(&width) && (4..=400).contains(&height)
 }
 
 /// Whether every herdr window attached to this pane's session runs in a terminal herdr
@@ -226,7 +233,16 @@ impl Picture {
     pub fn new(image: DynamicImage, format: &str, picker: &Picker) -> Self {
         let info = format!("{}×{} {}", image.width(), image.height(), format.to_uppercase());
         let fill = picker.protocol_type() == ProtocolType::Halfblocks;
-        Self { info, image, picker: picker.clone(), fill, zoom: 1.0, center: (0.5, 0.5), view: None }
+        let font = picker.font_size();
+        let picker = if sane_cell((font.width, font.height)) {
+            picker.clone()
+        } else {
+            #[allow(deprecated)]
+            let mut sane = Picker::from_fontsize(FontSize::new(10, 20));
+            sane.set_protocol_type(picker.protocol_type());
+            sane
+        };
+        Self { info, image, picker, fill, zoom: 1.0, center: (0.5, 0.5), view: None }
     }
 
     fn cell(&self) -> (f32, f32) {
@@ -262,10 +278,17 @@ impl Picture {
         }
         let view = self.layout(area);
         if self.view.as_ref().is_none_or(|(v, _)| v.crop != view.crop || v.at.as_size() != view.at.as_size()) {
+            // Scaled straight to the screen's size from the part on view, so a big image
+            // isn't copied whole for every view of it
             let (x, y, w, h) = view.crop;
-            let whole = (x, y, w, h) == (0, 0, self.image.width(), self.image.height());
-            let part = if whole { self.image.clone() } else { self.image.crop_imm(x, y, w, h) };
-            self.view = Some((view, self.picker.new_resize_protocol(part)));
+            let (cell_w, cell_h) = self.cell();
+            let size = (
+                ((view.at.width as f32 * cell_w) as u32).clamp(1, w.max(1) * 50),
+                ((view.at.height as f32 * cell_h) as u32).clamp(1, h.max(1) * 50),
+            );
+            let part = image::imageops::crop_imm(&self.image, x, y, w, h);
+            let screen = image::imageops::resize(&*part, size.0, size.1, FilterType::Triangle);
+            self.view = Some((view, self.picker.new_resize_protocol(DynamicImage::ImageRgba8(screen))));
         }
         let Some((last, protocol)) = &mut self.view else { return };
         *last = view;
@@ -328,6 +351,17 @@ mod tests {
 
     fn shows(vars: &[(&'static str, &'static str)]) -> bool {
         terminal_shows_kitty(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))
+    }
+
+    #[test]
+    fn a_zero_cell_size_is_not_believed() {
+        assert_eq!(parse_answers(b"\x1b[6;0;0t\x1b[?62;22c").2, None);
+        #[allow(deprecated)]
+        let mut zero = Picker::from_fontsize(FontSize::new(0, 0));
+        zero.set_protocol_type(ProtocolType::Halfblocks);
+        let mut picture = Picture::new(DynamicImage::new_rgb8(64, 48), "png", &zero);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(60, 20)).unwrap();
+        term.draw(|f| picture.draw(f, Rect::new(0, 0, 60, 20))).unwrap();
     }
 
     #[test]

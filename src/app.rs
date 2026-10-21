@@ -38,6 +38,8 @@ const MESSAGE_FOR: Duration = Duration::from_secs(4);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const TREE_REFRESH: Duration = Duration::from_secs(2);
 const WHEEL: isize = 3;
+/// Markdown bigger than this opens as plain text
+const MAX_RENDERED: usize = 5 << 20;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -119,6 +121,8 @@ impl Doc {
             "md" | "markdown" | "mdx" => Kind::Markdown,
             ext => table::delimiter(ext).map_or(Kind::Text, Kind::Table),
         };
+        // Rendering Markdown takes many times the text's size, so a huge file shows as text
+        let huge = kind == Kind::Markdown && buf.lines.iter().map(|l| l.len() + 1).sum::<usize>() > MAX_RENDERED;
         Self {
             path: path.into(),
             source,
@@ -126,7 +130,7 @@ impl Doc {
             colors: LineCache::new(path, &buf.lines),
             buf,
             kind,
-            raw: false,
+            raw: huge,
             editing: false,
             wrap,
             top: 0,

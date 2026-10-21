@@ -4,7 +4,7 @@
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, Condvar, Mutex, mpsc},
     thread,
 };
 
@@ -32,6 +32,12 @@ const DECODED: (u32, u32) = (400, 800);
 const TALLEST: f32 = 2.0;
 /// Files bigger than this aren't decoded for a thumbnail
 const MAX_BYTES: u64 = 50 << 20;
+/// Nor are images that need more memory than this to decode
+const LARGEST: u64 = 512 << 20;
+/// What all the decoders may hold at once; a decode waits until it fits
+const BUDGET: u64 = 1 << 30;
+/// Thumbnails further than this many screens from the view are let go
+const KEEP_SCREENS: usize = 3;
 pub const WIDTHS: (u32, u32) = (50, 400);
 
 /// The images directly in `dir`, by name.
@@ -43,21 +49,49 @@ pub fn images_in(dir: &Path) -> Vec<PathBuf> {
     images
 }
 
+/// Memory taken by decodes in progress.
+struct Budget {
+    used: Mutex<u64>,
+    freed: Condvar,
+}
+
+impl Budget {
+    /// Waits until `need` more fits, unless nothing else is decoding.
+    fn take(&self, need: u64) -> Held<'_> {
+        let mut used = self.used.lock().unwrap_or_else(|e| e.into_inner());
+        while *used > 0 && *used + need > BUDGET {
+            used = self.freed.wait(used).unwrap_or_else(|e| e.into_inner());
+        }
+        *used += need;
+        Held { budget: self, need }
+    }
+}
+
+struct Held<'a> {
+    budget: &'a Budget,
+    need: u64,
+}
+
+impl Drop for Held<'_> {
+    fn drop(&mut self) {
+        *self.budget.used.lock().unwrap_or_else(|e| e.into_inner()) -= self.need;
+        self.budget.freed.notify_all();
+    }
+}
+
 enum Thumb {
     Waiting,
     Loading,
     Failed,
-    Ready {
-        protocol: Box<StatefulProtocol>,
-        /// Height over width
-        aspect: f32,
-    },
+    Ready(Box<StatefulProtocol>),
 }
 
 pub struct Gallery {
     pub dir: PathBuf,
     pub images: Vec<PathBuf>,
     thumbs: Vec<Thumb>,
+    /// Each image's height over its width, once known; kept when a thumbnail is let go
+    aspects: Vec<Option<f32>>,
     pub selected: usize,
     /// First row of the grid on screen
     top: usize,
@@ -79,9 +113,10 @@ impl Gallery {
         let (jobs, queue) = mpsc::channel::<(usize, PathBuf)>();
         let (finished, done) = mpsc::channel();
         let queue = Arc::new(Mutex::new(queue));
+        let budget = Arc::new(Budget { used: Mutex::new(0), freed: Condvar::new() });
         // Every core but the one the screen needs
         for _ in 0..crate::cores().saturating_sub(1).max(1) {
-            let (queue, finished) = (queue.clone(), finished.clone());
+            let (queue, finished, budget) = (queue.clone(), finished.clone(), budget.clone());
             // They end when the gallery goes away and takes its sender with it
             thread::spawn(move || {
                 loop {
@@ -90,17 +125,19 @@ impl Gallery {
                         Err(_) => None,
                     };
                     let Some((i, path)) = job else { break };
-                    if finished.send((i, decode(&path))).is_err() {
+                    if finished.send((i, decode(&path, &budget))).is_err() {
                         break;
                     }
                 }
             });
         }
         let thumbs = images.iter().map(|_| Thumb::Waiting).collect();
+        let aspects = vec![None; images.len()];
         Self {
             dir,
             images,
             thumbs,
+            aspects,
             selected: 0,
             top: 0,
             follow: true,
@@ -140,10 +177,10 @@ impl Gallery {
     fn take_finished(&mut self, picker: &Picker) {
         while let Ok((i, image)) = self.done.try_recv() {
             self.thumbs[i] = match image {
-                Some(image) => Thumb::Ready {
-                    aspect: image.height() as f32 / image.width().max(1) as f32,
-                    protocol: Box::new(picker.new_resize_protocol(image)),
-                },
+                Some(image) => {
+                    self.aspects[i] = Some(image.height() as f32 / image.width().max(1) as f32);
+                    Thumb::Ready(Box::new(picker.new_resize_protocol(image)))
+                }
                 None => Thumb::Failed,
             };
         }
@@ -162,10 +199,7 @@ impl Gallery {
         let scale = if picker.protocol_type() == ProtocolType::Halfblocks { 2.0 } else { 1.0 };
         let font = picker.font_size();
         let (cell_w, cell_h) = (font.width.max(1) as f32 / scale, font.height.max(1) as f32 / scale);
-        let aspect = match &self.thumbs[i] {
-            Thumb::Ready { aspect, .. } => aspect.min(TALLEST),
-            _ => 0.75,
-        };
+        let aspect = self.aspects[i].map_or(0.75, |a| a.min(TALLEST));
         let width = self.width_px as f32;
         ((width / cell_w).ceil().max(2.0) as u16, (width * aspect / cell_h).ceil().max(1.0) as u16)
     }
@@ -211,12 +245,12 @@ impl Gallery {
                 // A thumbnail cut off by the bottom edge waits for the next scroll
                 let fits = picture.bottom() <= area.bottom() && picture.right() <= area.right();
                 match &mut self.thumbs[i] {
-                    Thumb::Ready { protocol, .. } if fits => {
+                    Thumb::Ready(protocol) if fits => {
                         let image = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
                         f.render_stateful_widget(image, picture, protocol.as_mut());
                     }
                     Thumb::Failed => note(f, picture.intersection(area), "can't read"),
-                    Thumb::Ready { .. } => {}
+                    Thumb::Ready(_) => {}
                     _ => note(f, picture.intersection(area), "…"),
                 }
                 let name_y = y + h;
@@ -238,17 +272,36 @@ impl Gallery {
         }
         // Get the next screenful ready
         let ahead = (last + 1) * per_row;
-        for i in ahead..(ahead + per_row * self.rows_shown.max(1)).min(self.images.len()) {
+        let screen = per_row * self.rows_shown.max(1);
+        for i in ahead..(ahead + screen).min(self.images.len()) {
             self.request(i);
+        }
+        // Let go of thumbnails far from the view, so a huge folder doesn't fill memory
+        let keep = (self.top * per_row).saturating_sub(screen * KEEP_SCREENS)..ahead + screen * KEEP_SCREENS;
+        for (i, thumb) in self.thumbs.iter_mut().enumerate() {
+            if !keep.contains(&i) && matches!(thumb, Thumb::Ready(_)) {
+                *thumb = Thumb::Waiting;
+            }
         }
     }
 }
 
-fn decode(path: &Path) -> Option<DynamicImage> {
+fn decode(path: &Path, budget: &Budget) -> Option<DynamicImage> {
     if fs::metadata(path).ok()?.len() > MAX_BYTES {
         return None;
     }
-    let image = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.decode().ok()?;
+    // The header gives the size, and so roughly what decoding will take
+    let (width, height) = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()?;
+    let need = u64::from(width) * u64::from(height) * 4;
+    if need > LARGEST {
+        return None;
+    }
+    let _held = budget.take(need.max(1));
+    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(LARGEST);
+    reader.limits(limits);
+    let image = reader.decode().ok()?;
     Some(image.thumbnail(DECODED.0, DECODED.1))
 }
 

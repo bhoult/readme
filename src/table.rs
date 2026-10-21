@@ -13,6 +13,8 @@ use crate::{
 
 /// Cells wider than this are cut short with "…"
 const MAX_CELL: usize = 40;
+/// Only this many rows are laid out as a table; the raw text has the rest
+const MAX_ROWS: usize = 100_000;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -31,9 +33,10 @@ pub fn render(src: &str, delimiter: u8) -> Rendered {
     let mut reader =
         csv::ReaderBuilder::new().delimiter(delimiter).has_headers(false).flexible(true).from_reader(src.as_bytes());
     // Each record with the (0-based) source line it starts on
-    let rows: Vec<(usize, Vec<String>)> = reader
+    let mut rows: Vec<(usize, Vec<String>)> = reader
         .records()
         .filter_map(Result::ok)
+        .take(MAX_ROWS + 1)
         .map(|record| {
             let line = record.position().map_or(0, |p| p.line().saturating_sub(1) as usize);
             let cells =
@@ -41,6 +44,8 @@ pub fn render(src: &str, delimiter: u8) -> Rendered {
             (line, cells)
         })
         .collect();
+    let cut = rows.len() > MAX_ROWS;
+    rows.truncate(MAX_ROWS);
     if rows.is_empty() {
         return Rendered { lines: vec![Line::styled("(empty)", dim())], src: vec![0], pinned: 0, gutter: 0, width: 0 };
     }
@@ -88,6 +93,10 @@ pub fn render(src: &str, delimiter: u8) -> Rendered {
             out.src.push(*line);
             out.pinned = 2;
         }
+    }
+    if cut {
+        out.lines.push(Line::styled(format!("  … the first {MAX_ROWS} rows; m shows all of the text"), dim()));
+        out.src.push(rows.last().map_or(0, |r| r.0));
     }
     out
 }

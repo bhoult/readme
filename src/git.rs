@@ -2,6 +2,7 @@
 //! changed, and files as they were at any commit.
 
 use std::{
+    io::Read,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{SystemTime, UNIX_EPOCH},
@@ -29,19 +30,59 @@ pub struct Change {
     pub path: String,
 }
 
-fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let out = Command::new("git")
+/// Most of git's output that's read: enough for any file readme shows, and a stop
+/// on a huge file from an old commit or an enormous diff.
+const MAX_OUTPUT: u64 = 50 << 20;
+
+/// git's output, cut off at MAX_OUTPUT (the second value says whether it was).
+fn git_capped(repo: &Path, args: &[&str]) -> Result<(Vec<u8>, bool)> {
+    let mut child = Command::new("git")
         .arg("-C")
         .arg(repo)
         .args(args)
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .output()
+        .spawn()
         .context("couldn't run git")?;
-    if !out.status.success() {
-        bail!("git {}: {}", args.first().unwrap_or(&""), String::from_utf8_lossy(&out.stderr).trim());
+    // Read alongside, so a chatty git can't stall on a full pipe
+    let mut stderr = child.stderr.take().context("no stderr")?;
+    let errors = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    });
+    let mut out = Vec::new();
+    child.stdout.take().context("no stdout")?.take(MAX_OUTPUT + 1).read_to_end(&mut out)?;
+    let cut = out.len() as u64 > MAX_OUTPUT;
+    if cut {
+        out.truncate(MAX_OUTPUT as usize);
+        let _ = child.kill();
     }
-    Ok(out.stdout)
+    let status = child.wait()?;
+    let errors = errors.join().unwrap_or_default();
+    if !cut && !status.success() {
+        bail!("git {}: {}", args.first().unwrap_or(&""), errors.trim());
+    }
+    Ok((out, cut))
+}
+
+/// git's output; an error if there's more than MAX_OUTPUT of it.
+fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let (out, cut) = git_capped(repo, args)?;
+    if cut {
+        bail!("more than {} MB", MAX_OUTPUT >> 20);
+    }
+    Ok(out)
+}
+
+/// git's output, with a note at the end if it had to be cut short.
+fn git_text(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
+    let (mut out, cut) = git_capped(repo, args)?;
+    if cut {
+        out.extend_from_slice(format!("\n… cut short at {} MB\n", MAX_OUTPUT >> 20).as_bytes());
+    }
+    Ok(out)
 }
 
 /// The top of the repository `dir` is in, if it's in one.
@@ -115,14 +156,14 @@ pub fn show(repo: &Path, hash: &str, path: &str) -> Result<Vec<u8>> {
 
 /// The whole commit: its message, which files changed, and the diff.
 pub fn commit_text(repo: &Path, hash: &str) -> Result<Vec<u8>> {
-    git(repo, &["show", "--stat", "--patch", "--format=fuller", "--no-color", hash])
+    git_text(repo, &["show", "--stat", "--patch", "--format=fuller", "--no-color", hash])
 }
 
 /// What a commit did to one file.
 pub fn file_diff(repo: &Path, commit: &Commit, path: &str) -> Result<Vec<u8>> {
     match &commit.parent {
-        Some(parent) => git(repo, &["diff", "-M", "--no-color", parent, &commit.hash, "--", path]),
-        None => git(repo, &["show", "--format=", "--no-color", &commit.hash, "--", path]),
+        Some(parent) => git_text(repo, &["diff", "-M", "--no-color", parent, &commit.hash, "--", path]),
+        None => git_text(repo, &["show", "--format=", "--no-color", &commit.hash, "--", path]),
     }
 }
 
