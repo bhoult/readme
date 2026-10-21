@@ -7,7 +7,8 @@ files as other programs change them.
 
 It was made for a [herdr](https://herdr.dev) pane next to coding agents: you watch
 their edits land, read what they wrote, look back through the history, and fix a line
-yourself, without leaving the terminal.
+yourself, without leaving the terminal. herdr isn't required, though: readme runs in any
+terminal, on its own or inside tmux, zellij or screen.
 
 ![readme showing a project's README rendered, next to the directory tree](docs/screenshots/markdown.png)
 
@@ -31,7 +32,7 @@ on Linux.
 - [**Source code**](#source-code) highlighted for every language [bat](https://github.com/sharkdp/bat) knows, with search, word wrap and sideways scrolling
 - [**Editing**](#editing) with selection, undo, the system clipboard, and each line's own line ending kept
 - [**CSV and TSV**](#csv-and-tsv-tables) as aligned tables with the header kept on screen
-- [**Images**](#images) with real pixels in terminals that can show them, and colored half-blocks anywhere else
+- [**Images**](#images) at full resolution in terminals that can show them, with zoom, and colored half-blocks anywhere else
 - [**Thumbnails**](#thumbnails) of a folder of images, in a grid
 - [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
 - [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
@@ -101,22 +102,31 @@ put.
 
 ## Images
 
-PNG, JPEG, GIF, WebP, BMP, TIFF, TGA, QOI, ICO, PNM and HDR images show in the terminal:
-with real pixels where it has a graphics protocol (Kitty, Ghostty, WezTerm, Konsole,
-iTerm2, Sixel terminals), and with colored half-blocks anywhere else, as in these
-screenshots. The wheel or `+` and `-` zoom (toward the pointer), dragging or the arrow
-keys move around, and `0` or a double-click fits the image again.
+PNG, JPEG, GIF, WebP, BMP, TIFF, TGA, QOI, ICO, PNM and HDR images show at full
+resolution in terminals with a graphics protocol: Kitty, Ghostty, WezTerm, Konsole,
+iTerm2, and Sixel terminals. The header gives the image's size and format.
 
-![A Mandelbrot set image drawn in half-blocks](docs/screenshots/image.png)
+![A 2400×1600 Mandelbrot set image shown at full resolution](docs/screenshots/image.png)
+
+The wheel (or `+` and `-`) zooms toward the pointer, dragging or the arrow keys move
+around, and `0` or a double-click fits the image again. Each view is scaled from the
+full image, so zooming in shows the real detail rather than blown-up pixels.
+
+![The same image zoomed in four steps with the wheel, showing the detail at the edge of the set](docs/screenshots/zoom.png)
+
+Anywhere else, images are drawn with colored half-blocks, two pixels to a character,
+which works in any terminal with true color:
+
+<p align="center"><img src="docs/screenshots/halfblocks.png" width="70%" alt="A Mandelbrot set image drawn in half-blocks"></p>
 
 ## Thumbnails
 
 Select a folder with images in it and the right pane shows them as a grid. They load in
-the background, on every core but one, as they come into view. `+` and `-` (or
-`Ctrl`+wheel) change their size, and a click or `Enter` opens one; `Esc` goes back to the
-grid.
+the background, on every core but one, as they come into view. They start 100 pixels
+wide; `+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` opens one.
+`Esc` goes back to the grid.
 
-![A folder of nine images shown as thumbnails](docs/screenshots/thumbnails.png)
+![A folder of nine images shown as 300-pixel thumbnails](docs/screenshots/thumbnails.png)
 
 ## Archives
 
@@ -190,7 +200,8 @@ The easy way: point Claude Code, Codex or another coding agent at
 out what's needed.
 
 By hand, you need Rust 1.90 or newer and a C compiler (for the xz and zstd decoders),
-plus `git` for the history view.
+plus `git` for the history view. herdr isn't needed; any terminal will do, and one with
+Kitty graphics or Sixel support shows images at full resolution.
 
 ```
 cargo install --git https://github.com/bhoult/readme
