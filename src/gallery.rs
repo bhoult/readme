@@ -35,11 +35,13 @@ const TALLEST: f32 = 2.0;
 const MAX_BYTES: u64 = 50 << 20;
 /// Nor are images that need more memory than this to decode
 const LARGEST: u64 = 512 << 20;
-/// What all the decoders may hold at once; a decode waits until it fits
+/// What all the decoders may hold at once, in every gallery; a decode waits until it fits
 const BUDGET: u64 = 1 << 30;
 /// Thumbnails further than this many screens from the view are let go
 const KEEP_SCREENS: usize = 3;
 pub const WIDTHS: (u32, u32) = (50, 400);
+/// The decoding threads' name: a panic in one fails just its thumbnail
+pub const WORKER: &str = "thumbnails";
 
 /// The images directly in `dir`, by name.
 pub fn images_in(dir: &Path) -> Vec<PathBuf> {
@@ -55,6 +57,10 @@ struct Budget {
     used: Mutex<u64>,
     freed: Condvar,
 }
+
+/// One for the whole program: a gallery kept to go back to, or one left behind, may
+/// still have decodes going
+static DECODING: Budget = Budget { used: Mutex::new(0), freed: Condvar::new() };
 
 impl Budget {
     /// Waits until `need` more fits, unless nothing else is decoding.
@@ -114,12 +120,11 @@ impl Gallery {
         let (jobs, queue) = mpsc::channel::<(usize, PathBuf)>();
         let (finished, done) = mpsc::channel();
         let queue = Arc::new(Mutex::new(queue));
-        let budget = Arc::new(Budget { used: Mutex::new(0), freed: Condvar::new() });
         // Every core but the one the screen needs
         for _ in 0..crate::cores().saturating_sub(1).max(1) {
-            let (queue, finished, budget) = (queue.clone(), finished.clone(), budget.clone());
+            let (queue, finished) = (queue.clone(), finished.clone());
             // They end when the gallery goes away and takes its sender with it
-            thread::spawn(move || {
+            let _ = thread::Builder::new().name(WORKER.into()).spawn(move || {
                 loop {
                     let job = match queue.lock() {
                         Ok(queue) => queue.recv().ok(),
@@ -127,7 +132,7 @@ impl Gallery {
                     };
                     let Some((i, path)) = job else { break };
                     // A decoder that panics on a broken file fails just that thumbnail
-                    let image = panic::catch_unwind(AssertUnwindSafe(|| decode(&path, &budget))).ok().flatten();
+                    let image = panic::catch_unwind(AssertUnwindSafe(|| decode(&path, &DECODING))).ok().flatten();
                     if finished.send((i, image)).is_err() {
                         break;
                     }

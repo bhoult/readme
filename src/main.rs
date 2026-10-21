@@ -21,6 +21,7 @@ use std::{
     io::{self, Stdout},
     panic,
     path::PathBuf,
+    sync::Mutex,
     time::{Duration, Instant},
 };
 
@@ -30,13 +31,17 @@ use ratatui::{
     backend::CrosstermBackend,
     crossterm::{
         cursor::{SetCursorStyle, Show},
-        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture},
+        event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event},
         execute,
         terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
     },
 };
 
 use app::App;
+use picture::LateAnswers;
+
+/// What a panic on another thread said, for the screen to show
+static BACKGROUND_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
 const USAGE: &str = "\
 readme: view and edit files in the terminal
@@ -94,16 +99,26 @@ struct Tui {
 impl Tui {
     fn start() -> Result<Self> {
         let previous = panic::take_hook();
-        // Only a panic on this thread ends the program. One on another thread (an image
-        // decoder on a broken file, say) ends just that thread, so the screen stays as it
-        // is, without the message written over it.
+        // Only a panic on this thread ends the program. One on another thread ends just
+        // that thread, so the screen stays as it is and says so in its status line,
+        // rather than have the message written over it. Thumbnail decoders say it
+        // themselves, by showing "can't read".
         let main = std::thread::current().id();
         panic::set_hook(Box::new(move |info| {
-            if std::thread::current().id() != main {
-                return;
+            let thread = std::thread::current();
+            if thread.id() == main {
+                restore();
+                previous(info);
+            } else if thread.name() != Some(gallery::WORKER) {
+                let at = info.location().map(|l| format!(" ({}:{})", l.file(), l.line())).unwrap_or_default();
+                let payload = info.payload();
+                let message =
+                    payload.downcast_ref::<&str>().copied().or(payload.downcast_ref::<String>().map(String::as_str));
+                let what = format!("{}{at}", message.unwrap_or("it stopped"));
+                if let Ok(mut last) = BACKGROUND_PANIC.lock() {
+                    *last = Some(what);
+                }
             }
-            restore();
-            previous(info);
         }));
         terminal::enable_raw_mode()?;
         let setup = execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture, EnableBracketedPaste)
@@ -159,11 +174,18 @@ fn main() -> Result<()> {
     let mut app = App::new(&target)?;
     let mut tui = Tui::start()?;
     // Asking the terminal about graphics needs raw mode, and has to happen before any input is read
-    app.set_picker(picture::picker());
-    run(&mut tui.terminal, &mut app)
+    let (picker, late) = picture::picker();
+    app.set_picker(picker);
+    run(&mut tui.terminal, &mut app, late.then(LateAnswers::new))
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Result<()> {
+fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, mut late: Option<LateAnswers>) -> Result<()> {
+    let mut handle = |app: &mut App, event: Event| {
+        // The terminal's answer to the graphics question, come too late, isn't typing
+        if !late.as_mut().is_some_and(|late| late.swallows(&event)) {
+            app.handle(event);
+        }
+    };
     let mut bar_cursor = false;
     let mut last_tick = Instant::now();
     while !app.quit {
@@ -173,16 +195,21 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) -> Resu
             let style = if bar_cursor { SetCursorStyle::BlinkingBar } else { SetCursorStyle::DefaultUserShape };
             execute!(io::stdout(), style)?;
         }
-        if event::poll(Duration::from_millis(250))? {
-            app.handle(event::read()?);
+        // Straight back to drawing while there's more to color in, unless a key comes first
+        let wait = if app.busy() { Duration::ZERO } else { Duration::from_millis(250) };
+        if event::poll(wait)? {
+            handle(app, event::read()?);
             // Take whatever else is queued before redrawing, so fast scrolling keeps up
             while !app.quit && event::poll(Duration::ZERO)? {
-                app.handle(event::read()?);
+                handle(app, event::read()?);
             }
         }
         if last_tick.elapsed() >= Duration::from_secs(1) {
             app.tick();
             last_tick = Instant::now();
+        }
+        if let Some(what) = BACKGROUND_PANIC.lock().ok().and_then(|mut last| last.take()) {
+            app.say(format!("Something went wrong in the background: {what}"));
         }
     }
     Ok(())

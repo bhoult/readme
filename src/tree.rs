@@ -61,6 +61,8 @@ pub struct Tree {
     expanded: HashSet<PathBuf>,
     /// Everything under the root, read once for the filter
     everything: Option<Vec<(PathBuf, bool)>>,
+    /// Most entries the filter looks through
+    pub filter_limit: usize,
     /// What's in each archive that's been opened
     archives: RefCell<HashMap<PathBuf, Listing>>,
 }
@@ -79,6 +81,7 @@ impl Tree {
             anchor: None,
             expanded: HashSet::new(),
             everything: None,
+            filter_limit: FILTER_LIMIT,
             archives: RefCell::default(),
         };
         tree.rebuild();
@@ -195,8 +198,8 @@ impl Tree {
     /// Every file under the root whose path holds all the words of `query`, with the
     /// directories leading to them.
     fn filtered_into(&mut self, query: &str, rows: &mut Vec<Row>) {
-        let (root, all) = (&self.root, self.show_hidden);
-        let everything = self.everything.get_or_insert_with(|| walk_all(root, all));
+        let (root, all, limit) = (&self.root, self.show_hidden, self.filter_limit);
+        let everything = self.everything.get_or_insert_with(|| walk_all(root, all, limit));
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut keep: HashSet<&Path> = HashSet::new();
         for (path, _) in everything.iter() {
@@ -235,6 +238,11 @@ impl Tree {
 
     pub fn filtering(&self) -> bool {
         self.filter.as_deref().is_some_and(|q| !q.trim().is_empty())
+    }
+
+    /// Whether the filter stopped at its limit, so it looked through only part of the tree.
+    pub fn filter_cut_short(&self) -> bool {
+        self.filtering() && self.everything.as_ref().is_some_and(|e| e.len() >= self.filter_limit)
     }
 
     /// Opens, changes or (with None) closes the filter. Closing it leaves the tree
@@ -314,7 +322,7 @@ impl Tree {
 
 /// Everything under `root`, for the filter, read on all the cores. Unless `all`,
 /// this leaves out what the tree hides, and SKIP_DIRS too.
-fn walk_all(root: &Path, all: bool) -> Vec<(PathBuf, bool)> {
+fn walk_all(root: &Path, all: bool, limit: usize) -> Vec<(PathBuf, bool)> {
     let found = Mutex::new(Vec::new());
     let count = AtomicUsize::new(0);
     WalkBuilder::new(root)
@@ -328,7 +336,7 @@ fn walk_all(root: &Path, all: bool) -> Vec<(PathBuf, bool)> {
                 if entry.depth() == 0 {
                     return WalkState::Continue;
                 }
-                if count.fetch_add(1, Ordering::Relaxed) >= FILTER_LIMIT {
+                if count.fetch_add(1, Ordering::Relaxed) >= limit {
                     return WalkState::Quit;
                 }
                 let is_dir =
@@ -428,6 +436,13 @@ mod tests {
         assert!(tree.rows.iter().all(|r| r.name != "app.md"));
         tree.set_filter(Some("zzz".into()));
         assert!(tree.rows.is_empty());
+        assert!(!tree.filter_cut_short());
+        // Past its limit, it says it looked through only part of the tree
+        tree.filter_limit = 3;
+        tree.refresh();
+        assert!(tree.filter_cut_short());
+        tree.filter_limit = FILTER_LIMIT;
+        tree.refresh();
 
         // Closing it opens the tree down to the selection
         tree.set_filter(Some("test".into()));

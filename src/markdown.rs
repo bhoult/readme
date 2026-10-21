@@ -57,6 +57,8 @@ fn heading_style(level: HeadingLevel) -> Style {
 struct Table {
     aligns: Vec<Alignment>,
     rows: Vec<Vec<Vec<Frag>>>,
+    /// The source line of each row
+    srcs: Vec<usize>,
     row: Vec<Vec<Frag>>,
 }
 
@@ -67,6 +69,11 @@ struct Renderer {
     blank: Vec<bool>,
     /// Text of the paragraph, heading, list item or table cell being built
     inline: Vec<Frag>,
+    /// The source line each piece of `inline` came from, so each line it wraps into
+    /// knows where it is in the source
+    inline_src: Vec<usize>,
+    /// The source line of the event being handled
+    at: usize,
     styles: Vec<Style>,
     /// Enclosing lists; Some(n) for ordered ones, n being the next number
     lists: Vec<Option<u64>>,
@@ -96,6 +103,8 @@ pub fn render(src: &str, width: u16, wrap_code: bool) -> Rendered {
         out: Rendered { lines: Vec::new(), src: Vec::new(), pinned: 0, gutter: 0, width: 0 },
         blank: Vec::new(),
         inline: Vec::new(),
+        inline_src: Vec::new(),
+        at: 0,
         styles: Vec::new(),
         lists: Vec::new(),
         items: Vec::new(),
@@ -166,6 +175,7 @@ impl Renderer {
     fn push(&mut self, text: &str, style: Style) {
         let style = self.styles.last().copied().unwrap_or_default().patch(style);
         self.inline.push((text.to_string(), style));
+        self.inline_src.push(self.at);
     }
 
     fn push_style(&mut self, style: Style) {
@@ -174,6 +184,7 @@ impl Renderer {
     }
 
     fn event(&mut self, event: Event, offset: usize) {
+        self.at = self.line_of(offset);
         match event {
             Event::Start(tag) => self.start(tag, offset),
             Event::End(tag) => self.end(tag),
@@ -268,9 +279,17 @@ impl Renderer {
                 self.flush();
                 self.gap();
                 self.src = line;
-                self.table = Some(Table { aligns, rows: Vec::new(), row: Vec::new() });
+                self.table = Some(Table { aligns, rows: Vec::new(), srcs: Vec::new(), row: Vec::new() });
             }
-            Tag::TableCell => self.inline.clear(),
+            Tag::TableHead | Tag::TableRow => {
+                if let Some(table) = &mut self.table {
+                    table.srcs.push(line);
+                }
+            }
+            Tag::TableCell => {
+                self.inline.clear();
+                self.inline_src.clear();
+            }
             Tag::Emphasis => self.push_style(Style::new().add_modifier(Modifier::ITALIC)),
             Tag::Strong => self.push_style(Style::new().add_modifier(Modifier::BOLD)),
             Tag::Strikethrough => self.push_style(Style::new().add_modifier(Modifier::CROSSED_OUT)),
@@ -324,13 +343,14 @@ impl Renderer {
             TagEnd::Item => {
                 // An empty item still shows its bullet
                 if self.marker.is_some() && self.inline.is_empty() {
-                    self.inline.push((String::new(), Style::new()));
+                    self.push("", Style::new());
                 }
                 self.flush();
                 self.items.pop();
                 self.marker = None;
             }
             TagEnd::TableCell => {
+                self.inline_src.clear();
                 let cell = std::mem::take(&mut self.inline);
                 if let Some(table) = &mut self.table {
                     table.row.push(cell);
@@ -374,9 +394,13 @@ impl Renderer {
             return 0;
         }
         let frags = std::mem::take(&mut self.inline);
+        let srcs = std::mem::take(&mut self.inline_src);
         let marker = self.marker.take();
         let mut widest = 0;
-        for (i, line) in wrap(&frags, self.room(0)).into_iter().enumerate() {
+        for (i, (line, first)) in wrap(&frags, self.room(0)).into_iter().enumerate() {
+            if let Some(&src) = srcs.get(first) {
+                self.src = src;
+            }
             let mut out = self.prefix();
             if let (0, Some(marker)) = (i, &marker) {
                 let indent = out.pop().map_or(0, |(pad, _)| pad.len());
@@ -432,6 +456,7 @@ impl Renderer {
             *width = (*width).min(MAX_CELL);
         }
         for (r, row) in table.rows.iter().enumerate() {
+            self.src = table.srcs.get(r).copied().unwrap_or(self.src);
             let mut out = self.prefix();
             for (c, &width) in widths.iter().enumerate() {
                 if c > 0 {
@@ -447,6 +472,8 @@ impl Renderer {
             }
             self.emit(out, false);
             if r == 0 {
+                // The |---| line under the header
+                self.src += 1;
                 let mut out = self.prefix();
                 let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
                 out.push((rule.join("─┼─"), dim()));
@@ -491,30 +518,37 @@ fn push_frag(line: &mut Vec<Frag>, text: &str, style: Style) {
     }
 }
 
-/// Greedy word wrap; "\n" forces a break. Always returns at least one line.
-fn wrap(frags: &[Frag], width: usize) -> Vec<Vec<Frag>> {
-    let mut lines: Vec<Vec<Frag>> = vec![Vec::new()];
+/// Greedy word wrap; "\n" forces a break. Always returns at least one line, each with
+/// the index of the frag its text starts in.
+fn wrap(frags: &[Frag], width: usize) -> Vec<(Vec<Frag>, usize)> {
+    // Each line, and the frag its first text came from
+    let mut lines: Vec<(Vec<Frag>, Option<usize>)> = vec![(Vec::new(), None)];
+    let put = |lines: &mut Vec<(Vec<Frag>, Option<usize>)>, i: usize, text: &str, style: Style| {
+        let (line, first) = lines.last_mut().unwrap();
+        first.get_or_insert(i);
+        push_frag(line, text, style);
+    };
     let mut col = 0;
-    for (text, style) in frags {
+    for (i, (text, style)) in frags.iter().enumerate() {
         for token in tokens(text) {
             if token == "\n" {
-                lines.push(Vec::new());
+                lines.push((Vec::new(), None));
                 col = 0;
                 continue;
             }
             let w = str_width(token);
             if token.chars().all(char::is_whitespace) {
                 if col > 0 && col + w <= width {
-                    push_frag(lines.last_mut().unwrap(), token, *style);
+                    put(&mut lines, i, token, *style);
                     col += w;
                 }
                 continue;
             }
             if col > 0 && col + w > width {
-                if let Some((last, _)) = lines.last_mut().unwrap().last_mut() {
+                if let Some((last, _)) = lines.last_mut().unwrap().0.last_mut() {
                     last.truncate(last.trim_end().len());
                 }
-                lines.push(Vec::new());
+                lines.push((Vec::new(), None));
                 col = 0;
             }
             // A word wider than the whole line gets split
@@ -525,18 +559,26 @@ fn wrap(frags: &[Frag], width: usize) -> Vec<Vec<Frag>> {
                     let first = rest.chars().next().map_or(0, char::len_utf8);
                     (head, tail) = rest.split_at(first);
                 }
-                push_frag(lines.last_mut().unwrap(), head, *style);
-                lines.push(Vec::new());
+                put(&mut lines, i, head, *style);
+                lines.push((Vec::new(), None));
                 col = 0;
                 rest = tail;
             }
             if !rest.is_empty() {
-                push_frag(lines.last_mut().unwrap(), rest, *style);
+                put(&mut lines, i, rest, *style);
                 col += str_width(rest);
             }
         }
     }
+    // An empty line (from a hard break) goes with the one before
+    let mut last = 0;
     lines
+        .into_iter()
+        .map(|(line, first)| {
+            last = first.unwrap_or(last);
+            (line, last)
+        })
+        .collect()
 }
 
 /// Breaks code at exactly `width` columns.
@@ -664,6 +706,21 @@ mod tests {
         let y = (0..r.lines.len()).find(|&i| r.text(i).contains('y')).unwrap();
         assert_eq!(r.src[y], 6);
         assert_eq!(r.line_for_src(2), 3);
+    }
+
+    #[test]
+    fn wrapped_paragraphs_and_table_rows_know_their_source_lines() {
+        // Lines 2 to 11: a paragraph that wraps; 13 to 16: a table
+        let para: String = (0..10).map(|i| format!("line {i} of the paragraph goes on for a while\n")).collect();
+        let src = format!("# T\n\n{para}\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n");
+        let r = render(&src, 30, false);
+        let row = |text: &str| (0..r.lines.len()).find(|&i| r.text(i).contains(text)).unwrap();
+        // That row starts with the end of line 6 or the start of line 7
+        assert!([8, 9].contains(&r.src[row("line 7")]), "{:?}", r.src);
+        assert_eq!(r.src[row("line 0")], 2);
+        assert_eq!(r.src[row("3 │ 4")], 16);
+        assert_eq!(r.src[row("1 │ 2")], 15);
+        assert!(r.src.is_sorted(), "{:?}", r.src);
     }
 
     #[test]

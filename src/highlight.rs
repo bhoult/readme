@@ -4,6 +4,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use ratatui::style::{Color, Modifier, Style};
@@ -86,6 +87,9 @@ fn to_style(style: highlighting::Style) -> Style {
 pub type Colors = Vec<(Style, Range<usize>)>;
 
 const CHECKPOINT: usize = 64;
+/// Most time one call spends highlighting, so a jump to the end of a big file doesn't
+/// hold up the screen: the next frames do the rest
+const SLICE: Duration = Duration::from_millis(25);
 
 /// Highlighted lines of a file, computed as far down as has been shown. Edits throw
 /// away what follows them, back to the nearest saved parser state.
@@ -130,21 +134,26 @@ impl LineCache {
         self.state = self.checkpoints.last().cloned();
     }
 
-    /// Highlights through line `upto` (exclusive) of `text`.
-    pub fn ensure(&mut self, text: &[String], upto: usize) {
-        let Some(hl) = get() else { return };
+    /// Highlights through line `upto` (exclusive) of `text`, or as far as it gets in
+    /// SLICE; false if there's more to do.
+    pub fn ensure(&mut self, text: &[String], upto: usize) -> bool {
+        let Some(hl) = get() else { return true };
         if self.disabled {
-            return;
+            return true;
         }
         let syntax =
             *self.syntax.get_or_insert_with(|| hl.syntax_for(&self.path, text.first().map_or("", String::as_str)));
-        let Some(syntax) = syntax else { return };
+        let Some(syntax) = syntax else { return true };
+        let started = Instant::now();
         let highlighter = Highlighter::new(&hl.theme);
         let state = self
             .state
             .get_or_insert_with(|| (ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new())));
         while self.lines.len() < upto.min(text.len()) {
             let n = self.lines.len();
+            if n.is_multiple_of(CHECKPOINT) && started.elapsed() > SLICE {
+                return false;
+            }
             if n.is_multiple_of(CHECKPOINT) && n / CHECKPOINT == self.checkpoints.len() {
                 self.checkpoints.push(state.clone());
             }
@@ -161,6 +170,7 @@ impl LineCache {
             }
             self.lines.push(colors);
         }
+        true
     }
 
     pub fn get(&self, line: usize) -> &[(Style, Range<usize>)] {
@@ -203,7 +213,7 @@ mod tests {
         load();
         let text: Vec<String> = (0..200).map(|i| format!("let x{i} = {i};")).collect();
         let mut cache = LineCache::new(Path::new("a.rs"), &text);
-        cache.ensure(&text, 200);
+        while !cache.ensure(&text, 200) {}
         assert_eq!(cache.lines.len(), 200);
         // A line added at the end, as a log or an agent's notes grow
         let mut more = text.clone();
@@ -213,7 +223,7 @@ mod tests {
         // A change further up goes back to the checkpoint before it
         cache.replaced(&more, 130);
         assert_eq!(cache.lines.len(), 128);
-        cache.ensure(&more, 201);
+        while !cache.ensure(&more, 201) {}
         assert_eq!(cache.get(200), LineCache::new(Path::new("a.rs"), &more).colors_of(&more, 200));
         // The first line can change the syntax (#!/bin/sh), so that starts again
         cache.replaced(&more, 0);
@@ -222,7 +232,7 @@ mod tests {
 
     impl LineCache {
         fn colors_of(mut self, text: &[String], line: usize) -> Vec<(Style, Range<usize>)> {
-            self.ensure(text, line + 1);
+            while !self.ensure(text, line + 1) {}
             self.get(line).to_vec()
         }
     }

@@ -110,6 +110,8 @@ struct Doc {
     disk: (Option<SystemTime>, u64),
     /// Changed on disk while it had unsaved changes here
     disk_changed: bool,
+    /// The colors haven't caught up with what's on screen; the next frames do more
+    coloring: bool,
     /// The longest line's width, roughly, for the buffer version it was measured on
     widest: Option<(u64, usize)>,
     /// Whether the view's cut off anything to the left, and to the right
@@ -150,6 +152,7 @@ impl Doc {
             last_match: None,
             disk: disk_stamp(path),
             disk_changed: false,
+            coloring: false,
         };
         doc.raw = doc.too_big_to_render();
         doc
@@ -634,7 +637,12 @@ impl App {
         self.focus == Focus::Content && matches!(&self.shown, Shown::Doc(doc) if doc.editing)
     }
 
-    fn say(&mut self, message: impl Into<String>) {
+    /// Whether there's drawing left that the next frames do, so they should come soon.
+    pub fn busy(&self) -> bool {
+        matches!(&self.shown, Shown::Doc(doc) if doc.coloring)
+    }
+
+    pub fn say(&mut self, message: impl Into<String>) {
         self.message = Some((message.into(), Instant::now()));
     }
 
@@ -822,6 +830,11 @@ impl App {
     }
 
     fn key(&mut self, key: KeyEvent) {
+        // A key lets go of a tree row held down: the press goes by the row's place, which
+        // keys like r and . move
+        if matches!(self.drag, Drag::Tree { .. }) {
+            self.drag = Drag::None;
+        }
         if let Some(prompt) = self.prompt.take() {
             return self.prompt_key(prompt, key);
         }
@@ -1572,8 +1585,9 @@ impl App {
                 }
             }
             'v' => match clipboard::paste(false) {
-                Some(text) => self.insert_text(&text),
-                None => self.say("Nothing to paste"),
+                Ok(Some(text)) => self.insert_text(&text),
+                Ok(None) => self.say("Nothing to paste"),
+                Err(why) => self.say(why),
             },
             'f' => self.prompt = Some(Prompt::Search(String::new())),
             'z' | 'y' | 'a' => {
@@ -1785,8 +1799,10 @@ impl App {
                     let pos = doc.pos_at(area, gutter, x, y, width);
                     doc.buf.move_to(pos, false);
                 }
-                if let Some(text) = clipboard::paste(true) {
-                    self.insert_text(&text);
+                match clipboard::paste(true) {
+                    Ok(Some(text)) => self.insert_text(&text),
+                    Ok(None) => {}
+                    Err(why) => self.say(why),
                 }
             }
             MouseEventKind::ScrollUp
@@ -2209,7 +2225,13 @@ impl App {
                 let typing = focused && self.filtering;
                 let area = self.filter_area;
                 let files = self.tree.rows.iter().filter(|r| !r.is_dir).count();
-                let count = if self.tree.filtering() { format!("{files} ") } else { String::new() };
+                let count = if self.tree.filter_cut_short() {
+                    format!("{files} in the first {}k ", self.tree.filter_limit / 1000)
+                } else if self.tree.filtering() {
+                    format!("{files} ")
+                } else {
+                    String::new()
+                };
                 let room = (area.width as usize).saturating_sub(3 + str_width(&count));
                 let shown: String = query.chars().rev().take(room).collect::<Vec<_>>().into_iter().rev().collect();
                 let pad = room.saturating_sub(str_width(&shown));
@@ -2412,11 +2434,12 @@ impl App {
                         let room = width.saturating_sub(number.len());
                         // From the start of the text, or from a little before the match
                         let chars: Vec<char> = hit.text.chars().collect();
-                        let lead = chars.iter().take_while(|c| c.is_whitespace()).count();
-                        let start = lead.max(hit.col.saturating_sub(room / 3));
+                        let lead =
+                            if hit.from > 0 { 0 } else { chars.iter().take_while(|c| c.is_whitespace()).count() };
+                        let start = lead.max((hit.col - hit.from).saturating_sub(room / 3));
                         let hits = find_all(&hit.text, &query);
                         let mut spans = vec![Span::styled(number, base.add_modifier(Modifier::DIM))];
-                        if start > lead {
+                        if start > lead || hit.from > 0 {
                             push_span(&mut spans, "…", base.add_modifier(Modifier::DIM));
                         }
                         let mut used: usize = spans.iter().map(|s| str_width(&s.content)).sum();
@@ -2444,6 +2467,12 @@ impl App {
         if grep.files.is_empty() {
             let note = if grep.done { "  (no matches)" } else { "  searching…" };
             lines.push(Line::styled(note, dim()));
+        }
+        // Last in the list, and counted in its rows, so scrolling reaches it
+        let big = grep.too_big();
+        if big > 0 && lines.len() < height {
+            let files = if big == 1 { "file" } else { "files" };
+            lines.push(Line::styled(format!("  {big} {files} over 10 MB not searched"), dim()));
         }
         f.render_widget(Paragraph::new(lines), list);
     }
@@ -2642,11 +2671,11 @@ fn draw_formatted(f: &mut Frame, doc: &mut Doc, area: Rect, search: Option<&str>
     let max_top = rendered.lines.len().saturating_sub(body).max(rendered.pinned);
     doc.fmt_top = doc.fmt_top.clamp(rendered.pinned, max_top);
     doc.fmt_left = doc.fmt_left.min(rendered.width.saturating_sub(text.width as usize));
-    doc.more = (doc.fmt_left > 0, doc.fmt_left + (text.width as usize) < rendered.width);
     let (top, left, gutter) = (doc.fmt_top, doc.fmt_left, rendered.gutter);
-    let lines: Vec<Line> = rendered.lines[..pinned]
-        .iter()
-        .chain(rendered.lines.iter().skip(top).take(body))
+    let shown = || rendered.lines[..pinned].iter().chain(rendered.lines.iter().skip(top).take(body));
+    // More to the right only if a line on screen goes on past the edge
+    doc.more = (left > 0, shown().any(|line| line.width() > left + text.width as usize));
+    let lines: Vec<Line> = shown()
         .map(|line| {
             let line = slice_line(line, gutter, left);
             match search {
@@ -2701,7 +2730,7 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
         row = 0;
     }
     let bottom = rows.last().map_or(doc.top, |r| r.0 + 1);
-    doc.colors.ensure(&doc.buf.lines, bottom);
+    doc.coloring = !doc.colors.ensure(&doc.buf.lines, bottom);
     doc.more = if doc.wrap {
         (false, false)
     } else {
@@ -3130,6 +3159,14 @@ mod tests {
             h.key(KeyCode::Right);
         }
         assert!(h.screen().contains("for the pane"), "{}", h.screen());
+
+        // A wide table further down doesn't count until it's on screen
+        let md = format!("# T\n\n{}{md}", "Some text.\n\n".repeat(40));
+        let mut h = Harness::new(&[("README.md", &md)]);
+        h.key(KeyCode::Tab);
+        assert!(!h.screen().contains("more →"), "{}", h.screen());
+        h.key(KeyCode::End);
+        assert!(h.screen().contains("more →"), "{}", h.screen());
     }
 
     #[test]
@@ -3425,6 +3462,17 @@ mod tests {
         assert!(h.screen().contains("Move x.txt into sub/?"), "{}", h.screen());
         h.key(KeyCode::Char('y'));
         assert!(h.root.join("sub/x.txt").exists() && !h.root.join("x.txt").exists());
+
+        // A key while a row is held down (r, which reads the tree again, here with a new
+        // folder above) lets go of it, so letting go doesn't click whatever row is there now
+        fs::create_dir(h.root.join("aaa")).unwrap();
+        fs::write(h.root.join("aaa/inside.txt"), "a\n").unwrap();
+        let (x, y) = h.find("▸ sub");
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x + 2, y);
+        h.key(KeyCode::Char('r'));
+        h.mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y);
+        assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "sub");
+        assert!(!h.screen().contains("inside.txt"), "{}", h.screen());
     }
 
     #[test]

@@ -4,11 +4,15 @@
 use std::{
     env,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use image::DynamicImage;
-use ratatui::{Frame, layout::Rect};
+use ratatui::{
+    Frame,
+    crossterm::event::{Event, KeyCode, KeyModifiers},
+    layout::Rect,
+};
 use ratatui_image::{
     FilterType, FontSize, Resize, StatefulImage,
     picker::{Picker, ProtocolType},
@@ -27,15 +31,21 @@ pub fn is_image(path: &Path) -> bool {
 /// (herdr does inside GNOME Terminal), so inside one this keeps to half-blocks. The
 /// exception is herdr whose windows all run in a terminal it passes images on to.
 /// README_IMAGES overrides all this: kitty, sixel, iterm2, halfblocks, or auto to ask
-/// the terminal.
-pub fn picker() -> Picker {
+/// the terminal. Also says whether the terminal was asked and didn't answer in time, so
+/// its answers may yet come, as keys.
+pub fn picker() -> (Picker, bool) {
     let wanted = env::var("README_IMAGES").unwrap_or_default().to_lowercase();
     let multiplexed = ["HERDR_ENV", "TMUX", "ZELLIJ", "STY"].iter().any(|v| env::var_os(v).is_some());
     let herdr_shows_images = wanted.is_empty() && env::var_os("HERDR_ENV").is_some() && herdr_windows_show_images();
+    let mut late = false;
     let mut picker = match wanted.as_str() {
         "halfblocks" | "blocks" => Picker::halfblocks(),
         "" if multiplexed && !herdr_shows_images => Picker::halfblocks(),
-        _ => ask_terminal().unwrap_or_else(Picker::halfblocks),
+        _ => {
+            let (asked, slow) = ask_terminal();
+            late = slow;
+            asked.unwrap_or_else(Picker::halfblocks)
+        }
     };
     let forced = match wanted.as_str() {
         "kitty" => Some(ProtocolType::Kitty),
@@ -47,15 +57,64 @@ pub fn picker() -> Picker {
     if let Some(protocol) = forced {
         picker.set_protocol_type(protocol);
     }
-    picker
+    (picker, late)
+}
+
+/// Answers to the graphics question that come after the wait for them ended. crossterm
+/// reads them as keys: the Kitty answer `ESC _ G … ESC \` as Alt+_, its letters, then
+/// Alt+\ (it drops the other answers). For a while after the start, those are dropped.
+pub struct LateAnswers {
+    until: Instant,
+    state: Late,
+}
+
+enum Late {
+    Waiting,
+    /// An Alt+_: an answer if a G follows
+    Start,
+    /// Keys taken so far of an answer
+    Inside(usize),
+}
+
+impl LateAnswers {
+    pub fn new() -> Self {
+        Self { until: Instant::now() + Duration::from_secs(10), state: Late::Waiting }
+    }
+
+    /// Whether `event` is part of a late answer, to be dropped.
+    pub fn swallows(&mut self, event: &Event) -> bool {
+        let Event::Key(key) = event else { return false };
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let (state, drop) = match self.state {
+            Late::Waiting if alt && key.code == KeyCode::Char('_') && Instant::now() < self.until => {
+                (Late::Start, true)
+            }
+            Late::Waiting => (Late::Waiting, false),
+            // Alt+_ does nothing in readme, so only the key after it goes through
+            Late::Start if key.code == KeyCode::Char('G') => (Late::Inside(1), true),
+            Late::Start => (Late::Waiting, false),
+            // It ends with ESC \, and anyway soon: the answer is short
+            Late::Inside(_) if alt && key.code == KeyCode::Char('\\') => (Late::Waiting, true),
+            Late::Inside(n) if n < 200 => (Late::Inside(n + 1), true),
+            Late::Inside(_) => (Late::Waiting, true),
+        };
+        self.state = state;
+        drop
+    }
 }
 
 /// Asks the terminal whether it shows Kitty graphics or sixels, and how big its
 /// character cells are. ratatui-image can ask too, but it waits on a thread that's
 /// left reading the keyboard when a terminal never answers; this waits here, with a
-/// deadline, so nothing is left behind.
+/// deadline. Also says whether the deadline passed with the question asked.
 #[cfg(unix)]
-fn ask_terminal() -> Option<Picker> {
+fn ask_terminal() -> (Option<Picker>, bool) {
+    let mut late = false;
+    (query_terminal(&mut late), late)
+}
+
+#[cfg(unix)]
+fn query_terminal(late: &mut bool) -> Option<Picker> {
     use std::{io::Write, os::fd::AsRawFd};
     // The answers come back where crossterm reads the keys: stdin when it's the terminal,
     // /dev/tty when it isn't (`readme notes.md < /dev/null`). Waited for anywhere else,
@@ -80,6 +139,7 @@ fn ask_terminal() -> Option<Picker> {
         // SAFETY: one valid pollfd, then a read into a buffer of the length given
         let ready = unsafe { libc::poll(&mut waiting, 1, left.as_millis() as i32) };
         if ready <= 0 {
+            *late = ready == 0;
             return None;
         }
         let mut chunk = [0u8; 512];
@@ -112,8 +172,8 @@ fn ask_terminal() -> Option<Picker> {
 }
 
 #[cfg(not(unix))]
-fn ask_terminal() -> Option<Picker> {
-    None
+fn ask_terminal() -> (Option<Picker>, bool) {
+    (None, false)
 }
 
 /// Where the device attributes answer (`ESC [ ? … c`) ends, once it has arrived.
@@ -366,6 +426,23 @@ mod tests {
 
     fn shows(vars: &[(&'static str, &'static str)]) -> bool {
         terminal_shows_kitty(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))
+    }
+
+    #[test]
+    fn late_answers_are_not_typed() {
+        use ratatui::crossterm::event::KeyEvent;
+        let key = |c: char, m: KeyModifiers| Event::Key(KeyEvent::new(KeyCode::Char(c), m));
+        let mut late = LateAnswers::new();
+        // ESC _ G i = 3 1 ; O K ESC \ as crossterm reads it
+        let mut answer = vec![key('_', KeyModifiers::ALT)];
+        answer.extend("Gi=31;OK".chars().map(|c| key(c, KeyModifiers::NONE)));
+        answer.push(key('\\', KeyModifiers::ALT));
+        assert!(answer.iter().all(|k| late.swallows(k)));
+        assert!(!late.swallows(&key('x', KeyModifiers::NONE)));
+        // Alt+_ and then anything but G is someone typing
+        assert!(late.swallows(&key('_', KeyModifiers::ALT)));
+        assert!(!late.swallows(&key('q', KeyModifiers::NONE)));
+        assert!(!late.swallows(&key('G', KeyModifiers::NONE)));
     }
 
     #[test]

@@ -42,56 +42,58 @@ pub fn copy(text: &str, primary: bool) {
     }
 }
 
-/// The clipboard (or primary selection) contents, where a tool can read them.
-pub fn paste(primary: bool) -> Option<String> {
+/// The clipboard (or primary selection) contents, where a tool can read them: None
+/// when there's nothing there to paste, or why it couldn't be read.
+pub fn paste(primary: bool) -> Result<Option<String>, &'static str> {
     if cfg!(test) {
-        return None;
+        return Ok(None);
     }
     let output = if wayland() {
         let mut args = vec!["--no-newline"];
         if primary {
             args.push("--primary");
         }
-        read("wl-paste", &args)
+        read("wl-paste", &args)?
     } else if x11() {
         // Either tool, as copy uses
         let (which, flag) = if primary { ("primary", "-p") } else { ("clipboard", "-b") };
-        read("xclip", &["-o", "-selection", which]).or_else(|| read("xsel", &["-o", flag]))
+        match read("xclip", &["-o", "-selection", which])? {
+            Some(output) => Some(output),
+            None => read("xsel", &["-o", flag])?,
+        }
     } else {
         None
-    }?;
-    String::from_utf8(output).ok().filter(|s| !s.is_empty())
+    };
+    Ok(output.and_then(|o| String::from_utf8(o).ok()).filter(|s| !s.is_empty()))
 }
 
-/// What a clipboard tool prints, if it's done within a couple of seconds. The text comes
-/// from whichever program holds the clipboard, and one that has hung would hang the
-/// tool, and readme waiting on it, for good.
-fn read(program: &str, args: &[&str]) -> Option<Vec<u8>> {
+/// What a clipboard tool prints (None if it fails), if it's done within a couple of
+/// seconds. The text comes from whichever program holds the clipboard, and one that has
+/// hung would hang the tool, and readme waiting on it, for good.
+fn read(program: &str, args: &[&str]) -> Result<Option<Vec<u8>>, &'static str> {
     use std::{io::Read, sync::mpsc, time::Duration};
 
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdout = child.stdout.take()?;
+    let Ok(mut child) =
+        Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
+    else {
+        return Ok(None);
+    };
+    let Some(mut stdout) = child.stdout.take() else { return Ok(None) };
     let (sender, received) = mpsc::channel();
     std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = sender.send(stdout.read_to_end(&mut out).map(|_| out));
     });
     match received.recv_timeout(Duration::from_secs(2)) {
-        Ok(Ok(out)) if child.wait().is_ok_and(|status| status.success()) => Some(out),
+        Ok(Ok(out)) if child.wait().is_ok_and(|status| status.success()) => Ok(Some(out)),
         Ok(_) => {
             let _ = child.wait();
-            None
+            Ok(None)
         }
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
-            None
+            Err("The clipboard didn't answer: the program holding it may be stuck")
         }
     }
 }

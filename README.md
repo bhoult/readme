@@ -15,9 +15,9 @@ as they land.
   press `.`. Press `/` to filter the whole tree by name as you type. It
   refreshes itself every couple of seconds.
 - **Find in files**: `F` searches the text of every file under the tree's
-  folder, on all the CPU cores, skipping binary files and whatever the tree
-  hides (ignored files, `node_modules`, `target`; press `.` first to include
-  them). Matches fill the left pane as they're found; moving through them shows
+  folder, on all the CPU cores, skipping binary files, text files over 10 MB
+  (the list ends by saying how many), and whatever the tree hides (ignored
+  files, `node_modules`, `target`; press `.` first to include them). Matches fill the left pane as they're found; moving through them shows
   each file at its line, and `n`/`N` step through the rest of that file.
 - **Source**: syntax highlighting for the languages [bat](https://github.com/sharkdp/bat)
   knows, in the terminal's own colors, with line numbers, search, and word wrap
@@ -33,7 +33,8 @@ as they land.
   `-`) zooms, dragging or the arrow keys move around, and `0` fits it again.
 - **Archives**: zip files and tar files (plain, `.gz`, `.bz2`, `.xz`, `.zst`)
   open in the tree like directories, and the files inside them open like any
-  other, without unpacking anything.
+  other, without unpacking anything. A tar file has no index, so a very big
+  compressed one is listed as far as readme gets through it in a few seconds.
 - **Thumbnails**: select a folder with images in it and the right pane shows
   them as a grid, 100 pixels wide (`+` and `-` change that). Click one, or
   press `Enter`, to open it, and `Esc` to go back.

@@ -28,6 +28,8 @@ pub struct Change {
     pub status: char,
     /// Relative to the top of the repository
     pub path: String,
+    /// What a renamed or copied file was called before
+    pub from: Option<String>,
 }
 
 /// Most of git's output that's read: enough for any file readme shows, and a stop
@@ -141,11 +143,9 @@ pub fn changes(repo: &Path, commit: &Commit) -> Result<Vec<Change>> {
     while let Some(status) = fields.next().filter(|s| !s.is_empty()) {
         let letter = status.chars().next().unwrap_or('M');
         // Renames and copies list the old path, then the new one
-        if matches!(letter, 'R' | 'C') {
-            fields.next();
-        }
+        let from = if matches!(letter, 'R' | 'C') { fields.next() } else { None };
         let Some(path) = fields.next() else { break };
-        changes.push(Change { status: letter, path });
+        changes.push(Change { status: letter, path, from });
     }
     Ok(changes)
 }
@@ -168,10 +168,15 @@ pub fn commit_text(repo: &Path, hash: &str) -> Result<Vec<u8>> {
 
 /// What a commit did to one file.
 pub fn file_diff(repo: &Path, commit: &Commit, path: &str) -> Result<Vec<u8>> {
-    match &commit.parent {
-        Some(parent) => git_text(repo, &["diff", "-M", "--no-color", parent, &commit.hash, "--", path]),
-        None => git_text(repo, &["show", "--format=", "--no-color", &commit.hash, "--", path]),
-    }
+    let Some(parent) = &commit.parent else {
+        return git_text(repo, &["show", "--format=", "--no-color", &commit.hash, "--", path]);
+    };
+    // Given only the new name, git sees a renamed file as all new; given the old one
+    // too, it shows the rename and what changed
+    let from = changes(repo, commit).ok().and_then(|c| c.into_iter().find(|c| c.path == path)?.from);
+    let mut args = vec!["diff", "-M", "--no-color", parent, &commit.hash, "--", path];
+    args.extend(from.as_deref());
+    git_text(repo, &args)
 }
 
 /// "5m", "3h", "2d", "6w", "4mo", "2y"
@@ -245,6 +250,9 @@ mod tests {
         let file = log(&root, &root.join("renamed.txt"), true).unwrap();
         let names: Vec<(&str, Option<&str>)> = file.iter().map(|c| (c.subject.as_str(), c.path.as_deref())).collect();
         assert_eq!(names, vec![("rename", Some("renamed.txt")), ("second", Some("a.txt")), ("first", Some("a.txt"))]);
+        // ...and its diff there is a rename, not a whole new file
+        let diff = String::from_utf8(file_diff(&root, &file[0], "renamed.txt").unwrap()).unwrap();
+        assert!(diff.contains("rename from a.txt") && !diff.contains("+two"), "{diff}");
 
         // Names git would quote (accents, quote marks) come back as they are
         let odd = "café \"x\".txt";

@@ -2,7 +2,8 @@
 //! as they're found, kept in path order.
 
 use std::{
-    fs,
+    fs::File,
+    io::Read,
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -14,7 +15,11 @@ use std::{
 
 use ignore::{WalkBuilder, WalkState};
 
-use crate::{cores, text::find_all, tree::SKIP_DIRS};
+use crate::{
+    cores,
+    text::{find_all, fold_case},
+    tree::SKIP_DIRS,
+};
 
 /// Bigger files aren't searched
 const MAX_FILE: u64 = 10 << 20;
@@ -24,10 +29,15 @@ const PER_FILE: usize = 500;
 /// How much of a file is checked for NUL bytes to tell binary from text
 const SNIFF: usize = 8000;
 
-/// A matching line: its number (from 0), where the match starts (in chars), and the line.
+/// How much of a matching line is kept, around the match
+const KEEP: usize = 1000;
+
+/// A matching line: its number (from 0), where the match starts (in chars), and the line,
+/// or for a long one the part of it from char `from`, with the match in it.
 pub struct Hit {
     pub line: usize,
     pub col: usize,
+    pub from: usize,
     pub text: String,
 }
 
@@ -41,6 +51,8 @@ pub struct Grep {
     pub files: Vec<FileHits>,
     pub done: bool,
     pub searched: Arc<AtomicUsize>,
+    /// Text files left out for being over MAX_FILE
+    too_big: Arc<AtomicUsize>,
     matches: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     found: mpsc::Receiver<Option<FileHits>>,
@@ -59,13 +71,15 @@ impl Grep {
         let (sender, found) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let searched = Arc::new(AtomicUsize::new(0));
+        let too_big = Arc::new(AtomicUsize::new(0));
         let matches = Arc::new(AtomicUsize::new(0));
         let (root, query_owned) = (root.to_path_buf(), query.to_string());
         let (stop_walk, searched_walk, matches_walk) = (stop.clone(), searched.clone(), matches.clone());
+        let too_big_walk = too_big.clone();
         thread::spawn(move || {
             // Case matters only when the query has a capital
             let fold = !query_owned.chars().any(char::is_uppercase);
-            let needle = if fold { query_owned.to_lowercase() } else { query_owned.clone() };
+            let needle = if fold { fold_case(&query_owned) } else { query_owned.clone() };
             WalkBuilder::new(&root)
                 .standard_filters(!all)
                 .filter_entry(move |e| {
@@ -76,6 +90,7 @@ impl Grep {
                 .run(|| {
                     let (sender, query, needle) = (sender.clone(), query_owned.clone(), needle.clone());
                     let (stop, searched, matches) = (stop_walk.clone(), searched_walk.clone(), matches_walk.clone());
+                    let too_big = too_big_walk.clone();
                     Box::new(move |entry| {
                         if stop.load(Ordering::Relaxed) {
                             return WalkState::Quit;
@@ -85,7 +100,15 @@ impl Grep {
                             return WalkState::Continue;
                         }
                         searched.fetch_add(1, Ordering::Relaxed);
-                        if let Some(hits) = search_file(entry.path(), &query, &needle, fold) {
+                        let hits = match search_file(entry.path(), &query, &needle, fold) {
+                            Searched::Hits(hits) => Some(hits),
+                            Searched::TooBig => {
+                                too_big.fetch_add(1, Ordering::Relaxed);
+                                None
+                            }
+                            Searched::Nothing => None,
+                        };
+                        if let Some(hits) = hits {
                             let total = matches.fetch_add(hits.len(), Ordering::Relaxed) + hits.len();
                             let _ = sender.send(Some(FileHits { path: entry.into_path(), hits }));
                             if total >= MAX_MATCHES {
@@ -103,6 +126,7 @@ impl Grep {
             files: Vec::new(),
             done: false,
             searched,
+            too_big,
             matches,
             stop,
             found,
@@ -135,6 +159,11 @@ impl Grep {
 
     pub fn matches(&self) -> usize {
         self.matches.load(Ordering::Relaxed)
+    }
+
+    /// Text files left out for being too big to search, once the search is done.
+    pub fn too_big(&self) -> usize {
+        if self.done { self.too_big.load(Ordering::Relaxed) } else { 0 }
     }
 
     /// Whether the search stopped at the limit rather than at the end.
@@ -188,8 +217,9 @@ impl Grep {
         None
     }
 
+    /// Lines in the list, including the one saying files were too big to search.
     pub fn rows(&self) -> usize {
-        self.files.iter().map(|f| f.hits.len() + 1).sum()
+        self.files.iter().map(|f| f.hits.len() + 1).sum::<usize>() + usize::from(self.too_big() > 0)
     }
 }
 
@@ -199,37 +229,55 @@ impl Drop for Grep {
     }
 }
 
+enum Searched {
+    Hits(Vec<Hit>),
+    Nothing,
+    /// Text, but too big to search
+    TooBig,
+}
+
 /// The lines of a text file that hold the query.
-fn search_file(path: &Path, query: &str, needle: &str, fold: bool) -> Option<Vec<Hit>> {
-    if fs::metadata(path).ok()?.len() > MAX_FILE {
-        return None;
+fn search_file(path: &Path, query: &str, needle: &str, fold: bool) -> Searched {
+    let Ok(mut file) = File::open(path) else { return Searched::Nothing };
+    let size = file.metadata().map_or(0, |m| m.len());
+    let mut bytes = Vec::new();
+    // Binary files are left out quietly, whatever their size
+    if (&mut file).take(SNIFF as u64).read_to_end(&mut bytes).is_err() || bytes.contains(&0) {
+        return Searched::Nothing;
     }
-    let bytes = fs::read(path).ok()?;
-    if bytes[..bytes.len().min(SNIFF)].contains(&0) {
-        return None;
+    if size > MAX_FILE {
+        return Searched::TooBig;
+    }
+    if file.take(MAX_FILE + 1 - bytes.len() as u64).read_to_end(&mut bytes).is_err() {
+        return Searched::Nothing;
     }
     let text = String::from_utf8_lossy(&bytes);
     // Most files don't have it at all, which one look at the whole text tells
-    let present = if fold { text.to_lowercase().contains(needle) } else { text.contains(needle) };
+    let present = if fold { fold_case(&text).contains(needle) } else { text.contains(needle) };
     if !present {
-        return None;
+        return Searched::Nothing;
     }
     let hits: Vec<Hit> = text
         .lines()
         .enumerate()
         .filter_map(|(line, text)| {
             let (col, _) = *find_all(text, query).first()?;
-            Some(Hit { line, col, text: text.chars().take(1000).collect() })
+            // A long line (minified code, say) keeps the part around the match
+            let from = col.saturating_sub(KEEP / 5);
+            Some(Hit { line, col, from, text: text.chars().skip(from).take(KEEP).collect() })
         })
         .take(PER_FILE)
         .collect();
-    (!hits.is_empty()).then_some(hits)
+    if hits.is_empty() { Searched::Nothing } else { Searched::Hits(hits) }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{Duration, Instant};
+    use std::{
+        fs,
+        time::{Duration, Instant},
+    };
 
     fn finish(mut grep: Grep) -> Grep {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -283,5 +331,32 @@ mod tests {
         grep.step(-1);
         assert_eq!(grep.selected, (0, 1));
         assert_eq!(grep.at_row(3), Some((1, 0)), "a file's own line is its first match");
+    }
+
+    #[test]
+    fn long_lines_other_alphabets_and_big_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // A match far along a minified line keeps the part of the line around it
+        fs::write(root.join("min.js"), format!("{}needle{}\n", "a".repeat(5000), "b".repeat(5000))).unwrap();
+        // Case folds a char at a time, as / search does: Σ is σ, İ is i
+        fs::write(root.join("greek.txt"), "ΟΔΟΣ\nİstanbul\n").unwrap();
+        fs::write(root.join("big.txt"), "needle\n".repeat(2 << 20)).unwrap();
+        fs::write(root.join("big.bin"), [b"needle\0".as_slice(), &vec![b'x'; 11 << 20]].concat()).unwrap();
+
+        let grep = finish(Grep::start(root, "needle", false));
+        assert_eq!(grep.files.len(), 1);
+        let hit = &grep.files[0].hits[0];
+        assert_eq!(hit.col, 5000);
+        assert_eq!(&hit.text.chars().skip(hit.col - hit.from).take(6).collect::<String>(), "needle");
+        // big.txt is text, and over the limit; big.bin is binary, which is left out quietly
+        assert_eq!(grep.too_big(), 1);
+        assert_eq!(grep.rows(), 3);
+
+        for query in ["οδοσ", "istanbul"] {
+            let grep = finish(Grep::start(root, query, false));
+            assert_eq!(grep.files.len(), 1, "{query}");
+            assert_eq!(grep.files[0].hits.len(), 1, "{query}");
+        }
     }
 }

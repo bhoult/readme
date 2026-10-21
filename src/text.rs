@@ -116,13 +116,24 @@ pub fn slice_line(line: &Line<'static>, keep: usize, left: usize) -> Line<'stati
     Line::from(spans)
 }
 
+/// A char in lower case, as searches compare them: one char for one, so a folded text
+/// lines up with the original (unlike str::to_lowercase, which makes İ two chars and
+/// a final Σ a ς).
+pub fn fold_char(c: char) -> char {
+    c.to_lowercase().next().unwrap_or(c)
+}
+
+pub fn fold_case(text: &str) -> String {
+    text.chars().map(fold_char).collect()
+}
+
 /// Char ranges where `query` occurs in `line`, ignoring case unless the query has a capital.
 pub fn find_all(line: &str, query: &str) -> Vec<(usize, usize)> {
     if query.is_empty() {
         return Vec::new();
     }
     let fold = !query.chars().any(char::is_uppercase);
-    let norm = |c: char| if fold { c.to_lowercase().next().unwrap_or(c) } else { c };
+    let norm = |c: char| if fold { fold_char(c) } else { c };
     let hay: Vec<char> = line.chars().map(norm).collect();
     let needle: Vec<char> = query.chars().map(norm).collect();
     let mut hits = Vec::new();
