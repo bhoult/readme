@@ -106,7 +106,7 @@ PNG, JPEG, GIF, WebP, BMP, TIFF, TGA, QOI, ICO, PNM and HDR images show at full
 resolution in terminals with a graphics protocol: Kitty, Ghostty, WezTerm, Konsole,
 iTerm2, and Sixel terminals. The header gives the image's size and format.
 
-![A 2400×1600 Mandelbrot set image shown at full resolution](docs/screenshots/image.png)
+![A 2400×1600 Mandelbrot set image shown at full resolution](docs/screenshots/viewer.png)
 
 The wheel (or `+` and `-`) zooms toward the pointer, dragging or the arrow keys move
 around, and `0` or a double-click fits the image again. Each view is scaled from the
@@ -126,7 +126,7 @@ the background, on every core but one, as they come into view. They start 100 pi
 wide; `+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` opens one.
 `Esc` goes back to the grid.
 
-![A folder of nine images shown as 300-pixel thumbnails](docs/screenshots/thumbnails.png)
+![A folder of nine images shown as 300-pixel thumbnails](docs/screenshots/gallery.png)
 
 ## Archives
 
