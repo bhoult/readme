@@ -103,9 +103,20 @@ pub struct LineCache {
 
 impl LineCache {
     pub fn new(path: &Path, lines: &[String]) -> Self {
-        // Huge files and minified lines would make syntect crawl
-        let disabled = lines.len() > 100_000 || lines.iter().any(|l| l.len() > 10_000);
+        let disabled = too_slow(lines);
         Self { path: path.into(), syntax: None, disabled, lines: Vec::new(), checkpoints: Vec::new(), state: None }
+    }
+
+    /// The text was replaced by `lines`, the same as before up to line `from`: what's
+    /// highlighted before that stays, unless the first line (which can decide the
+    /// syntax) changed, or whether to highlight at all.
+    pub fn replaced(&mut self, lines: &[String], from: usize) {
+        if from == 0 || self.disabled != too_slow(lines) {
+            let path = std::mem::take(&mut self.path);
+            *self = Self::new(&path, lines);
+        } else {
+            self.invalidate(from);
+        }
     }
 
     /// Forgets everything from line `from` on.
@@ -157,6 +168,11 @@ impl LineCache {
     }
 }
 
+/// Huge files and minified lines would make syntect crawl.
+fn too_slow(lines: &[String]) -> bool {
+    lines.len() > 100_000 || lines.iter().any(|l| l.len() > 10_000)
+}
+
 /// Highlights a fenced code block. None if the language isn't known, or highlighting
 /// hasn't loaded yet.
 pub fn block(lang: &str, code: &str) -> Option<Vec<Vec<(Style, String)>>> {
@@ -176,4 +192,38 @@ pub fn block(lang: &str, code: &str) -> Option<Vec<Vec<(Style, String)>>> {
             })
             .collect(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_text_keeps_the_colors_above_the_change() {
+        load();
+        let text: Vec<String> = (0..200).map(|i| format!("let x{i} = {i};")).collect();
+        let mut cache = LineCache::new(Path::new("a.rs"), &text);
+        cache.ensure(&text, 200);
+        assert_eq!(cache.lines.len(), 200);
+        // A line added at the end, as a log or an agent's notes grow
+        let mut more = text.clone();
+        more.push("let y = 1;".into());
+        cache.replaced(&more, 200);
+        assert_eq!(cache.lines.len(), 200);
+        // A change further up goes back to the checkpoint before it
+        cache.replaced(&more, 130);
+        assert_eq!(cache.lines.len(), 128);
+        cache.ensure(&more, 201);
+        assert_eq!(cache.get(200), LineCache::new(Path::new("a.rs"), &more).colors_of(&more, 200));
+        // The first line can change the syntax (#!/bin/sh), so that starts again
+        cache.replaced(&more, 0);
+        assert!(cache.lines.is_empty());
+    }
+
+    impl LineCache {
+        fn colors_of(mut self, text: &[String], line: usize) -> Vec<(Style, Range<usize>)> {
+            self.ensure(text, line + 1);
+            self.get(line).to_vec()
+        }
+    }
 }

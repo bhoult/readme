@@ -39,15 +39,16 @@ enum Edit {
 
 struct Snapshot {
     lines: Vec<String>,
+    crlf: Vec<bool>,
     cursor: Pos,
     /// Roughly how much text `lines` holds
     bytes: usize,
 }
 
 impl Snapshot {
-    fn new(lines: Vec<String>, cursor: Pos) -> Self {
+    fn new(lines: Vec<String>, crlf: Vec<bool>, cursor: Pos) -> Self {
         let bytes = lines.iter().map(|l| l.len() + 1).sum();
-        Self { lines, cursor, bytes }
+        Self { lines, crlf, cursor, bytes }
     }
 }
 
@@ -79,7 +80,9 @@ pub struct Buffer {
     pub changed_from: Option<usize>,
     /// Screen column kept while moving up and down through shorter lines
     want_col: Option<usize>,
-    crlf: bool,
+    /// Whether each line ends in CRLF rather than LF, so a file that mixes the two
+    /// saves with each line's own ending; a line made by breaking one takes its ending
+    crlf: Vec<bool>,
     final_newline: bool,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
@@ -135,12 +138,24 @@ impl Buffer {
     }
 
     pub fn from_text(text: &str) -> Self {
-        // Only when every line ends in CRLF: in a file that mixes the two, the lines keep
-        // their \r so saving writes back each line's own ending
-        let crlf = text.contains("\r\n") && text.matches("\r\n").count() == text.matches('\n').count();
+        let final_newline = text.is_empty() || text.ends_with('\n');
         let body = text.strip_suffix('\n').unwrap_or(text);
-        let lines =
-            body.split('\n').map(|l| if crlf { l.strip_suffix('\r').unwrap_or(l) } else { l }.to_string()).collect();
+        let (mut lines, mut crlf): (Vec<String>, Vec<bool>) = body
+            .split('\n')
+            .map(|l| match l.strip_suffix('\r') {
+                Some(l) => (l.to_string(), true),
+                None => (l.to_string(), false),
+            })
+            .unzip();
+        // A last line with no newline has no ending of its own: a \r there is text, and a
+        // line broken off it ends like the one before
+        let n = lines.len();
+        if !final_newline {
+            if crlf[n - 1] {
+                lines[n - 1].push('\r');
+            }
+            crlf[n - 1] = n > 1 && crlf[n - 2];
+        }
         Self {
             lines,
             cursor: Pos::default(),
@@ -151,7 +166,7 @@ impl Buffer {
             changed_from: None,
             want_col: None,
             crlf,
-            final_newline: text.is_empty() || text.ends_with('\n'),
+            final_newline,
             undo: Vec::new(),
             redo: Vec::new(),
             last_edit: None,
@@ -160,10 +175,13 @@ impl Buffer {
 
     /// The file contents, with the original line endings.
     pub fn text(&self) -> String {
-        let nl = if self.crlf { "\r\n" } else { "\n" };
-        let mut text = self.lines.join(nl);
-        if self.final_newline && !text.is_empty() {
-            text.push_str(nl);
+        let mut text = String::with_capacity(self.lines.iter().map(|l| l.len() + 2).sum());
+        let last = self.lines.len() - 1;
+        for (i, (line, &crlf)) in self.lines.iter().zip(&self.crlf).enumerate() {
+            text.push_str(line);
+            if i < last || (self.final_newline && !(last == 0 && line.is_empty())) {
+                text.push_str(if crlf { "\r\n" } else { "\n" });
+            }
         }
         text
     }
@@ -356,6 +374,8 @@ impl Buffer {
             self.cursor.col -= 1;
         } else {
             let joined = self.lines.remove(line);
+            // The joined line ends the way the second one did
+            self.crlf[line - 1] = self.crlf.remove(line);
             self.cursor = Pos::new(line - 1, self.line_len(line - 1));
             self.lines[line - 1].push_str(&joined);
         }
@@ -377,6 +397,7 @@ impl Buffer {
         self.begin(Edit::Delete);
         if at_end {
             let joined = self.lines.remove(line + 1);
+            self.crlf[line] = self.crlf.remove(line + 1);
             self.lines[line].push_str(&joined);
         } else {
             let at = byte_at(&self.lines[line], col);
@@ -404,7 +425,8 @@ impl Buffer {
     fn step_history(&mut self, undo: bool) -> bool {
         let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
         let Some(snap) = from.pop() else { return false };
-        to.push(Snapshot::new(std::mem::replace(&mut self.lines, snap.lines), self.cursor));
+        let lines = std::mem::replace(&mut self.lines, snap.lines);
+        to.push(Snapshot::new(lines, std::mem::replace(&mut self.crlf, snap.crlf), self.cursor));
         self.cursor = snap.cursor;
         self.anchor = None;
         self.last_edit = None;
@@ -415,7 +437,7 @@ impl Buffer {
     /// Records an undo step, except that a run of typing (or of deleting) undoes as one.
     fn begin(&mut self, kind: Edit) {
         if kind == Edit::Other || self.last_edit != Some(kind) {
-            self.undo.push(Snapshot::new(self.lines.clone(), self.cursor));
+            self.undo.push(Snapshot::new(self.lines.clone(), self.crlf.clone(), self.cursor));
             let mut bytes: usize = self.undo.iter().map(|s| s.bytes).sum();
             while self.undo.len() > MAX_UNDO || (self.undo.len() > 1 && bytes > MAX_UNDO_BYTES) {
                 bytes -= self.undo.remove(0).bytes;
@@ -445,6 +467,8 @@ impl Buffer {
         head.truncate(byte_at(head, s.col));
         head.push_str(&tail);
         self.lines.drain(s.line + 1..=e.line);
+        self.crlf[s.line] = self.crlf[e.line];
+        self.crlf.drain(s.line + 1..=e.line);
         self.cursor = s;
         self.anchor = None;
         self.changed(s.line);
@@ -458,6 +482,7 @@ impl Buffer {
         self.lines[line].push_str(parts.next().unwrap_or(""));
         let added: Vec<String> = parts.map(String::from).collect();
         let last = line + added.len();
+        self.crlf.splice(line + 1..line + 1, std::iter::repeat_n(self.crlf[line], added.len()));
         self.lines.splice(line + 1..line + 1, added);
         self.cursor = Pos::new(last, self.line_len(last));
         self.lines[last].push_str(&rest);
@@ -479,7 +504,43 @@ mod tests {
         assert_eq!(buf("a\nb").text(), "a\nb");
         assert_eq!(buf("a\r\nb\r\n").text(), "a\r\nb\r\n");
         assert_eq!(buf("a\nb\r\nc\n").text(), "a\nb\r\nc\n");
+        assert_eq!(buf("a\r\nb").text(), "a\r\nb");
+        assert_eq!(buf("a\nb\r").text(), "a\nb\r");
         assert_eq!(buf("").lines, vec![""]);
+    }
+
+    #[test]
+    fn mixed_line_endings_survive_editing() {
+        // No \r in the text, so End, clicks and Down stop before it
+        let mut b = buf("one\r\ntwo\n");
+        assert_eq!(b.lines, vec!["one", "two"]);
+        b.line_end(false);
+        b.insert("X");
+        assert_eq!(b.text(), "oneX\r\ntwo\n");
+        // A line broken off takes the ending of the line it came from
+        b.newline();
+        b.insert("new");
+        assert_eq!(b.text(), "oneX\r\nnew\r\ntwo\n");
+        // Joining keeps the second line's ending
+        b.move_to(Pos::new(2, 0), false);
+        b.backspace();
+        assert_eq!(b.text(), "oneX\r\nnewtwo\n");
+        b.move_to(Pos::new(0, 4), false);
+        b.delete();
+        assert_eq!(b.text(), "oneXnewtwo\n");
+        b.undo();
+        b.undo();
+        assert_eq!(b.text(), "oneX\r\nnew\r\ntwo\n");
+        // Deleting across lines keeps the last one's ending
+        b.move_to(Pos::new(0, 1), false);
+        b.move_to(Pos::new(2, 1), true);
+        b.insert("-");
+        assert_eq!(b.text(), "o-wo\n");
+        // With no newline at the end, a new last line ends like the one before
+        let mut b = buf("a\r\nb");
+        b.move_to(Pos::new(1, 1), false);
+        b.newline();
+        assert_eq!(b.text(), "a\r\nb\r\n");
     }
 
     #[test]

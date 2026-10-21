@@ -399,7 +399,9 @@ impl Doc {
             // start_editing is the only check, so leave edit mode rather than slip past it
             self.editing = false;
         }
-        self.colors = LineCache::new(&self.path, &buf.lines);
+        // Usually something was added at the end, so the colors above it stand
+        let same = self.buf.lines.iter().zip(&buf.lines).take_while(|(a, b)| a == b).count();
+        self.colors.replaced(&buf.lines, same);
         self.buf = buf;
         self.keep_renderable();
         self.top = self.top.min(self.buf.lines.len() - 1);
