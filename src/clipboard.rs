@@ -23,19 +23,21 @@ pub fn copy(text: &str, primary: bool) {
     }
     #[cfg(not(test))]
     {
-        let copied = if wayland() {
+        // X11's tools when Wayland's can't do it: not installed (XWayland has the same
+        // clipboard), or a stale WAYLAND_DISPLAY in a long-lived session
+        let wayland = wayland() && {
             if primary {
                 pipe("wl-copy", &["--primary"], text);
             }
             pipe("wl-copy", &[], text)
-        } else if x11() {
-            if primary {
-                let _ = pipe("xclip", &["-selection", "primary"], text) || pipe("xsel", &["-ip"], text);
-            }
-            pipe("xclip", &["-selection", "clipboard"], text) || pipe("xsel", &["-ib"], text)
-        } else {
-            false
         };
+        let copied = wayland
+            || x11() && {
+                if primary {
+                    let _ = pipe("xclip", &["-selection", "primary"], text) || pipe("xsel", &["-ip"], text);
+                }
+                pipe("xclip", &["-selection", "clipboard"], text) || pipe("xsel", &["-ib"], text)
+            };
         if !copied {
             osc52(text);
         }
@@ -48,22 +50,22 @@ pub fn paste(primary: bool) -> Result<Option<String>, &'static str> {
     if cfg!(test) {
         return Ok(None);
     }
-    let output = if wayland() {
+    let mut output = None;
+    if wayland() {
         let mut args = vec!["--no-newline"];
         if primary {
             args.push("--primary");
         }
-        read("wl-paste", &args)?
-    } else if x11() {
-        // Either tool, as copy uses
+        output = read("wl-paste", &args)?;
+    }
+    // As copy does: X11's tools when there's no wl-paste, or WAYLAND_DISPLAY is stale
+    if output.is_none() && x11() {
         let (which, flag) = if primary { ("primary", "-p") } else { ("clipboard", "-b") };
-        match read("xclip", &["-o", "-selection", which])? {
+        output = match read("xclip", &["-o", "-selection", which])? {
             Some(output) => Some(output),
             None => read("xsel", &["-o", flag])?,
-        }
-    } else {
-        None
-    };
+        };
+    }
     Ok(output.and_then(|o| String::from_utf8(o).ok()).filter(|s| !s.is_empty()))
 }
 
@@ -115,7 +117,25 @@ fn pipe(program: &str, args: &[&str], text: &str) -> bool {
     let child =
         Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     let Ok(mut child) = child else { return false };
-    let written = child.stdin.take().is_some_and(|mut stdin| stdin.write_all(text.as_bytes()).is_ok());
+    let Some(mut stdin) = child.stdin.take() else { return false };
+    // Written from another thread: a tool that never reads what it's given (xclip
+    // waiting on a display that doesn't answer, say) would otherwise hold readme for good
+    let text = text.to_owned();
+    let writer = std::thread::spawn(move || stdin.write_all(text.as_bytes()).is_ok());
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !writer.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    if !writer.is_finished() {
+        // It isn't taking it, so it's stopped, and the text goes another way
+        let _ = child.kill();
+        std::thread::spawn(move || {
+            let _ = child.wait();
+            let _ = writer.join();
+        });
+        return false;
+    }
+    let written = writer.join().unwrap_or(false);
     // wl-copy and xclip fail straight away when they can't reach the display (a stale
     // WAYLAND_DISPLAY or DISPLAY in a long-lived session), and otherwise fork to serve the
     // clipboard. A failure has to count, or OSC 52 never gets its turn.

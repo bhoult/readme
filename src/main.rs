@@ -18,10 +18,12 @@ mod text;
 mod tree;
 
 use std::{
+    env,
     io::{self, Stdout},
     panic,
     path::PathBuf,
-    sync::Mutex,
+    process::{Command, Stdio},
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -43,6 +45,40 @@ use picture::LateAnswers;
 /// What a panic on another thread said, for the screen to show
 static BACKGROUND_PANIC: Mutex<Option<String>> = Mutex::new(None);
 
+/// What tmux's allow-passthrough was for this pane before readme started, empty if the
+/// pane didn't set it. ratatui-image turns it on whenever it's set up inside tmux and
+/// leaves it on, which would let anything run in the pane later write escape sequences
+/// straight to the terminal outside, so it's put back on the way out.
+static PASSTHROUGH: OnceLock<String> = OnceLock::new();
+
+fn save_passthrough() {
+    let tmux =
+        env::var("TERM").is_ok_and(|t| t.starts_with("tmux")) || env::var("TERM_PROGRAM").is_ok_and(|p| p == "tmux");
+    if !tmux {
+        return;
+    }
+    let shown = Command::new("tmux")
+        .args(["show-options", "-p", "-v", "allow-passthrough"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+    // A tmux too old to have the option can't have had it turned on either
+    if let Some(out) = shown.ok().filter(|out| out.status.success()) {
+        let _ = PASSTHROUGH.set(String::from_utf8_lossy(&out.stdout).trim().to_string());
+    }
+}
+
+fn restore_passthrough() {
+    let Some(was) = PASSTHROUGH.get() else { return };
+    let mut tmux = Command::new("tmux");
+    if was.is_empty() {
+        tmux.args(["set-option", "-p", "-u", "allow-passthrough"]);
+    } else {
+        tmux.args(["set-option", "-p", "allow-passthrough", was]);
+    }
+    let _ = tmux.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+}
+
 const USAGE: &str = "\
 readme: view and edit files in the terminal
 
@@ -54,6 +90,7 @@ if it has one) or a file to open.
 Keys
   Tab          switch between the tree and the file
   Tree         ↑↓/jk move · Enter open · ←→/hl fold · / filter by name
+               Backspace or .. up a folder
                F find text in all the files (Esc back to the tree)
                . hidden files · r refresh · H git history
                Space mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
@@ -141,6 +178,7 @@ impl Drop for Tui {
 }
 
 fn restore() {
+    restore_passthrough();
     let _ = execute!(
         io::stdout(),
         DisableBracketedPaste,
@@ -170,6 +208,7 @@ fn main() -> Result<()> {
         Some(arg) => PathBuf::from(arg),
         None => PathBuf::from("."),
     };
+    save_passthrough();
     highlight::preload();
     let mut app = App::new(&target)?;
     let mut tui = Tui::start()?;

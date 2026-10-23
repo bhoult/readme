@@ -36,9 +36,11 @@ pub struct Change {
 /// on a huge file from an old commit or an enormous diff.
 const MAX_OUTPUT: u64 = 50 << 20;
 
-/// git's output, cut off at MAX_OUTPUT (the second value says whether it was).
+/// git's output, cut off at MAX_OUTPUT (the second value says whether it was). Paths
+/// are taken as they are, so a file called `a[1].txt` doesn't also match `a1.txt`.
 fn git_capped(repo: &Path, args: &[&str]) -> Result<(Vec<u8>, bool)> {
     let mut child = Command::new("git")
+        .arg("--literal-pathspecs")
         .arg("-C")
         .arg(repo)
         .args(args)
@@ -118,10 +120,19 @@ pub fn log(repo: &Path, path: &Path, follow: bool) -> Result<Vec<Commit>> {
             // follows on a line of its own
             let (head, names) = record.split_once(['\n', '\0']).unwrap_or((record, ""));
             let mut f = head.split('\x1f');
+            // A subject can hold the separators too, and start a record of its own. Hashes are
+            // checked, as they go on to git's command line, where one like --output=… would
+            // be taken as an option.
+            let hash = f.next().filter(|h| is_hash(h))?.to_string();
+            let short = f.next().filter(|h| is_hash(h))?.to_string();
+            let parent = f.next()?.split(' ').next().filter(|p| !p.is_empty());
+            if parent.is_some_and(|p| !is_hash(p)) {
+                return None;
+            }
             Some(Commit {
-                hash: f.next().filter(|h| !h.is_empty())?.to_string(),
-                short: f.next()?.to_string(),
-                parent: f.next()?.split(' ').next().filter(|p| !p.is_empty()).map(String::from),
+                hash,
+                short,
+                parent: parent.map(String::from),
                 time: f.next()?.parse().unwrap_or(0),
                 subject: f.next()?.to_string(),
                 path: names.split('\0').map(|n| n.trim_start_matches('\n')).find(|n| !n.is_empty()).map(String::from),
@@ -130,12 +141,17 @@ pub fn log(repo: &Path, path: &Path, follow: bool) -> Result<Vec<Commit>> {
         .collect())
 }
 
+/// A commit's hash, as git prints it in full or short: hex digits and nothing else.
+fn is_hash(text: &str) -> bool {
+    (4..=64).contains(&text.len()) && text.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// The files a commit changed, compared with its first parent.
 pub fn changes(repo: &Path, commit: &Commit) -> Result<Vec<Change>> {
     let mut args = vec!["diff-tree", "-r", "-z", "-M", "--name-status", "--no-commit-id"];
     match &commit.parent {
-        Some(parent) => args.extend([parent.as_str(), commit.hash.as_str()]),
-        None => args.extend(["--root", commit.hash.as_str()]),
+        Some(parent) => args.extend(["--end-of-options", parent.as_str(), commit.hash.as_str()]),
+        None => args.extend(["--root", "--end-of-options", commit.hash.as_str()]),
     }
     let out = git(repo, &args)?;
     let mut fields = out.split(|&b| b == 0).map(|f| String::from_utf8_lossy(f).into_owned());
@@ -152,29 +168,43 @@ pub fn changes(repo: &Path, commit: &Commit) -> Result<Vec<Change>> {
 
 /// Every file in the repository as of a commit.
 pub fn files(repo: &Path, hash: &str) -> Result<Vec<String>> {
-    let out = git(repo, &["ls-tree", "-r", "-z", "--name-only", hash])?;
+    let out = git(repo, &["ls-tree", "-r", "-z", "--name-only", "--end-of-options", hash])?;
     Ok(out.split(|&b| b == 0).filter(|f| !f.is_empty()).map(|f| String::from_utf8_lossy(f).into_owned()).collect())
 }
 
 /// A file's contents as of a commit.
 pub fn show(repo: &Path, hash: &str, path: &str) -> Result<Vec<u8>> {
-    git(repo, &["show", &format!("{hash}:{path}")])
+    git(repo, &["show", "--end-of-options", &format!("{hash}:{path}")])
 }
+
+/// What git prints for diffs: its own patches, not a diff program or text conversion
+/// the user's or the repository's settings name (difftastic, say), which aren't diffs
+/// readme can show, and which a repository that came with its .git/config could use to
+/// run anything.
+const PLAIN_DIFF: [&str; 3] = ["--no-ext-diff", "--no-textconv", "--no-color"];
 
 /// The whole commit: its message, which files changed, and the diff.
 pub fn commit_text(repo: &Path, hash: &str) -> Result<Vec<u8>> {
-    git_text(repo, &["show", "--stat", "--patch", "--format=fuller", "--no-color", hash])
+    let mut args = vec!["show", "--stat", "--patch", "--format=fuller"];
+    args.extend(PLAIN_DIFF);
+    args.extend(["--end-of-options", hash]);
+    git_text(repo, &args)
 }
 
 /// What a commit did to one file.
 pub fn file_diff(repo: &Path, commit: &Commit, path: &str) -> Result<Vec<u8>> {
     let Some(parent) = &commit.parent else {
-        return git_text(repo, &["show", "--format=", "--no-color", &commit.hash, "--", path]);
+        let mut args = vec!["show", "--format="];
+        args.extend(PLAIN_DIFF);
+        args.extend(["--end-of-options", &commit.hash, "--", path]);
+        return git_text(repo, &args);
     };
     // Given only the new name, git sees a renamed file as all new; given the old one
     // too, it shows the rename and what changed
     let from = changes(repo, commit).ok().and_then(|c| c.into_iter().find(|c| c.path == path)?.from);
-    let mut args = vec!["diff", "-M", "--no-color", parent, &commit.hash, "--", path];
+    let mut args = vec!["diff", "-M"];
+    args.extend(PLAIN_DIFF);
+    args.extend(["--end-of-options", parent, &commit.hash, "--", path]);
     args.extend(from.as_deref());
     git_text(repo, &args)
 }
@@ -262,5 +292,38 @@ mod tests {
         assert_eq!(file[0].path.as_deref(), Some(odd));
         assert_eq!(file[1].path.as_deref(), Some("renamed.txt"));
         assert_eq!(show(&root, &file[0].hash, odd).unwrap(), b"two\n");
+    }
+
+    #[test]
+    fn a_subject_cant_pass_for_a_commit_or_an_option() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        run(&root, &["init", "-q"]);
+        fs::write(root.join("a[1].txt"), "one\n").unwrap();
+        fs::write(root.join("a1.txt"), "other\n").unwrap();
+        run(&root, &["add", "."]);
+        let target = root.join("overwritten");
+        let forged = format!("innocent\x1e--output={}\x1fabcd\x1f\x1f0\x1flooks normal", target.display());
+        run(&root, &["commit", "-q", "-m", &forged]);
+        fs::write(root.join("a1.txt"), "changed\n").unwrap();
+        run(&root, &["commit", "-q", "-am", "only a1"]);
+
+        let commits = log(&root, &root, false).unwrap();
+        let subjects: Vec<&str> = commits.iter().map(|c| c.subject.as_str()).collect();
+        assert_eq!(subjects, vec!["only a1", "innocent"]);
+        for c in &commits {
+            let _ = commit_text(&root, &c.hash);
+            let _ = changes(&root, c);
+        }
+        assert!(!target.exists());
+
+        // A name with glob characters in it is only itself
+        let file = log(&root, &root.join("a[1].txt"), true).unwrap();
+        assert_eq!(file.len(), 1);
+
+        // Diffs are git's own, whatever diff program the repository asks for
+        run(&root, &["config", "diff.external", "false"]);
+        let diff = String::from_utf8(file_diff(&root, &commits[0], "a1.txt").unwrap()).unwrap();
+        assert!(diff.contains("-other") && diff.contains("+changed"), "{diff}");
     }
 }

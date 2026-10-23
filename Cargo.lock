@@ -2200,6 +2200,7 @@ dependencies = [
  "tempfile",
  "trash",
  "two-face",
+ "unicode-segmentation",
  "unicode-width",
  "zip",
  "zstd",

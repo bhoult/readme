@@ -1,8 +1,11 @@
 //! The application: what's open, input handling, and drawing.
 
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fs,
     path::{Path, PathBuf},
+    rc::Rc,
     time::{Duration, Instant, SystemTime},
 };
 
@@ -29,9 +32,10 @@ use crate::{
     picture::{self, Picture},
     table,
     text::{
-        char_at_col, display_col, find_all, line_spans, push_span, row_of, search, slice_line, str_width, wrap_points,
+        Place, char_at_col_from, display_col, display_col_from, find_all, line_spans, printable, push_span, row_of,
+        search, slice_line, split_at_width, str_width, tail_width, wider_than, wrap_points,
     },
-    tree::Tree,
+    tree::{NoWayUp, Tree},
 };
 
 const MESSAGE_FOR: Duration = Duration::from_secs(4);
@@ -42,6 +46,8 @@ const WHEEL: isize = 3;
 const SIDEWAYS: isize = 8;
 /// Markdown bigger than this opens as plain text
 const MAX_RENDERED: usize = 5 << 20;
+/// Most lines whose wrapping is kept at once
+const MAX_WRAPS: usize = 4096;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -110,12 +116,42 @@ struct Doc {
     disk: (Option<SystemTime>, u64),
     /// Changed on disk while it had unsaved changes here
     disk_changed: bool,
+    /// A change on disk to read in, once there's nothing unsaved to lose
+    reread: bool,
     /// The colors haven't caught up with what's on screen; the next frames do more
     coloring: bool,
     /// The longest line's width, roughly, for the buffer version it was measured on
     widest: Option<(u64, usize)>,
     /// Whether the view's cut off anything to the left, and to the right
     more: (bool, bool),
+    /// Where wrapped lines' screen rows start: moving and drawing ask for the same lines
+    /// again and again, and a long line takes a while to wrap
+    wraps: RefCell<Wraps>,
+}
+
+/// Wrapped lines' row starts, for the text and width they were worked out for.
+#[derive(Default)]
+struct Wraps {
+    key: (u64, usize),
+    rows: HashMap<usize, Rc<Vec<Place>>>,
+}
+
+/// How a file shows, from its name: rendered Markdown, a table, or text.
+fn kind_of(path: &Path) -> Kind {
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    match ext.as_str() {
+        "md" | "markdown" | "mdx" => Kind::Markdown,
+        ext => table::delimiter(ext).map_or(Kind::Text, Kind::Table),
+    }
+}
+
+/// An image file's bytes, unless it isn't a regular file or is too big to open.
+fn read_image(path: &Path) -> Result<Vec<u8>> {
+    match fs::metadata(path) {
+        Ok(m) if !m.is_file() => Err(anyhow::anyhow!("not a regular file")),
+        Ok(m) if m.len() > 50 << 20 => Err(anyhow::anyhow!("too large ({})", human_size(m.len()))),
+        _ => fs::read(path).map_err(Into::into),
+    }
 }
 
 fn disk_stamp(path: &Path) -> (Option<SystemTime>, u64) {
@@ -124,11 +160,7 @@ fn disk_stamp(path: &Path) -> (Option<SystemTime>, u64) {
 
 impl Doc {
     fn new(path: &Path, buf: Buffer, wrap: bool, source: Source, label: Option<String>) -> Self {
-        let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let kind = match ext.as_str() {
-            "md" | "markdown" | "mdx" => Kind::Markdown,
-            ext => table::delimiter(ext).map_or(Kind::Text, Kind::Table),
-        };
+        let kind = kind_of(path);
         let mut doc = Self {
             path: path.into(),
             source,
@@ -152,10 +184,27 @@ impl Doc {
             last_match: None,
             disk: disk_stamp(path),
             disk_changed: false,
+            reread: false,
             coloring: false,
+            wraps: RefCell::default(),
         };
         doc.raw = doc.too_big_to_render();
         doc
+    }
+
+    /// Under a new name, renamed or moved, which can change how it shows: as Markdown, as
+    /// a table, or the syntax it's colored as.
+    fn moved_to(&mut self, path: &Path) {
+        self.path = path.into();
+        self.disk = disk_stamp(path);
+        self.colors = LineCache::new(path, &self.buf.lines);
+        let kind = kind_of(path);
+        if kind != self.kind {
+            let top = if self.formatted() { self.formatted_top_src() } else { self.top };
+            (self.kind, self.rendered, self.raw) = (kind, None, false);
+            self.raw = self.too_big_to_render();
+            (self.top, self.top_row, self.fmt_sync) = (top, 0, Some(top));
+        }
     }
 
     /// Markdown too big to render, which shows as text: rendering takes many times the
@@ -187,6 +236,10 @@ impl Doc {
         let width = if let Kind::Table(_) = self.kind { 0 } else { width };
         let key = (self.buf.version, width, highlight::get().is_some(), self.wrap);
         if self.rendered.as_ref().is_none_or(|(k, _)| *k != key) {
+            // Laid out again (a new width, or new text), the same source line stays at the top
+            if self.fmt_sync.is_none() && self.rendered.is_some() {
+                self.fmt_sync = Some(self.formatted_top_src());
+            }
             let text = self.buf.lines.join("\n");
             let rendered = match self.kind {
                 Kind::Table(delimiter) => table::render(&text, delimiter),
@@ -211,8 +264,32 @@ impl Doc {
     }
 
     /// Where each screen row of `line` starts: one row unless wrapping.
-    fn rows(&self, line: usize, width: usize) -> Vec<usize> {
-        if self.wrap { wrap_points(&self.buf.lines[line], width) } else { vec![0] }
+    fn rows(&self, line: usize, width: usize) -> Rc<Vec<Place>> {
+        if !self.wrap {
+            return Rc::new(vec![Place::default()]);
+        }
+        let mut wraps = self.wraps.borrow_mut();
+        let key = (self.buf.version, width);
+        if wraps.key != key || wraps.rows.len() >= MAX_WRAPS {
+            *wraps = Wraps { key, rows: HashMap::new() };
+        }
+        wraps.rows.entry(line).or_insert_with(|| Rc::new(wrap_points(&self.buf.lines[line], width))).clone()
+    }
+
+    /// Scrolls so char `col` of `line` is a third of the way down the source view.
+    fn jump_to(&mut self, line: usize, col: usize, height: usize, width: usize) {
+        let at = (line, row_of(&self.rows(line, width), col));
+        (self.top, self.top_row) = self.step_rows(at, -((height / 3) as isize), width);
+    }
+
+    /// Scrolls the source view to char `col` of `line`, unless it's on screen already. A
+    /// wrapped line can take many rows, so it's rows that are counted, not lines.
+    fn show(&mut self, line: usize, col: usize, height: usize, width: usize) {
+        let at = (line, row_of(&self.rows(line, width), col));
+        let bottom = self.step_rows((self.top, self.top_row), height as isize - 1, width);
+        if at < (self.top, self.top_row) || at > bottom {
+            self.jump_to(line, col, height, width);
+        }
     }
 
     /// `delta` screen rows on from (line, row), stopping at either end of the file.
@@ -341,11 +418,12 @@ impl Doc {
         };
         let text = &self.buf.lines[line];
         let starts = self.rows(line, width);
-        let first = if self.wrap { display_col(text, starts[row]) } else { self.left };
-        let mut col = char_at_col(text, first + x.saturating_sub(area.x + gutter) as usize);
+        let start = starts[row.min(starts.len() - 1)];
+        let first = if self.wrap { start.col } else { self.left };
+        let mut col = char_at_col_from(text, start, first + x.saturating_sub(area.x + gutter) as usize);
         // Past the end of a wrapped row is its last character, not the next row
-        if let Some(&next) = starts.get(row + 1) {
-            col = col.min(next - 1);
+        if let Some(next) = starts.get(row + 1) {
+            col = col.min(next.char - 1);
         }
         Pos::new(line, col)
     }
@@ -359,19 +437,23 @@ impl Doc {
         let starts = self.rows(cursor.line, width);
         let row = row_of(&starts, cursor.col);
         let text = &self.buf.lines[cursor.line];
-        let x = self.wrap_x.unwrap_or_else(|| display_col(text, cursor.col) - display_col(text, starts[row]));
+        let x = self.wrap_x.unwrap_or_else(|| display_col_from(text, starts[row], cursor.col) - starts[row].col);
         let (line, row) = self.step_rows((cursor.line, row), delta, width);
         let starts = self.rows(line, width);
         let text = &self.buf.lines[line];
-        let mut col = char_at_col(text, display_col(text, starts[row]) + x);
-        if let Some(&next) = starts.get(row + 1) {
-            col = col.min(next - 1);
+        let mut col = char_at_col_from(text, starts[row], starts[row].col + x);
+        if let Some(next) = starts.get(row + 1) {
+            col = col.min(next.char - 1);
         }
         self.buf.move_to(Pos::new(line, col), select);
         self.wrap_x = Some(x);
     }
 
-    fn toggle_raw(&mut self) {
+    /// Between the formatted view and the text; false if it's too big to show formatted.
+    fn toggle_raw(&mut self) -> bool {
+        if self.raw && self.too_big_to_render() {
+            return false;
+        }
         // A match's place is in formatted lines or source lines, not both
         self.last_match = None;
         if self.raw {
@@ -381,6 +463,7 @@ impl Doc {
             (self.top, self.top_row) = (self.formatted_top_src(), 0);
             self.raw = true;
         }
+        true
     }
 
     fn stop_editing(&mut self) {
@@ -398,6 +481,8 @@ impl Doc {
     fn reload(&mut self) -> bool {
         let Ok(Loaded::Text(mut buf)) = Buffer::load(&self.path) else { return false };
         buf.cursor = buf.clamp(self.buf.cursor);
+        // A selection being dragged out as the file grows keeps where it started
+        buf.anchor = self.buf.anchor.map(|a| buf.clamp(a));
         if buf.read_only.is_some() {
             // start_editing is the only check, so leave edit mode rather than slip past it
             self.editing = false;
@@ -405,10 +490,13 @@ impl Doc {
         // Usually something was added at the end, so the colors above it stand
         let same = self.buf.lines.iter().zip(&buf.lines).take_while(|(a, b)| a == b).count();
         self.colors.replaced(&buf.lines, same);
-        self.buf = buf;
+        self.buf = *buf;
         self.keep_renderable();
+        // The same row of the top line stays at the top, as far as it still has rows
         self.top = self.top.min(self.buf.lines.len() - 1);
-        self.top_row = 0;
+        if same <= self.top {
+            self.top_row = 0;
+        }
         self.last_match = None;
         true
     }
@@ -429,6 +517,8 @@ struct ImageShown {
     label: Option<String>,
     bytes: u64,
     picture: Picture,
+    /// Modification time and size when it was read, for one from disk
+    disk: (Option<SystemTime>, u64),
 }
 
 /// The left pane's history view: the commits that touched the folder, and the files
@@ -459,6 +549,9 @@ struct Opened {
 
 enum Prompt {
     Unsaved(After),
+    /// Saving would write over changes made on disk since the file was read; what to do
+    /// once it's saved
+    Overwrite(Option<After>),
     Search(String),
     /// Yes or no to moving or deleting files
     Confirm(Change),
@@ -485,7 +578,32 @@ enum Target {
 /// What to do once unsaved changes are dealt with.
 enum After {
     Quit,
-    Open(PathBuf),
+    /// Open a file, and with true pass a web page or video on to the browser or player
+    Open(PathBuf, bool),
+}
+
+/// A preview put off while more moving is queued up: holding ↓ through a folder of big
+/// files or photos reads only the one the selection stops on.
+#[derive(Clone, Copy)]
+enum Preview {
+    Tree,
+    History,
+    Grep,
+}
+
+/// Keys that move a list's selection, each one putting off the preview again.
+fn moves(key: &KeyEvent) -> bool {
+    !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        && matches!(
+            key.code,
+            KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::PageUp
+                | KeyCode::PageDown
+                | KeyCode::Home
+                | KeyCode::End
+                | KeyCode::Char('j' | 'k' | 'g' | 'G' | ' ')
+        )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -526,6 +644,10 @@ pub struct App {
     search: Option<String>,
     drag: Drag,
     last_click: Option<(Instant, u16, u16)>,
+    /// The tree row the last press landed on: a double-click's second press goes only to
+    /// the same row, though the rows may have moved under it (going up, folding)
+    pressed: Option<PathBuf>,
+    pending: Option<Preview>,
     // Where things were drawn last, for the mouse
     filter_area: Rect,
     tree_area: Rect,
@@ -562,6 +684,8 @@ impl App {
             search: None,
             drag: Drag::None,
             last_click: None,
+            pressed: None,
+            pending: None,
             filter_area: Rect::default(),
             tree_area: Rect::default(),
             content_area: Rect::default(),
@@ -607,22 +731,21 @@ impl App {
     /// Showing `path` as it is now, not a version of it from history.
     fn showing(&self, path: &Path) -> bool {
         let source = match &self.shown {
-            Shown::Doc(doc) => Some(doc.source),
-            Shown::Image(image) => Some(image.source),
-            _ => None,
+            Shown::Doc(doc) => doc.source,
+            Shown::Image(image) => image.source,
+            Shown::Gallery(_) => Source::Disk,
+            // A note (moved to the trash, couldn't be read) is tried again
+            Shown::Note(..) | Shown::Nothing => return false,
         };
-        self.shown_path() == Some(path) && source != Some(Source::History)
+        self.shown_path() == Some(path) && source != Source::History
     }
 
     /// How images are drawn, once the terminal has been asked. The image on screen, if
     /// any, is drawn again the new way.
     pub fn set_picker(&mut self, picker: Picker) {
         self.picker = picker;
-        match &self.shown {
-            Shown::Image(image) if image.source != Source::History => {
-                let path = image.path.clone();
-                self.open(&path);
-            }
+        match &mut self.shown {
+            Shown::Image(image) => image.picture.set_picker(&self.picker),
             Shown::Gallery(gallery) => {
                 let dir = gallery.dir.clone();
                 self.shown = Shown::Nothing;
@@ -666,15 +789,21 @@ impl App {
                 let size = fs::metadata(path).map_or(0, |m| m.len());
                 Shown::Note(path.into(), format!("Video, {}. Click it, or press Enter, to play it.", human_size(size)))
             } else if picture::is_image(path) {
-                let bytes = match fs::metadata(path) {
-                    Ok(m) if !m.is_file() => Err(anyhow::anyhow!("not a regular file")),
-                    Ok(m) if m.len() > 50 << 20 => Err(anyhow::anyhow!("too large ({})", human_size(m.len()))),
-                    _ => fs::read(path).map_err(Into::into),
-                };
-                self.show_bytes(path, bytes, Source::Disk, None)
+                // Taken before reading, so a change made meanwhile shows up as one
+                let stamp = disk_stamp(path);
+                let mut shown = self.show_bytes(path, read_image(path), Source::Disk, None);
+                if let Shown::Image(image) = &mut shown {
+                    image.disk = stamp;
+                }
+                shown
             } else {
+                let stamp = disk_stamp(path);
                 match Buffer::load(path) {
-                    Ok(Loaded::Text(buf)) => Shown::Doc(Box::new(Doc::new(path, buf, self.wrap, Source::Disk, None))),
+                    Ok(Loaded::Text(buf)) => {
+                        let mut doc = Doc::new(path, *buf, self.wrap, Source::Disk, None);
+                        doc.disk = stamp;
+                        Shown::Doc(Box::new(doc))
+                    }
                     Ok(Loaded::Binary(size)) => Shown::Note(path.into(), format!("Binary file, {}", human_size(size))),
                     Ok(Loaded::TooBig(size)) => {
                         Shown::Note(path.into(), format!("Too large to open ({})", human_size(size)))
@@ -705,7 +834,10 @@ impl App {
             if let Ok(format) = image::ImageFormat::from_path(path) {
                 reader.set_format(format);
             }
-            let decoded = reader.with_guessed_format().map_err(image::ImageError::IoError).and_then(|r| r.decode());
+            let decoded = reader
+                .with_guessed_format()
+                .map_err(image::ImageError::IoError)
+                .and_then(|r| picture::decode_upright(r, image::Limits::default()));
             return match decoded {
                 Ok(image) => Shown::Image(Box::new(ImageShown {
                     path: path.into(),
@@ -713,6 +845,7 @@ impl App {
                     label,
                     bytes: size,
                     picture: Picture::new(image, &format, &self.picker),
+                    disk: (None, 0),
                 })),
                 Err(e) => Shown::Note(path.into(), format!("Can't show this image: {e}")),
             };
@@ -724,7 +857,7 @@ impl App {
                     Source::Archive => Some("in an archive"),
                     Source::History => Some("from history"),
                 });
-                Shown::Doc(Box::new(Doc::new(path, buf, self.wrap, source, label)))
+                Shown::Doc(Box::new(Doc::new(path, *buf, self.wrap, source, label)))
             }
             Loaded::Binary(size) => Shown::Note(path.into(), format!("Binary file, {}", human_size(size))),
             Loaded::TooBig(size) => Shown::Note(path.into(), format!("Too large to open ({})", human_size(size))),
@@ -732,14 +865,17 @@ impl App {
     }
 
     /// Opens `path`, asking first what to do with unsaved changes.
-    fn request_open(&mut self, path: PathBuf) {
-        if self.showing(&path) {
-            return;
-        }
-        if self.dirty() {
-            self.prompt = Some(Prompt::Unsaved(After::Open(path)));
-        } else {
+    /// Opens `path`, asking first about unsaved changes. With `hand_off`, a web page or a
+    /// video also goes to the browser or player, once it's opened here.
+    fn request_open(&mut self, path: PathBuf, hand_off: bool) {
+        if !self.showing(&path) {
+            if self.dirty() {
+                return self.prompt = Some(Prompt::Unsaved(After::Open(path, hand_off)));
+            }
             self.open(&path);
+        }
+        if hand_off {
+            self.hand_off(&path);
         }
     }
 
@@ -754,7 +890,36 @@ impl App {
     fn proceed(&mut self, after: After) {
         match after {
             After::Quit => self.quit = true,
-            After::Open(path) => self.open(&path),
+            After::Open(path, hand_off) => {
+                self.open(&path);
+                if hand_off {
+                    self.hand_off(&path);
+                }
+            }
+        }
+    }
+
+    /// Whether saving would write over changes made on disk since the file was read:
+    /// another program's, which the header says are there, or ones made just now.
+    fn clobbers(&self) -> bool {
+        match &self.shown {
+            Shown::Doc(doc) if doc.buf.dirty && doc.source == Source::Disk => {
+                let stamp = disk_stamp(&doc.path);
+                doc.disk_changed || (stamp.0.is_some() && stamp != doc.disk)
+            }
+            _ => false,
+        }
+    }
+
+    /// Saves, then goes on to `after`; if that would write over changes made on disk, it
+    /// asks first.
+    fn save_then(&mut self, after: Option<After>) {
+        if self.clobbers() {
+            self.prompt = Some(Prompt::Overwrite(after));
+        } else if self.save()
+            && let Some(after) = after
+        {
+            self.proceed(after);
         }
     }
 
@@ -768,8 +933,7 @@ impl App {
         let name = file_name(&doc.path);
         match result {
             Ok(()) => {
-                doc.disk = disk_stamp(&doc.path);
-                doc.disk_changed = false;
+                (doc.disk, doc.disk_changed, doc.reread) = (disk_stamp(&doc.path), false, false);
                 self.say(format!("Saved {name}"));
                 true
             }
@@ -800,16 +964,42 @@ impl App {
         {
             let stamp = disk_stamp(&doc.path);
             if stamp.0.is_some() && stamp != doc.disk {
-                doc.disk = stamp;
-                // Unsaved changes stay, as does what's shown when the new contents can't be
-                // (binary, too big, unreadable); either way the header says it's out of date
-                if !doc.buf.dirty && doc.reload() {
+                (doc.disk, doc.disk_changed, doc.reread) = (stamp, true, true);
+            }
+            // Read in once per change, as soon as there are no unsaved changes to lose: at
+            // once, or when they're undone back to what was saved. When the new contents
+            // can't be shown (binary, too big, unreadable), what's shown stays, and the header
+            // says it's out of date.
+            if doc.reread && !doc.buf.dirty {
+                doc.reread = false;
+                if doc.reload() {
                     doc.disk_changed = false;
                     self.say("Reloaded: the file changed on disk");
-                } else {
-                    doc.disk_changed = true;
                 }
             }
+        }
+        // An image another program redraws (a plot, a screenshot) shows the new one, zoomed
+        // the same. One read while it's still being written can't be shown, so the old one
+        // stays, and the rest of the writing changes it again for another try.
+        let changed = match &mut self.shown {
+            Shown::Image(image) if image.source == Source::Disk => {
+                let stamp = disk_stamp(&image.path);
+                (stamp.0.is_some() && stamp != image.disk).then(|| {
+                    image.disk = stamp;
+                    (image.path.clone(), stamp)
+                })
+            }
+            _ => None,
+        };
+        if let Some((path, stamp)) = changed
+            && let Shown::Image(mut new) = self.show_bytes(&path, read_image(&path), Source::Disk, None)
+        {
+            new.disk = stamp;
+            if let Shown::Image(old) = &self.shown {
+                new.picture.keep_view(&old.picture);
+            }
+            self.shown = Shown::Image(new);
+            self.say("Reloaded: the image changed on disk");
         }
         // Not while a row is held down: the press, and a drag from it, go by its place in the rows
         if self.last_refresh.elapsed() >= TREE_REFRESH && !matches!(self.drag, Drag::Tree { .. }) {
@@ -818,9 +1008,22 @@ impl App {
         }
     }
 
+    /// Shows the preview that moving put off.
+    fn settle(&mut self) {
+        match self.pending.take() {
+            Some(Preview::Tree) => self.preview(),
+            Some(Preview::History) => self.history_preview(),
+            Some(Preview::Grep) => self.grep_preview(),
+            None => {}
+        }
+    }
+
     // Input
 
     pub fn handle(&mut self, event: Event) {
+        if !matches!(&event, Event::Key(key) if moves(key)) {
+            self.settle();
+        }
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => self.key(key),
             Event::Mouse(mouse) => self.mouse(mouse),
@@ -842,10 +1045,7 @@ impl App {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('q') if ctrl => return self.request_quit(),
-            KeyCode::Char('s') if ctrl => {
-                self.save();
-                return;
-            }
+            KeyCode::Char('s') if ctrl => return self.save_then(None),
             KeyCode::Char('z') if alt => return self.toggle_wrap(),
             KeyCode::Tab | KeyCode::BackTab => {
                 self.filtering = false;
@@ -865,14 +1065,12 @@ impl App {
     }
 
     fn prompt_key(&mut self, prompt: Prompt, key: KeyEvent) {
+        // Answers are plain letters: Ctrl+D out of habit mustn't throw changes away
+        let plain = !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         match prompt {
             Prompt::Unsaved(after) => match key.code {
-                KeyCode::Char('s' | 'y') => {
-                    if self.save() {
-                        self.proceed(after);
-                    }
-                }
-                KeyCode::Char('d' | 'n') => {
+                KeyCode::Char('s' | 'y') if plain => self.save_then(Some(after)),
+                KeyCode::Char('d' | 'n') if plain => {
                     if let Some(doc) = self.doc() {
                         doc.buf.dirty = false;
                     }
@@ -885,6 +1083,16 @@ impl App {
                     }
                 }
                 _ => self.prompt = Some(Prompt::Unsaved(after)),
+            },
+            Prompt::Overwrite(after) => match key.code {
+                KeyCode::Char('y' | 'Y') if plain => {
+                    if self.save()
+                        && let Some(after) = after
+                    {
+                        self.proceed(after);
+                    }
+                }
+                _ => self.say("Not saved"),
             },
             Prompt::Search(mut query) => match key.code {
                 KeyCode::Esc => self.search = None,
@@ -908,7 +1116,8 @@ impl App {
                 _ => self.prompt = Some(Prompt::Search(query)),
             },
             Prompt::Confirm(change) => match key.code {
-                KeyCode::Char('y' | 'Y') | KeyCode::Enter => self.perform(change),
+                KeyCode::Char('y' | 'Y') if plain => self.perform(change),
+                KeyCode::Enter => self.perform(change),
                 _ => self.say("Left as it was"),
             },
             Prompt::Grep(mut query) => match key.code {
@@ -958,6 +1167,12 @@ impl App {
             KeyCode::End | KeyCode::Char('G') => self.tree_move(isize::MAX / 2),
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.tree_activate(key.code == KeyCode::Enter),
             KeyCode::Left | KeyCode::Char('h') => self.tree.collapse_or_parent(),
+            // With a filter on show, it's the filter's last character that goes
+            KeyCode::Backspace if self.tree.filter.is_some() => {
+                self.filtering = true;
+                return self.filter_key(key);
+            }
+            KeyCode::Backspace => self.tree_up(),
             KeyCode::Char('/') => {
                 if self.tree.filter.is_none() {
                     self.tree.set_filter(Some(String::new()));
@@ -999,7 +1214,7 @@ impl App {
         self.last_grep = query.clone();
         self.history = None;
         self.filtering = false;
-        self.grep = Some(Grep::start(&self.tree.root, &query, self.tree.show_hidden));
+        self.grep = Some(Grep::start(&self.tree.root, &query, self.tree.show_hidden, self.tree.rules_above));
         self.focus = Focus::Tree;
     }
 
@@ -1044,11 +1259,12 @@ impl App {
         } else if row >= grep.scroll + height {
             grep.scroll = row + 1 - height;
         }
-        self.grep_preview();
+        self.pending = Some(Preview::Grep);
     }
 
     /// Shows the selected match: its file at that line, with the matches lit.
     fn grep_preview(&mut self) {
+        self.pending = None;
         let Some((path, line, col, query)) = self
             .grep
             .as_ref()
@@ -1071,7 +1287,8 @@ impl App {
             // A match is on a line of the text, so formatted views show the text
             doc.raw = true;
             doc.last_match = Some(Pos::new(line, col));
-            (doc.top, doc.top_row) = (line.saturating_sub(page / 3), 0);
+            let line = line.min(doc.buf.lines.len() - 1);
+            doc.jump_to(line, col, page, width);
             let at = display_col(doc.buf.lines.get(line).map_or("", String::as_str), col);
             doc.left = if doc.wrap || at < width { 0 } else { at.saturating_sub(width / 3) };
         }
@@ -1096,7 +1313,7 @@ impl App {
         }
         // The history of what's selected in the tree, or of what's open
         let picked = match self.focus {
-            Focus::Tree => self.tree.rows.get(self.tree.selected).map(|r| r.path.clone()),
+            Focus::Tree => self.tree.selected_entry().map(|r| r.path.clone()),
             Focus::Content => self.shown_path().map(Path::to_path_buf),
         };
         let scope = picked.filter(|p| p.exists()).unwrap_or_else(|| self.tree.root.clone());
@@ -1130,6 +1347,7 @@ impl App {
     /// Shows the selected commit, or the selected file of the opened commit, as it was
     /// or as a diff.
     fn history_preview(&mut self) {
+        self.pending = None;
         // The history still opens, but a file with unsaved changes stays on screen
         if self.dirty() {
             return self.say("Save or discard your changes first, to see other files");
@@ -1228,11 +1446,12 @@ impl App {
         } else if *selected >= *scroll + height {
             *scroll = *selected + 1 - height;
         }
-        self.history_preview();
+        self.pending = Some(Preview::History);
     }
 
     /// Opens the selected commit's files, or moves into the selected file.
     fn history_enter(&mut self) {
+        let height = self.tree_area.height as usize;
         let Some(h) = &mut self.history else { return };
         if h.opened.is_some() {
             self.focus = Focus::Content;
@@ -1245,7 +1464,8 @@ impl App {
                 // In a file's history, start on that file
                 let then = h.commits[h.selected].path.clone().or_else(|| h.file.clone());
                 let start = then.and_then(|f| files.iter().position(|(_, p)| *p == f)).unwrap_or(0);
-                h.opened = Some(Opened { commit: h.selected, files, all: false, selected: start, scroll: 0 });
+                let scroll = start.saturating_sub(height / 2);
+                h.opened = Some(Opened { commit: h.selected, files, all: false, selected: start, scroll });
                 self.history_preview();
             }
             Err(e) => self.say(format!("Couldn't read the commit: {e}")),
@@ -1287,10 +1507,9 @@ impl App {
             Err(e) => return self.say(format!("Couldn't read the commit: {e}")),
         };
         let current = opened.files.get(opened.selected).map(|f| f.1.clone());
-        opened.all = !opened.all;
-        opened.files = if opened.all {
-            let status: std::collections::HashMap<&str, char> =
-                changes.iter().map(|c| (c.path.as_str(), c.status)).collect();
+        let all = !opened.all;
+        opened.files = if all {
+            let status: HashMap<&str, char> = changes.iter().map(|c| (c.path.as_str(), c.status)).collect();
             let mut files: Vec<(char, String)> = match git::files(&h.repo, &commit.hash) {
                 Ok(files) => files.into_iter().map(|f| (status.get(f.as_str()).copied().unwrap_or(' '), f)).collect(),
                 Err(e) => return self.say(format!("Couldn't list the files: {e}")),
@@ -1301,6 +1520,7 @@ impl App {
         } else {
             changes.into_iter().map(|c| (c.status, c.path)).collect()
         };
+        opened.all = all;
         opened.selected = current.and_then(|p| opened.files.iter().position(|f| f.1 == p)).unwrap_or(0);
         opened.scroll = opened.selected.saturating_sub(self.tree_area.height as usize / 2);
         let all = opened.all;
@@ -1353,12 +1573,13 @@ impl App {
             return;
         }
         self.tree.selected = self.tree.selected.saturating_add_signed(delta).min(self.tree.rows.len() - 1);
-        self.preview();
+        self.pending = Some(Preview::Tree);
     }
 
     /// Shows the selected file as the selection moves, unless that would drop unsaved changes.
     fn preview(&mut self) {
-        let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
+        self.pending = None;
+        let Some(row) = self.tree.selected_entry() else { return };
         let (is_dir, path) = (row.is_dir, row.path.clone());
         if is_dir {
             // A folder of images shows its thumbnails
@@ -1411,10 +1632,11 @@ impl App {
     fn tree_activate(&mut self, enter: bool) {
         let Some(row) = self.tree.rows.get(self.tree.selected) else { return };
         let (is_dir, archive, open, path) = (row.is_dir, row.archive, self.tree.is_open(row), row.path.clone());
-        if !is_dir {
-            self.request_open(path.clone());
+        if row.up {
+            self.tree_up();
+        } else if !is_dir {
             self.focus = Focus::Content;
-            self.hand_off(&path);
+            self.request_open(path, true);
         } else if archive && self.tree.filter.is_some() {
             // The filter doesn't look inside archives, so open it in the full tree
             self.tree.set_filter(None);
@@ -1429,6 +1651,13 @@ impl App {
     }
 
     fn view_key(&mut self, key: KeyEvent) {
+        if let Shown::Note(path, _) = &self.shown
+            && key.code == KeyCode::Enter
+            && external::is_video(path)
+        {
+            let path = path.clone();
+            return self.hand_off(&path);
+        }
         if let Shown::Gallery(gallery) = &mut self.shown {
             let (across, rows) = (gallery.per_row as isize, gallery.rows_shown.max(1) as isize);
             match key.code {
@@ -1511,7 +1740,11 @@ impl App {
             KeyCode::Left | KeyCode::Char('h') if doc.scrolled_sideways() => doc.scroll_sideways(-SIDEWAYS),
             KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Tree,
             KeyCode::Right | KeyCode::Char('l') => doc.scroll_sideways(SIDEWAYS),
-            KeyCode::Char('m') if doc.kind != Kind::Text => doc.toggle_raw(),
+            KeyCode::Char('m') if doc.kind != Kind::Text => {
+                if !doc.toggle_raw() {
+                    self.say("Too big to show formatted: over 5 MB");
+                }
+            }
             _ => {}
         }
     }
@@ -1572,10 +1805,20 @@ impl App {
 
     fn edit_command(&mut self, c: char, shift: bool) {
         let (page, width) = (self.page(), self.text_width());
+        // A command that moves the cursor starts its column afresh, as typing does
+        if matches!(c, 'x' | 'v' | 'z' | 'y' | 'a')
+            && let Some(doc) = self.doc()
+        {
+            doc.wrap_x = None;
+        }
         match c {
             'c' => self.copy_selection(),
             'x' => {
-                let cut = self.doc().and_then(|doc| doc.buf.cut());
+                let cut = self.doc().and_then(|doc| {
+                    let cut = doc.buf.cut();
+                    doc.follow_cursor(page, width);
+                    cut
+                });
                 match cut {
                     Some(text) => {
                         clipboard::copy(&text, false);
@@ -1612,6 +1855,7 @@ impl App {
     fn insert_text(&mut self, text: &str) {
         let (page, width) = (self.page(), self.text_width());
         if let Some(doc) = self.doc() {
+            doc.wrap_x = None;
             doc.buf.insert(text);
             doc.follow_cursor(page, width);
         }
@@ -1627,7 +1871,7 @@ impl App {
                 self.search = (!query.is_empty()).then(|| query.clone());
             }
             Some(Prompt::Rename(_, name) | Prompt::Grep(name)) => name.push_str(first_line),
-            Some(Prompt::Unsaved(_) | Prompt::Confirm(_)) => {}
+            Some(Prompt::Unsaved(_) | Prompt::Overwrite(_) | Prompt::Confirm(_)) => {}
             None if self.focus == Focus::Tree && self.filtering => {
                 let query = format!("{}{first_line}", self.tree.filter.clone().unwrap_or_default());
                 self.tree.set_filter(Some(query));
@@ -1718,13 +1962,12 @@ impl App {
                 doc.fmt_left = (col - gutter).saturating_sub(room / 3);
             }
         } else if doc.editing {
+            doc.wrap_x = None;
             doc.buf.move_to(Pos::new(line, start), false);
             doc.buf.move_to(Pos::new(line, end), true);
             doc.follow_cursor(page, width);
         } else {
-            if line < doc.top || line >= doc.top + page {
-                (doc.top, doc.top_row) = (line.saturating_sub(page / 3), 0);
-            }
+            doc.show(line, start, page, width);
             let col = display_col(&doc.buf.lines[line], start);
             if !doc.wrap && (col < doc.left || col >= doc.left + width) {
                 doc.left = col.saturating_sub(width / 3);
@@ -1861,14 +2104,21 @@ impl App {
     /// double-click, opens).
     fn history_click(&mut self, y: u16, double: bool) {
         if y < self.tree_area.y {
-            return self.history_back();
+            // Once for a double-click, which would otherwise go back two steps
+            if !double {
+                self.history_back();
+            }
+            return;
         }
         let Some(h) = &self.history else { return };
-        let (scroll, selected) = match &h.opened {
-            Some(o) => (o.scroll, o.selected),
-            None => (h.scroll, h.selected),
+        let (scroll, selected, len) = match &h.opened {
+            Some(o) => (o.scroll, o.selected, o.files.len()),
+            None => (h.scroll, h.selected, h.commits.len()),
         };
         let row = scroll + (y - self.tree_area.y) as usize;
+        if row >= len {
+            return;
+        }
         if row != selected {
             self.history_move(row as isize - selected as isize);
         }
@@ -1890,6 +2140,13 @@ impl App {
             self.tree.marks.clear();
             return;
         };
+        // The second press of a double-click goes with the first, to the same row; if the
+        // rows moved in between (the first went up, or folded a folder), it's on another one
+        let path = self.tree.rows[i].path.clone();
+        if double && self.pressed.as_ref() != Some(&path) {
+            return;
+        }
+        self.pressed = Some(path);
         let before = self.tree.rows.get(self.tree.selected).map(|r| r.path.clone());
         self.tree.selected = i;
         if modifiers.contains(KeyModifiers::CONTROL) {
@@ -1907,6 +2164,13 @@ impl App {
     }
 
     fn tree_drag(&mut self, from: usize, double: bool, y: u16) {
+        // ".." doesn't move, and dragging off it lets go of it
+        if self.items_from(from).is_empty() {
+            if self.row_at(y) != Some(from) {
+                self.drag = Drag::None;
+            }
+            return;
+        }
         // Near the edges the tree scrolls
         let (top, bottom) = (self.tree_area.y, self.tree_area.bottom());
         if y < top {
@@ -1931,8 +2195,10 @@ impl App {
     }
 
     /// What dragging row `from` carries: the marked rows if it's one of them, or else it.
+    /// ".." carries nothing.
     fn items_from(&self, from: usize) -> Vec<PathBuf> {
         match self.tree.rows.get(from) {
+            Some(row) if row.up => Vec::new(),
             Some(row) if self.tree.marks.contains(&row.path) => self.tree.marked_or_selected(),
             Some(row) => vec![row.path.clone()],
             None => Vec::new(),
@@ -1994,7 +2260,7 @@ impl App {
     }
 
     fn request_rename(&mut self) {
-        let Some(path) = self.tree.rows.get(self.tree.selected).map(|r| r.path.clone()) else { return };
+        let Some(path) = self.tree.selected_entry().map(|r| r.path.clone()) else { return };
         match self.unchangeable(std::slice::from_ref(&path)) {
             Some(problem) => self.say(problem),
             None => self.prompt = Some(Prompt::Rename(path.clone(), file_name(&path))),
@@ -2003,31 +2269,42 @@ impl App {
 
     fn perform(&mut self, change: Change) {
         self.gallery_stash = None;
-        match change {
-            Change::Trash(items) => match fileops::trash(&items) {
-                Ok(()) => {
-                    let gone = self.shown_path().filter(|shown| items.iter().any(|p| shown.starts_with(p)));
-                    if let Some(path) = gone.map(Path::to_path_buf) {
-                        self.shown = Shown::Note(path, "Moved to the trash".into());
-                    }
-                    self.say(format!("Moved {} to the trash", describe(&items)));
+        let done = match change {
+            Change::Trash(items) => {
+                let result = fileops::trash(&items);
+                // Some can go before one fails, so it's what's gone that counts
+                let gone = self
+                    .shown_path()
+                    .filter(|shown| items.iter().any(|p| shown.starts_with(p) && p.symlink_metadata().is_err()));
+                if let Some(path) = gone.map(Path::to_path_buf) {
+                    self.shown = Shown::Note(path, "Moved to the trash".into());
                 }
-                Err(e) => self.say(format!("{e:#}")),
-            },
+                match &result {
+                    Ok(()) => self.say(format!("Moved {} to the trash", describe(&items))),
+                    Err(e) => self.say(format!("{e:#}")),
+                }
+                result.is_ok()
+            }
             Change::Move(items, dir) => {
                 let (moved, problem) = fileops::move_into(&items, &dir);
                 for (from, to) in &moved {
                     self.tree.renamed(from, to);
                     self.follow(from, to);
                 }
-                match problem {
+                // What did move isn't marked any more where it went
+                self.tree.marks.retain(|p| !moved.iter().any(|(_, to)| p.starts_with(to)));
+                match &problem {
                     Some(e) if moved.is_empty() => self.say(format!("{e}")),
                     Some(e) => self.say(format!("Moved {}, then stopped: {e}", describe(&items[..moved.len()]))),
                     None => self.say(format!("Moved {} into {}", describe(&items), self.dir_name(&dir))),
                 }
+                problem.is_none()
             }
+        };
+        // What's left after a failure stays marked, to see, or try again
+        if done {
+            self.tree.marks.clear();
         }
-        self.tree.marks.clear();
         self.tree.refresh();
     }
 
@@ -2055,8 +2332,7 @@ impl App {
             return;
         }
         if let Shown::Doc(doc) = &mut self.shown {
-            doc.disk = disk_stamp(&new);
-            doc.path = new;
+            doc.moved_to(&new);
         } else if let Shown::Gallery(_) = &self.shown {
             self.shown = Shown::Nothing;
             self.show_gallery(&new);
@@ -2072,21 +2348,36 @@ impl App {
 
     fn tree_click(&mut self, i: usize, double: bool) {
         let Some(row) = self.tree.rows.get(i) else { return };
-        let (is_dir, path) = (row.is_dir, row.path.clone());
+        let (is_dir, up, path) = (row.is_dir, row.up, row.path.clone());
         self.tree.selected = i;
-        if is_dir {
+        if up {
+            self.tree_up();
+        } else if is_dir {
             // The second click of a double-click would fold it straight back
             if !double {
                 self.tree.toggle(i);
             }
             self.show_gallery(&path);
         } else {
-            self.request_open(path.clone());
+            self.request_open(path, !double);
             if double {
                 self.focus = Focus::Content;
-            } else {
-                self.hand_off(&path);
             }
+        }
+    }
+
+    /// Moves the top of the tree up a folder.
+    fn tree_up(&mut self) {
+        let hidden = self.tree.show_hidden;
+        match self.tree.up() {
+            Err(NoWayUp::Top) => self.say("There's no folder above this one"),
+            Err(NoWayUp::Unreadable(dir, why)) => {
+                self.say(format!("Can't go up: {} can't be read ({why})", tilde(&dir)))
+            }
+            Ok(()) if self.tree.show_hidden != hidden => {
+                self.say("Showing hidden and ignored files, as the folder you were in is one")
+            }
+            Ok(()) => {}
         }
     }
 
@@ -2111,6 +2402,12 @@ impl App {
     }
 
     fn content_click(&mut self, x: u16, y: u16, double: bool, shift: bool) {
+        if let Shown::Note(path, _) = &self.shown
+            && external::is_video(path)
+        {
+            let path = path.clone();
+            return self.hand_off(&path);
+        }
         if let Shown::Image(image) = &mut self.shown {
             // A double-click fits it back in; otherwise a drag moves it around
             if double {
@@ -2177,6 +2474,7 @@ impl App {
     // Drawing
 
     pub fn draw(&mut self, f: &mut Frame) {
+        self.settle();
         let area = f.area();
         if area.width < 30 || area.height < 5 {
             f.render_widget(Paragraph::new("Too small"), area);
@@ -2217,8 +2515,14 @@ impl App {
 
     fn draw_tree(&mut self, f: &mut Frame, header_area: Rect) {
         let focused = self.focus == Focus::Tree;
-        let flag = if self.tree.show_hidden { "all " } else { "" };
-        header(f, header_area, &format!(" {}", tilde(&self.tree.root)), flag, focused);
+        let flag = match self.tree.hidden {
+            _ if self.tree.show_hidden => "all ".to_string(),
+            // The count is of the top folder, which the filter's matches replace
+            _ if self.tree.filtering() => String::new(),
+            0 => String::new(),
+            n => format!("{n} hidden "),
+        };
+        header(f, header_area, &format!(" {}", tilde(&self.tree.root)), &flag, focused);
 
         let words: Vec<String> = match &self.tree.filter {
             Some(query) => {
@@ -2233,7 +2537,7 @@ impl App {
                     String::new()
                 };
                 let room = (area.width as usize).saturating_sub(3 + str_width(&count));
-                let shown: String = query.chars().rev().take(room).collect::<Vec<_>>().into_iter().rev().collect();
+                let shown = tail_width(query, room).to_string();
                 let pad = room.saturating_sub(str_width(&shown));
                 let style = if typing { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
                 let line = Line::from(vec![
@@ -2261,6 +2565,7 @@ impl App {
         let mut lines = Vec::new();
         for (i, row) in self.tree.rows.iter().enumerate().skip(self.tree.scroll).take(height) {
             let icon = match (row.is_dir, self.tree.is_open(row)) {
+                _ if row.up => "◂ ",
                 (true, true) => "▾ ",
                 (true, false) => "▸ ",
                 _ => "  ",
@@ -2274,7 +2579,7 @@ impl App {
             } else {
                 Style::new()
             };
-            if open == Some(row.path.as_path()) {
+            if open == Some(row.path.as_path()) && !row.up {
                 style = style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
             }
             let selected = i == self.tree.selected;
@@ -2309,8 +2614,13 @@ impl App {
             spans.push(Span::styled(" ".repeat((list.width as usize).saturating_sub(used)), bar));
             lines.push(Line::from(spans));
         }
-        if self.tree.rows.is_empty() {
-            let note = if self.tree.filtering() { "  (no matches)" } else { "  (empty)" };
+        if self.tree.rows.iter().all(|r| r.up) {
+            let note = match (self.tree.unreadable, self.tree.hidden) {
+                _ if self.tree.filtering() => "  (no matches)".to_string(),
+                (Some(why), _) => format!("  (can't read it: {why})"),
+                (None, 0) => "  (empty)".to_string(),
+                (None, n) => format!("  ({n} hidden: . shows them)"),
+            };
             lines.push(Line::styled(note, dim()));
         }
         f.render_widget(Paragraph::new(lines), list);
@@ -2341,7 +2651,7 @@ impl App {
                     let base = row_style(i == h.selected);
                     let age = git::age(c.time);
                     let room = width.saturating_sub(c.short.len() + age.len() + 3);
-                    let subject: String = c.subject.chars().take(room).collect();
+                    let subject = split_at_width(&printable(&c.subject), room).0.to_string();
                     let pad = room.saturating_sub(str_width(&subject));
                     lines.push(Line::from(vec![
                         Span::styled(format!(" {} ", c.short), base.fg(Color::Yellow)),
@@ -2356,10 +2666,11 @@ impl App {
                 let what = if o.all { "all files " } else { "" };
                 // The subject gives way, not the hash
                 let room = width.saturating_sub(c.short.len() + str_width(what) + 5);
-                let subject = if str_width(&c.subject) > room {
-                    format!("{}…", c.subject.chars().take(room.saturating_sub(1)).collect::<String>())
+                let subject = printable(&c.subject);
+                let subject = if str_width(&subject) > room {
+                    format!("{}…", split_at_width(&subject, room.saturating_sub(1)).0)
                 } else {
-                    c.subject.clone()
+                    subject.into_owned()
                 };
                 header(f, header_area, &format!(" ◂ {} {subject}", c.short), what, focused);
                 o.scroll = o.scroll.min(o.files.len().saturating_sub(height));
@@ -2372,11 +2683,10 @@ impl App {
                         ' ' => Color::Reset,
                         _ => Color::Yellow,
                     };
-                    let text = path.as_str();
+                    let text = printable(path);
                     let room = width.saturating_sub(4);
                     // Long paths keep their end
-                    let skip = str_width(text).saturating_sub(room);
-                    let shown: String = text.chars().skip(skip).collect();
+                    let shown = tail_width(&text, room).to_string();
                     let pad = room.saturating_sub(str_width(&shown));
                     let path_style = if *status == ' ' { base.add_modifier(Modifier::DIM) } else { base };
                     lines.push(Line::from(vec![
@@ -2554,6 +2864,10 @@ impl App {
                     let name = self.shown_path().map(file_name).unwrap_or_default();
                     format!(" Unsaved changes to {name}: s save · d discard · Esc cancel")
                 }
+                Prompt::Overwrite(_) => {
+                    let name = self.shown_path().map(file_name).unwrap_or_default();
+                    format!(" {name} changed on disk since it was read. Save over it? y yes · n no")
+                }
                 Prompt::Search(query) => format!(" /{query}"),
                 Prompt::Confirm(Change::Trash(items)) => {
                     format!(" Move {} to the trash? y yes · n no", describe(items))
@@ -2585,7 +2899,7 @@ impl App {
         };
         let position = self.position();
         let room = (area.width as usize).saturating_sub(mode.len() + position.len() + 3);
-        let text: String = text.chars().take(room).collect();
+        let text = split_at_width(&text, room).0.to_string();
         let pad = room.saturating_sub(str_width(&text));
         let line = Line::from(vec![
             Span::styled(mode, Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)),
@@ -2690,7 +3004,7 @@ fn draw_formatted(f: &mut Frame, doc: &mut Doc, area: Rect, search: Option<&str>
 /// Draws the file with line numbers, wrapped or scrolled sideways; returns the gutter width.
 fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: Option<&str>) -> u16 {
     if let Some(line) = doc.buf.changed_from.take() {
-        doc.colors.invalidate(line);
+        doc.colors.invalidate(&doc.buf.lines, line);
     }
     let total = doc.buf.lines.len();
     let height = area.height as usize;
@@ -2724,7 +3038,7 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
             if rows.len() == height {
                 break;
             }
-            rows.push((line, r, starts[r], starts.get(r + 1).copied()));
+            rows.push((line, starts[r], starts.get(r + 1).copied()));
         }
         line += 1;
         row = 0;
@@ -2734,20 +3048,29 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     doc.more = if doc.wrap {
         (false, false)
     } else {
-        let cut_off = rows.iter().any(|&(i, ..)| str_width(&doc.buf.lines[i]) > doc.left + width);
+        let cut_off = rows.iter().any(|&(i, ..)| wider_than(&doc.buf.lines[i], doc.left + width));
         (doc.left > 0, cut_off)
     };
 
     let selection = doc.buf.selection();
     let current = doc.last_match;
     let mut lines = Vec::with_capacity(height);
-    for &(i, r, start, next) in &rows {
+    // A line's matches, found once for all the rows it wraps into
+    let mut found: Option<(usize, Vec<(usize, usize)>)> = None;
+    for &(i, start, next) in &rows {
         let text = &doc.buf.lines[i];
-        let number = if r > 0 { " ".repeat(digits + 2) } else { format!("{:>digits$}  ", i + 1) };
+        let number = if start.char > 0 { " ".repeat(digits + 2) } else { format!("{:>digits$}  ", i + 1) };
         let number_style = if doc.editing && i == doc.buf.cursor.line { Style::new().fg(Color::Yellow) } else { dim() };
         let mut marks = Vec::new();
         if let Some(q) = search {
-            for (s, e) in find_all(text, q) {
+            if found.as_ref().is_none_or(|(line, _)| *line != i) {
+                found = Some((i, find_all(text, q)));
+            }
+            let hits = found.as_ref().map_or(&[][..], |(_, hits)| hits.as_slice());
+            // Only the ones on this row: a long line can have thousands
+            let (from, to) = if doc.wrap { (start.char, next.map_or(usize::MAX, |n| n.char)) } else { (0, usize::MAX) };
+            let first = hits.partition_point(|&(_, e)| e <= from);
+            for &(s, e) in hits[first..].iter().take_while(|&&(s, _)| s < to) {
                 let style = if current == Some(Pos::new(i, s)) {
                     match_style().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
                 } else {
@@ -2761,16 +3084,15 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
             let to = if i == e.line { e.col } else { usize::MAX };
             marks.push((from, to, selection_style()));
         }
-        // A wrapped row shows just its own characters; the last row of a line may
-        // also show the selection running on past its end
-        let (left, room) = if doc.wrap {
-            let left = display_col(text, start);
-            (left, next.map_or(width, |n| display_col(text, n) - left))
+        // A wrapped row shows just its own characters, read from where it starts; the last
+        // row of a line may also show the selection running on past its end
+        let (from, left, room) = if doc.wrap {
+            (start, start.col, next.map_or(width, |n| n.col - start.col))
         } else {
-            (doc.left, width)
+            (Place::default(), doc.left, width)
         };
         let mut spans = vec![Span::styled(number, number_style)];
-        spans.extend(line_spans(text, doc.colors.get(i), left, room, &marks));
+        spans.extend(line_spans(text, doc.colors.get(i), from, left, room, &marks));
         lines.push(Line::from(spans));
     }
     f.render_widget(Paragraph::new(lines), area);
@@ -2778,14 +3100,17 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     if focused && doc.editing {
         let c = doc.buf.cursor;
         let text = &doc.buf.lines[c.line];
-        let col = display_col(text, c.col);
         let on_row = rows
             .iter()
-            .position(|&(i, _, start, next)| i == c.line && c.col >= start && next.is_none_or(|n| c.col < n));
+            .position(|&(i, start, next)| i == c.line && c.col >= start.char && next.is_none_or(|n| c.col < n.char));
         if let Some(y) = on_row {
-            let left = if doc.wrap { display_col(text, rows[y].2) } else { doc.left };
-            if col >= left && col - left < width {
-                f.set_cursor_position(Position::new(area.x + gutter + (col - left) as u16, area.y + y as u16));
+            let start = if doc.wrap { rows[y].1 } else { Place::default() };
+            let col = display_col_from(text, start, c.col);
+            let left = if doc.wrap { start.col } else { doc.left };
+            // At the end of a wrapped row that fills the width, it sits on the last cell
+            let x = if doc.wrap { (col - left).min(width - 1) } else { col.wrapping_sub(left) };
+            if col >= left && x < width {
+                f.set_cursor_position(Position::new(area.x + gutter + x as u16, area.y + y as u16));
             }
         }
     }
@@ -2804,8 +3129,7 @@ fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
     // Long paths lose their beginning, not the file name
     let mut title = title.to_string();
     if str_width(&title) > room {
-        let skip = str_width(&title) - room + 2;
-        title = format!(" …{}", title.chars().skip(skip + 1).collect::<String>());
+        title = format!(" …{}", tail_width(&title, room.saturating_sub(2)));
     }
     let pad = width.saturating_sub(str_width(&title) + str_width(right));
     let line = Line::from(vec![Span::raw(title), Span::raw(" ".repeat(pad)), Span::raw(right.to_string())]);
@@ -3091,6 +3415,174 @@ mod tests {
         h.app.tick();
         h.draw();
         assert!(h.screen().contains("After, longer"), "{}", h.screen());
+    }
+
+    #[test]
+    fn an_image_redrawn_on_disk_shows_the_new_one() {
+        let h0 = Harness::new(&[]);
+        write_png(&h0.root.join("plot.png"), 64, 48);
+        let mut h = Harness { app: App::new(&h0.root.join("plot.png")).unwrap(), ..h0 };
+        h.draw();
+        assert!(h.screen().contains("64×48"), "{}", h.screen());
+        // Caught halfway through being written: the old one stays
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(h.root.join("plot.png"), b"\x89PNG\r\n\x1a\n").unwrap();
+        h.app.tick();
+        h.draw();
+        assert!(h.screen().contains("64×48"), "{}", h.screen());
+        // ...and the rest of the writing brings the new one
+        std::thread::sleep(Duration::from_millis(20));
+        write_png(&h.root.join("plot.png"), 32, 24);
+        h.app.tick();
+        h.draw();
+        assert!(h.screen().contains("32×24"), "{}", h.screen());
+    }
+
+    #[test]
+    fn saving_over_changes_on_disk_asks_first() {
+        let mut h = Harness::new(&[("a.txt", "mine\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.typing("x");
+        // Another program writes the file meanwhile, too recently for the header to know
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(h.root.join("a.txt"), "theirs\n").unwrap();
+        h.key_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        assert!(h.screen().contains("changed on disk since it was read"), "{}", h.screen());
+        h.key(KeyCode::Char('n'));
+        assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "theirs\n");
+        h.key_with(KeyCode::Char('s'), KeyModifiers::CONTROL);
+        h.key(KeyCode::Char('y'));
+        assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "xmine\n");
+    }
+
+    #[test]
+    fn undoing_back_to_the_saved_text_lets_changes_on_disk_in() {
+        let mut h = Harness::new(&[("a.txt", "before\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.typing("x");
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(h.root.join("a.txt"), "before\nappended\n").unwrap();
+        h.app.tick();
+        h.draw();
+        assert!(!h.screen().contains("appended"), "unsaved changes stay: {}", h.screen());
+        h.key_with(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        h.app.tick();
+        h.draw();
+        assert!(h.screen().contains("appended"), "{}", h.screen());
+    }
+
+    #[test]
+    fn a_file_back_from_the_trash_opens_again() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "first\n")]);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Delete);
+        h.key(KeyCode::Char('y'));
+        assert!(h.screen().contains("Moved to the trash"), "{}", h.screen());
+        fs::write(h.root.join("b.txt"), "back again\n").unwrap();
+        h.app.tree.refresh();
+        h.draw();
+        let (x, y) = h.find("  b.txt");
+        h.click(x + 2, y);
+        assert!(h.screen().contains("back again"), "{}", h.screen());
+    }
+
+    #[test]
+    fn backspace_edits_a_filter_on_show() {
+        let mut h = Harness::new(&[("alpha.txt", "a\n"), ("beta.txt", "b\n")]);
+        h.key(KeyCode::Char('/'));
+        h.typing("betx");
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Backspace);
+        assert_eq!(h.app.tree.filter.as_deref(), Some("bet"));
+        assert_eq!(h.app.tree.root, h.root);
+        assert!(h.screen().contains("beta.txt"), "{}", h.screen());
+    }
+
+    #[test]
+    fn double_clicking_dot_dot_goes_up_once_though_the_rows_move() {
+        // Thirty folders sort before the one it starts in, so going up scrolls ".." away
+        let files: Vec<String> = (0..30).map(|i| format!("a{i:02}/x.txt")).chain(["zz/inner.txt".into()]).collect();
+        let files: Vec<(&str, &str)> = files.iter().map(|f| (f.as_str(), "x\n")).collect();
+        let h0 = Harness::new(&files);
+        let mut h = Harness { app: App::new(&h0.root.join("zz")).unwrap(), ..h0 };
+        h.draw();
+        let (x, y) = h.find("◂ ..");
+        h.app.last_click = None;
+        for _ in 0..2 {
+            h.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+            h.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        }
+        assert_eq!(h.app.tree.root, h.root);
+        assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "zz");
+    }
+
+    #[test]
+    fn ctrl_letters_dont_answer_the_unsaved_prompt() {
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.typing("x");
+        h.key_with(KeyCode::Char('q'), KeyModifiers::CONTROL);
+        h.key_with(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(!h.app.quit);
+        assert!(h.app.dirty());
+        assert!(h.screen().contains("Unsaved changes to a.txt"), "{}", h.screen());
+    }
+
+    #[test]
+    fn enter_on_a_videos_note_plays_it() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "\0\0\0\x18ftypmp42")]);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Enter);
+        assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
+    }
+
+    #[test]
+    fn a_match_in_a_long_wrapped_line_comes_into_view() {
+        let long = format!("{}needle {}", "word ".repeat(2000), "more ".repeat(100));
+        let text = format!("short\n{long}\nend\n");
+        let mut h = Harness::new(&[("a.txt", &text)]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('w'));
+        h.key(KeyCode::Char('/'));
+        h.typing("needle");
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("needle"), "{}", h.screen());
+    }
+
+    #[test]
+    fn the_rendered_view_keeps_its_place_when_laid_out_again() {
+        let text: String = (1..=40).map(|i| format!("Paragraph {i} {}\n\n", "words ".repeat(25))).collect();
+        let mut h = Harness::new(&[("README.md", &text)]);
+        h.key(KeyCode::Tab);
+        for _ in 0..4 {
+            h.key(KeyCode::PageDown);
+        }
+        let top = h.app.doc().unwrap().formatted_top_src();
+        assert!(top > 10, "scrolled down to source line {top}");
+        h.term.backend_mut().resize(60, 20);
+        h.draw();
+        assert_eq!(h.app.doc().unwrap().formatted_top_src(), top);
+    }
+
+    #[test]
+    fn queued_moves_preview_only_where_they_stop() {
+        let mut h = Harness::new(&[("a.txt", "aaa\n"), ("b.txt", "bbb\n"), ("c.txt", "ccc\n")]);
+        let down = Event::Key(KeyEvent {
+            code: KeyCode::Down,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+        h.app.handle(down.clone());
+        h.app.handle(down);
+        assert!(h.app.shown_path().is_none(), "nothing read while the keys come in");
+        h.draw();
+        assert!(h.screen().contains("ccc"), "{}", h.screen());
     }
 
     #[test]
@@ -3473,6 +3965,40 @@ mod tests {
         h.mouse(MouseEventKind::Up(MouseButton::Left), x + 2, y);
         assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "sub");
         assert!(!h.screen().contains("inside.txt"), "{}", h.screen());
+    }
+
+    #[test]
+    fn dot_dot_moves_the_root_up() {
+        let h0 = Harness::new(&[("inner/a.txt", "a\n"), ("beside.txt", "b\n")]);
+        let mut h = Harness { app: App::new(&h0.root.join("inner")).unwrap(), ..h0 };
+        h.draw();
+        assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "a.txt");
+        // ".." can't be deleted, renamed or dragged anywhere
+        h.key(KeyCode::Up);
+        assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "..");
+        h.key(KeyCode::Delete);
+        h.key(KeyCode::F(2));
+        assert!(h.app.prompt.is_none());
+        let (x, y) = h.find("◂ ..");
+        h.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), x, y + 1);
+        h.mouse(MouseEventKind::Up(MouseButton::Left), x, y + 1);
+        assert!(h.app.prompt.is_none());
+        assert_eq!(h.app.tree.root, h.root.join("inner"));
+
+        // A click goes up once, even as a double-click, leaving the old root open
+        h.app.last_click = None;
+        for _ in 0..2 {
+            h.mouse(MouseEventKind::Down(MouseButton::Left), x, y);
+            h.mouse(MouseEventKind::Up(MouseButton::Left), x, y);
+        }
+        assert_eq!(h.app.tree.root, h.root);
+        let screen = h.screen();
+        assert!(screen.contains("▾ inner") && screen.contains("a.txt") && screen.contains("beside.txt"), "{screen}");
+        assert_eq!(h.app.tree.rows[h.app.tree.selected].name, "inner");
+        // And so does Backspace
+        h.key(KeyCode::Backspace);
+        assert_eq!(h.app.tree.root, h.root.parent().unwrap());
     }
 
     #[test]

@@ -26,6 +26,24 @@ pub fn is_image(path: &Path) -> bool {
     path.extension().is_some_and(|e| EXTENSIONS.contains(&e.to_string_lossy().to_lowercase().as_str()))
 }
 
+/// Decodes an image the right way up (a phone stores a photo on its side, with a tag
+/// saying which way to turn it), refusing one that needs more memory than `limits` allow.
+pub fn decode_upright<R: std::io::BufRead + std::io::Seek>(
+    mut reader: image::ImageReader<R>,
+    mut limits: image::Limits,
+) -> image::ImageResult<DynamicImage> {
+    use image::ImageDecoder;
+    reader.limits(limits.clone());
+    let mut decoder = reader.into_decoder()?;
+    // As ImageReader::decode does, which a decoder of its own doesn't do for itself
+    limits.reserve(decoder.total_bytes())?;
+    decoder.set_limits(limits)?;
+    let orientation = decoder.orientation().unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = DynamicImage::from_decoder(decoder)?;
+    image.apply_orientation(orientation);
+    Ok(image)
+}
+
 /// How images get drawn, chosen once at startup. A terminal multiplexer answers
 /// graphics queries itself even when the terminal around it can't show the result
 /// (herdr does inside GNOME Terminal), so inside one this keeps to half-blocks. The
@@ -286,6 +304,8 @@ pub struct Picture {
     center: (f32, f32),
     /// The view drawn last, and its protocol, rebuilt only when the view changes
     view: Option<(View, StatefulProtocol)>,
+    /// Where it was drawn last
+    area: Option<Rect>,
 }
 
 /// The part of the image on screen (in image pixels), where it was drawn, and at how
@@ -307,20 +327,38 @@ fn fit_within((w, h): (u32, u32), room: (f32, f32)) -> (u32, u32) {
     (((w * k).round() as u32).max(1), ((h * k).round() as u32).max(1))
 }
 
+/// How pictures are drawn with `picker`: whether they're scaled up to fill the pane, and
+/// the picker, with a cell size that can be believed.
+fn drawn_with(picker: &Picker) -> (bool, Picker) {
+    let fill = picker.protocol_type() == ProtocolType::Halfblocks;
+    let font = picker.font_size();
+    let picker = if sane_cell((font.width, font.height)) {
+        picker.clone()
+    } else {
+        #[allow(deprecated)]
+        let mut sane = Picker::from_fontsize(FontSize::new(10, 20));
+        sane.set_protocol_type(picker.protocol_type());
+        sane
+    };
+    (fill, picker)
+}
+
 impl Picture {
     pub fn new(image: DynamicImage, format: &str, picker: &Picker) -> Self {
         let info = format!("{}×{} {}", image.width(), image.height(), format.to_uppercase());
-        let fill = picker.protocol_type() == ProtocolType::Halfblocks;
-        let font = picker.font_size();
-        let picker = if sane_cell((font.width, font.height)) {
-            picker.clone()
-        } else {
-            #[allow(deprecated)]
-            let mut sane = Picker::from_fontsize(FontSize::new(10, 20));
-            sane.set_protocol_type(picker.protocol_type());
-            sane
-        };
-        Self { info, image, picker, fill, zoom: 1.0, center: (0.5, 0.5), view: None }
+        let (fill, picker) = drawn_with(picker);
+        Self { info, image, picker, fill, zoom: 1.0, center: (0.5, 0.5), view: None, area: None }
+    }
+
+    /// Zoomed in on the same part as `other`, a picture this one replaces.
+    pub fn keep_view(&mut self, other: &Picture) {
+        (self.zoom, self.center) = (other.zoom, other.center);
+    }
+
+    /// From now on drawn the way `picker` draws, without decoding the image again.
+    pub fn set_picker(&mut self, picker: &Picker) {
+        (self.fill, self.picker) = drawn_with(picker);
+        self.view = None;
     }
 
     fn cell(&self) -> (f32, f32) {
@@ -354,6 +392,7 @@ impl Picture {
         if area.width == 0 || area.height == 0 {
             return;
         }
+        self.area = Some(area);
         let view = self.layout(area);
         if self.view.as_ref().is_none_or(|(v, _)| v.crop != view.crop || v.at.as_size() != view.at.as_size()) {
             // Scaled straight to the screen's size from the part on view, so a big image
@@ -374,10 +413,17 @@ impl Picture {
         );
     }
 
+    /// The view the next frame will draw: wheel events and keys come faster than a big
+    /// image redraws, so the one drawn last can be several zooms or moves behind.
+    fn current(&mut self) -> Option<View> {
+        let area = self.area?;
+        Some(self.layout(area))
+    }
+
     /// Zooms by `factor`. With a screen cell, the part of the image under it stays put.
     pub fn zoom_by(&mut self, factor: f32, at: Option<(u16, u16)>) {
         let zoom = (self.zoom * factor).clamp(ZOOMS.0, ZOOMS.1);
-        if let (Some((x, y)), Some((view, _))) = (at, &self.view) {
+        if let (Some((x, y)), Some(view)) = (at, at.and_then(|_| self.current())) {
             let (cell_w, cell_h) = self.cell();
             let (width, height) = (self.image.width() as f32, self.image.height() as f32);
             // Screen pixels from the middle of the drawn image to the pointer
@@ -400,7 +446,7 @@ impl Picture {
 
     /// Moves the view by a fraction of its own size.
     pub fn pan(&mut self, across: f32, down: f32) {
-        let Some((view, _)) = &self.view else { return };
+        let Some(view) = self.current() else { return };
         let (_, _, w, h) = view.crop;
         self.center.0 += across * w as f32 / self.image.width().max(1) as f32;
         self.center.1 += down * h as f32 / self.image.height().max(1) as f32;
@@ -408,7 +454,7 @@ impl Picture {
 
     /// Moves the view with the mouse, by screen cells.
     pub fn drag(&mut self, cols: i32, rows: i32) {
-        let Some((view, _)) = &self.view else { return };
+        let Some(view) = self.current() else { return };
         let (cell_w, cell_h) = self.cell();
         self.center.0 -= cols as f32 * cell_w / view.scale / self.image.width().max(1) as f32;
         self.center.1 -= rows as f32 * cell_h / view.scale / self.image.height().max(1) as f32;
@@ -443,6 +489,21 @@ mod tests {
         assert!(late.swallows(&key('_', KeyModifiers::ALT)));
         assert!(!late.swallows(&key('q', KeyModifiers::NONE)));
         assert!(!late.swallows(&key('G', KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_huge_image_is_refused_before_it_takes_the_memory() {
+        // A BMP header saying 20000 × 20000 pixels, with none of them there
+        let mut bmp = b"BM".to_vec();
+        for field in [54u32, 0, 54, 40, 20_000, 20_000] {
+            bmp.extend(field.to_le_bytes());
+        }
+        bmp.extend(1u16.to_le_bytes());
+        bmp.extend(24u16.to_le_bytes());
+        bmp.extend([0; 24]);
+        let reader = image::ImageReader::with_format(std::io::Cursor::new(bmp), image::ImageFormat::Bmp);
+        let err = decode_upright(reader, image::Limits::default()).unwrap_err();
+        assert!(matches!(err, image::ImageError::Limits(_)), "{err}");
     }
 
     #[test]

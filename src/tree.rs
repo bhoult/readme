@@ -4,7 +4,7 @@
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    fs,
+    fs, io,
     path::{Path, PathBuf},
     rc::Rc,
     sync::{
@@ -32,6 +32,14 @@ type Listing = (Option<SystemTime>, Rc<Vec<Entry>>);
 /// Most entries the filter looks through
 const FILTER_LIMIT: usize = 100_000;
 
+/// Why the root couldn't move up a folder.
+pub enum NoWayUp {
+    /// It's at the top already
+    Top,
+    /// The folder above can't be listed, so there'd be no way back down from it
+    Unreadable(PathBuf, io::ErrorKind),
+}
+
 pub struct Row {
     /// For something inside an archive, the archive's path joined with the path within it
     pub path: PathBuf,
@@ -42,6 +50,8 @@ pub struct Row {
     pub archive: bool,
     /// A folder that's a git repository
     pub repo: bool,
+    /// The ".." row at the top, for the folder above the root
+    pub up: bool,
 }
 
 pub struct Tree {
@@ -51,6 +61,16 @@ pub struct Tree {
     pub scroll: usize,
     /// Show dotfiles and what .gitignore leaves out
     pub show_hidden: bool,
+    /// Whether the ignore rules of the folders above the root apply. Not when they leave
+    /// out the root itself, as a home folder kept in git with `*` in its .gitignore does
+    pub rules_above: bool,
+    /// How many entries at the top the hidden-file and ignore rules leave out
+    pub hidden: usize,
+    /// Why there's nothing at the top, when the root can't be read
+    pub unreadable: Option<io::ErrorKind>,
+    /// Everything at the top, counted for `hidden`, with the root and its modification
+    /// time then: counted again only when it changes, not at every refresh
+    counted: Option<(PathBuf, Option<SystemTime>, usize)>,
     /// Scroll the selection into view at the next draw, once the height is known
     pub scroll_to_selected: bool,
     /// What's typed in the filter box, while it's open
@@ -70,11 +90,15 @@ pub struct Tree {
 impl Tree {
     pub fn new(root: PathBuf) -> Self {
         let mut tree = Self {
+            rules_above: !ignored_from_above(&root),
             root,
             rows: Vec::new(),
             selected: 0,
             scroll: 0,
             show_hidden: false,
+            hidden: 0,
+            unreadable: None,
+            counted: None,
             scroll_to_selected: false,
             filter: None,
             marks: HashSet::new(),
@@ -85,6 +109,8 @@ impl Tree {
             archives: RefCell::default(),
         };
         tree.rebuild();
+        // The first entry rather than ".."
+        tree.selected = tree.rows.iter().position(|r| !r.up).unwrap_or(0);
         tree
     }
 
@@ -95,7 +121,24 @@ impl Tree {
         let mut rows = Vec::new();
         match self.filter.clone().filter(|q| !q.trim().is_empty()) {
             Some(query) => self.filtered_into(&query, &mut rows),
-            None => self.list_into(&self.root, 0, &mut rows),
+            None => {
+                if let Some(parent) = self.root.parent() {
+                    let path = parent.to_path_buf();
+                    rows.push(Row {
+                        path,
+                        name: "..".into(),
+                        is_dir: true,
+                        depth: 0,
+                        archive: false,
+                        repo: false,
+                        up: true,
+                    });
+                }
+                self.list_into(&self.root, 0, &mut rows);
+                let shown = rows.iter().filter(|r| r.depth == 0 && !r.up).count();
+                self.unreadable = if shown == 0 { fs::read_dir(&self.root).err().map(|e| e.kind()) } else { None };
+                self.hidden = if self.show_hidden { 0 } else { self.count_top().saturating_sub(shown) };
+            }
         }
         self.rows = rows;
         if let Some(i) = selected.and_then(|p| self.rows.iter().position(|r| r.path == p)) {
@@ -103,12 +146,32 @@ impl Tree {
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         // Only what's on view stays marked, so nothing hidden gets moved or deleted
-        let shown: HashSet<&PathBuf> = self.rows.iter().map(|r| &r.path).collect();
+        let shown: HashSet<&PathBuf> = self.rows.iter().filter(|r| !r.up).map(|r| &r.path).collect();
         self.marks.retain(|p| shown.contains(p));
     }
 
+    /// The selected row, unless it's "..".
+    pub fn selected_entry(&self) -> Option<&Row> {
+        self.rows.get(self.selected).filter(|r| !r.up)
+    }
+
+    /// How many entries the root has, hidden or not.
+    fn count_top(&mut self) -> usize {
+        let modified = fs::metadata(&self.root).and_then(|m| m.modified()).ok();
+        if let Some((root, when, total)) = &self.counted
+            && *root == self.root
+            && modified.is_some()
+            && *when == modified
+        {
+            return *total;
+        }
+        let total = fs::read_dir(&self.root).map_or(0, Iterator::count);
+        self.counted = Some((self.root.clone(), modified, total));
+        total
+    }
+
     pub fn toggle_mark(&mut self, i: usize) {
-        let Some(row) = self.rows.get(i) else { return };
+        let Some(row) = self.rows.get(i).filter(|r| !r.up) else { return };
         if !self.marks.remove(&row.path) {
             self.marks.insert(row.path.clone());
         }
@@ -121,19 +184,21 @@ impl Tree {
         let anchor = self.anchor.get_or_insert_with(|| row.path.clone()).clone();
         let start = self.rows.iter().position(|r| r.path == anchor).unwrap_or(self.selected);
         let (from, to) = (start.min(self.selected), start.max(self.selected));
-        self.marks = self.rows[from..=to].iter().map(|r| r.path.clone()).collect();
+        self.marks = self.rows[from..=to].iter().filter(|r| !r.up).map(|r| r.path.clone()).collect();
     }
 
     /// What a move or delete applies to: the marked rows in tree order, or else the
-    /// selected one. A marked folder takes everything in it along, so marked rows inside
-    /// it aren't listed again (they'd be gone by the time their turn came).
+    /// selected one, never "..". A marked folder takes everything in it along, so marked
+    /// rows inside it aren't listed again (they'd be gone by the time their turn came).
     pub fn marked_or_selected(&self) -> Vec<PathBuf> {
         if self.marks.is_empty() {
-            return self.rows.get(self.selected).map(|r| r.path.clone()).into_iter().collect();
+            return self.selected_entry().map(|r| r.path.clone()).into_iter().collect();
         }
         self.rows
             .iter()
-            .filter(|r| self.marks.contains(&r.path) && !r.path.ancestors().skip(1).any(|a| self.marks.contains(a)))
+            .filter(|r| {
+                !r.up && self.marks.contains(&r.path) && !r.path.ancestors().skip(1).any(|a| self.marks.contains(a))
+            })
             .map(|r| r.path.clone())
             .collect()
     }
@@ -152,13 +217,14 @@ impl Tree {
     }
 
     fn list_into(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
-        for (path, is_dir) in list_dir(dir, self.show_hidden) {
+        let top = (!self.rules_above).then_some(self.root.as_path());
+        for (path, is_dir) in list_dir(dir, self.show_hidden, top) {
             let name =
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let archive = !is_dir && archive::is_archive(&path);
             let open = (is_dir || archive) && self.expanded.contains(&path);
             let repo = is_dir && path.join(".git").exists();
-            rows.push(Row { path: path.clone(), name, is_dir: is_dir || archive, depth, archive, repo });
+            rows.push(Row { path: path.clone(), name, is_dir: is_dir || archive, depth, archive, repo, up: false });
             if open && archive {
                 self.list_archive(&path, "", depth + 1, rows);
             } else if open {
@@ -177,7 +243,7 @@ impl Tree {
             let path = archive.join(&entry.path);
             let name = entry.path.rsplit('/').next().unwrap_or(&entry.path).to_string();
             let open = entry.is_dir && self.expanded.contains(&path);
-            rows.push(Row { path, name, is_dir: entry.is_dir, depth, archive: false, repo: false });
+            rows.push(Row { path, name, is_dir: entry.is_dir, depth, archive: false, repo: false, up: false });
             if open {
                 self.list_archive(archive, &entry.path, depth + 1, rows);
             }
@@ -190,7 +256,12 @@ impl Tree {
         if let Some((_, entries)) = cache.get(archive).filter(|(when, _)| *when == modified) {
             return entries.clone();
         }
-        let entries = Rc::new(archive::list(archive).unwrap_or_default());
+        // One that can't be read says why, rather than looking empty; opening the row
+        // says it again
+        let entries = Rc::new(archive::list(archive).unwrap_or_else(|e| {
+            let why = format!("… can't read it: {e:#}").replace('/', "∕");
+            vec![Entry { path: why, is_dir: false }]
+        }));
         cache.insert(archive.to_path_buf(), (modified, entries.clone()));
         entries
     }
@@ -198,8 +269,8 @@ impl Tree {
     /// Every file under the root whose path holds all the words of `query`, with the
     /// directories leading to them.
     fn filtered_into(&mut self, query: &str, rows: &mut Vec<Row>) {
-        let (root, all, limit) = (&self.root, self.show_hidden, self.filter_limit);
-        let everything = self.everything.get_or_insert_with(|| walk_all(root, all, limit));
+        let (root, all, above, limit) = (&self.root, self.show_hidden, self.rules_above, self.filter_limit);
+        let everything = self.everything.get_or_insert_with(|| walk_all(root, all, above, limit));
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut keep: HashSet<&Path> = HashSet::new();
         for (path, _) in everything.iter() {
@@ -227,7 +298,8 @@ impl Tree {
                     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
                 let archive = !is_dir && archive::is_archive(path);
                 let repo = is_dir && path.join(".git").exists();
-                rows.push(Row { path: path.to_path_buf(), name, is_dir: is_dir || archive, depth, archive, repo });
+                let is_dir = is_dir || archive;
+                rows.push(Row { path: path.to_path_buf(), name, is_dir, depth, archive, repo, up: false });
                 if is_dir {
                     add(path, depth + 1, children, rows);
                 }
@@ -270,11 +342,11 @@ impl Tree {
     /// Whether a row is unfolded. While filtering, directories always are, but
     /// archives aren't looked into.
     pub fn is_open(&self, row: &Row) -> bool {
-        if self.filtering() { !row.archive && row.is_dir } else { self.expanded.contains(&row.path) }
+        if self.filtering() { !row.archive && row.is_dir } else { !row.up && self.expanded.contains(&row.path) }
     }
 
     pub fn toggle(&mut self, i: usize) {
-        let Some(row) = self.rows.get(i).filter(|r| r.is_dir) else { return };
+        let Some(row) = self.rows.get(i).filter(|r| r.is_dir && !r.up) else { return };
         if !self.expanded.remove(&row.path) {
             self.expanded.insert(row.path.clone());
         }
@@ -292,6 +364,27 @@ impl Tree {
                 self.selected = parent;
             }
         }
+    }
+
+    /// Makes the folder above the root the root, with the old one open and selected. If
+    /// the old one is hidden there (a dotfolder, or one .gitignore leaves out), hidden
+    /// files show, so it doesn't vanish from under the selection.
+    pub fn up(&mut self) -> Result<(), NoWayUp> {
+        let Some(parent) = self.root.parent().map(Path::to_path_buf) else { return Err(NoWayUp::Top) };
+        if let Err(e) = fs::read_dir(&parent) {
+            return Err(NoWayUp::Unreadable(parent, e.kind()));
+        }
+        let below = std::mem::replace(&mut self.root, parent);
+        self.rules_above = !ignored_from_above(&self.root);
+        self.everything = None;
+        self.expanded.insert(below.clone());
+        self.reveal(&below);
+        if !self.show_hidden && self.rows.get(self.selected).is_none_or(|r| r.path != below) {
+            self.show_hidden = true;
+            self.refresh();
+            self.reveal(&below);
+        }
+        Ok(())
     }
 
     /// Opens the directories down to `path` and selects it.
@@ -322,11 +415,12 @@ impl Tree {
 
 /// Everything under `root`, for the filter, read on all the cores. Unless `all`,
 /// this leaves out what the tree hides, and SKIP_DIRS too.
-fn walk_all(root: &Path, all: bool, limit: usize) -> Vec<(PathBuf, bool)> {
+fn walk_all(root: &Path, all: bool, rules_above: bool, limit: usize) -> Vec<(PathBuf, bool)> {
     let found = Mutex::new(Vec::new());
     let count = AtomicUsize::new(0);
     WalkBuilder::new(root)
         .standard_filters(!all)
+        .parents(!all && rules_above)
         .filter_entry(move |e| all || e.depth() == 0 || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref()))
         .threads(cores())
         .build_parallel()
@@ -350,14 +444,55 @@ fn walk_all(root: &Path, all: bool, limit: usize) -> Vec<(PathBuf, bool)> {
     found.into_inner().unwrap_or_default()
 }
 
-/// A directory's entries, directories first, honoring .gitignore unless `all`.
-fn list_dir(dir: &Path, all: bool) -> Vec<(PathBuf, bool)> {
-    let mut entries: Vec<(PathBuf, bool)> = WalkBuilder::new(dir)
+/// Whether the ignore rules of the folders above `dir` leave it out, as a home folder
+/// kept in git with `*` in its .gitignore does to everything in it.
+fn ignored_from_above(dir: &Path) -> bool {
+    let Some(parent) = dir.parent() else { return false };
+    // Only a repository or an .ignore file above has rules for it
+    if !parent.ancestors().any(|a| a.join(".git").exists() || a.join(".ignore").exists()) {
+        return false;
+    }
+    // A folder above that can't be listed can't say, and the walk would find nothing
+    if fs::read_dir(parent).is_err() {
+        return false;
+    }
+    let wanted = dir.to_path_buf();
+    // A dotfile isn't left out by a rule
+    !WalkBuilder::new(parent)
         .max_depth(Some(1))
-        .standard_filters(!all)
+        .hidden(false)
+        .filter_entry(move |e| e.depth() == 0 || e.path() == wanted)
         .build()
         .filter_map(Result::ok)
-        .filter(|e| e.depth() == 1)
+        .any(|e| e.depth() == 1)
+}
+
+/// A directory's entries, directories first, honoring .gitignore unless `all`. Given
+/// `top`, a folder that `dir` is in, only the rules from `top` down apply.
+fn list_dir(dir: &Path, all: bool, top: Option<&Path>) -> Vec<(PathBuf, bool)> {
+    // The rules are picked up on the way down, so the walk starts at `top`, though it looks
+    // into nothing but the folders on the way to `dir`. It doesn't go through symlinks, so
+    // beyond one, only the rules from `dir` down apply.
+    let from = top
+        .filter(|top| {
+            dir.strip_prefix(top)
+                .is_ok_and(|rel| rel.ancestors().all(|a| a.as_os_str().is_empty() || !top.join(a).is_symlink()))
+        })
+        .unwrap_or(dir);
+    let depth = dir.strip_prefix(from).map_or(0, |rel| rel.components().count());
+    let mut walk = WalkBuilder::new(from);
+    walk.max_depth(Some(depth + 1)).standard_filters(!all);
+    if top.is_some() {
+        walk.parents(false);
+    }
+    if depth > 0 {
+        let dir = dir.to_path_buf();
+        walk.filter_entry(move |e| dir.starts_with(e.path()) || e.path().parent() == Some(dir.as_path()));
+    }
+    let mut entries: Vec<(PathBuf, bool)> = walk
+        .build()
+        .filter_map(Result::ok)
+        .filter(|e| e.depth() == depth + 1)
         .map(|e| {
             let is_dir = e.file_type().is_some_and(|t| t.is_dir()) || (e.path_is_symlink() && e.path().is_dir());
             (e.into_path(), is_dir)
@@ -387,20 +522,24 @@ mod tests {
 
         let mut tree = Tree::new(root.to_path_buf());
         let names: Vec<&str> = tree.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec!["src", "A.md", "b.md"]);
+        assert_eq!(names, vec!["..", "src", "A.md", "b.md"]);
+        assert_eq!(tree.selected, 1);
+        // .git, .gitignore and target
+        assert_eq!(tree.hidden, 3);
 
         tree.reveal(&root.join("src/main.rs"));
         let names: Vec<(&str, usize)> = tree.rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
-        assert_eq!(names, vec![("src", 0), ("main.rs", 1), ("A.md", 0), ("b.md", 0)]);
-        assert_eq!(tree.selected, 1);
+        assert_eq!(names, vec![("..", 0), ("src", 0), ("main.rs", 1), ("A.md", 0), ("b.md", 0)]);
+        assert_eq!(tree.selected, 2);
 
         tree.collapse_or_parent();
-        assert_eq!(tree.selected, 0);
+        assert_eq!(tree.selected, 1);
 
         tree.show_hidden = true;
         tree.rebuild();
         let names: Vec<&str> = tree.rows.iter().map(|r| r.name.as_str()).collect();
-        assert_eq!(names, vec![".git", "src", "main.rs", "target", ".gitignore", "A.md", "b.md"]);
+        assert_eq!(names, vec!["..", ".git", "src", "main.rs", "target", ".gitignore", "A.md", "b.md"]);
+        assert_eq!(tree.hidden, 0);
 
         tree.collapse_or_parent();
         assert!(tree.rows.iter().all(|r| r.name != "main.rs"));
@@ -415,8 +554,130 @@ mod tests {
         fs::write(root.join("z.txt"), "").unwrap();
         let mut tree = Tree::new(root.to_path_buf());
         tree.reveal(&root.join("docs/a.md"));
-        tree.marks = tree.rows.iter().map(|r| r.path.clone()).collect();
+        tree.marks = tree.rows.iter().filter(|r| !r.up).map(|r| r.path.clone()).collect();
         assert_eq!(tree.marked_or_selected(), vec![root.join("docs"), root.join("z.txt")]);
+    }
+
+    #[test]
+    fn up_moves_the_root_and_dot_dot_is_never_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = dir.path();
+        fs::create_dir_all(top.join("a/b")).unwrap();
+        fs::write(top.join("a/b/inner.txt"), "").unwrap();
+        fs::write(top.join("a/beside.txt"), "").unwrap();
+        let mut tree = Tree::new(top.join("a/b"));
+        assert!(tree.up().is_ok());
+        assert_eq!(tree.root, top.join("a"));
+        let rows: Vec<(&str, usize)> = tree.rows.iter().map(|r| (r.name.as_str(), r.depth)).collect();
+        assert_eq!(rows, vec![("..", 0), ("b", 0), ("inner.txt", 1), ("beside.txt", 0)]);
+        // The folder it came from is still open, and selected
+        assert_eq!(tree.rows[tree.selected].name, "b");
+
+        // ".." can't be marked, or picked for a move or delete
+        tree.selected = 0;
+        assert!(tree.marked_or_selected().is_empty());
+        tree.toggle_mark(0);
+        assert!(tree.marks.is_empty());
+        tree.selected = 3;
+        tree.anchor = Some(top.to_path_buf());
+        tree.mark_range();
+        assert!(!tree.marks.contains(top) && tree.marks.len() == 3);
+        tree.toggle(0);
+        assert_eq!(tree.root, top.join("a"));
+
+        // At the very top there's no ".."
+        let mut tree = Tree::new(PathBuf::from("/"));
+        assert!(tree.rows.iter().all(|r| !r.up));
+        assert!(matches!(tree.up(), Err(NoWayUp::Top)));
+    }
+
+    #[test]
+    fn up_keeps_a_way_back() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A folder that can be gone through but not listed, as home folders often are
+        let locked = dir.path().join("home");
+        let inside = locked.join("public");
+        fs::create_dir_all(&inside).unwrap();
+        fs::write(inside.join("index.html"), "").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o311)).unwrap();
+        let mut tree = Tree::new(inside.clone());
+        let went = tree.up();
+        let listable = fs::read_dir(&locked).is_ok();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+        // Unless the tests run as root, which can list anything
+        if !listable {
+            assert!(matches!(went, Err(NoWayUp::Unreadable(..))));
+            assert_eq!(tree.root, inside);
+        }
+
+        // Up from a dotfolder, hidden files show so it's still there
+        let dot = dir.path().join("top/.config");
+        fs::create_dir_all(&dot).unwrap();
+        fs::write(dot.join("settings.toml"), "").unwrap();
+        let mut tree = Tree::new(dot.clone());
+        assert!(tree.up().is_ok());
+        assert!(tree.show_hidden);
+        assert_eq!(tree.rows[tree.selected].path, dot);
+    }
+
+    #[test]
+    fn a_folder_that_rules_above_leave_out_still_shows() {
+        // A home folder kept in git, ignoring everything it doesn't track
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        fs::create_dir(home.join(".git")).unwrap();
+        fs::write(home.join(".gitignore"), "*\n").unwrap();
+        let root = home.join("notes");
+        for path in ["todo.md", "sub/deep.txt", "sub/scratch.tmp", "repo/keep.rs", "repo/build.log"] {
+            fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            fs::write(root.join(path), "").unwrap();
+        }
+        // Rules inside the root still count, from the root down
+        fs::write(root.join(".ignore"), "*.tmp\n").unwrap();
+        fs::create_dir(root.join("repo/.git")).unwrap();
+        fs::write(root.join("repo/.gitignore"), "*.log\n").unwrap();
+
+        let mut tree = Tree::new(root.clone());
+        assert!(!tree.rules_above);
+        tree.reveal(&root.join("sub/deep.txt"));
+        tree.reveal(&root.join("repo/keep.rs"));
+        let names: Vec<&str> = tree.rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["..", "repo", "keep.rs", "sub", "deep.txt", "todo.md"]);
+        tree.set_filter(Some("e".into()));
+        let names: Vec<&str> = tree.rows.iter().filter(|r| !r.is_dir).map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["keep.rs", "deep.txt"]);
+        tree.set_filter(None);
+
+        // Up in the home folder its rules apply again, so the folder that was the root would
+        // be left out, and hidden files show to keep it in view
+        assert!(tree.up().is_ok());
+        assert!(tree.rules_above);
+        assert!(tree.show_hidden);
+        assert_eq!(tree.rows[tree.selected].path, root);
+        assert_eq!(tree.unreadable, None);
+        // Hiding them again, the header says how much the rules leave out
+        tree.show_hidden = false;
+        tree.refresh();
+        assert!(tree.rows.iter().all(|r| r.up));
+        assert_eq!(tree.hidden, 3);
+    }
+
+    #[test]
+    fn a_folder_that_cant_be_read_says_so() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("locked");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("secret.txt"), "").unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000)).unwrap();
+        let tree = Tree::new(root.clone());
+        let readable = fs::read_dir(&root).is_ok();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        // Unless the tests run as root, which can read anything
+        if !readable {
+            assert_eq!(tree.unreadable, Some(io::ErrorKind::PermissionDenied));
+        }
     }
 
     #[test]

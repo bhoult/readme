@@ -66,8 +66,8 @@ pub struct Grep {
 
 impl Grep {
     /// Starts searching for `query` under `root`. With `all`, hidden and ignored files
-    /// are searched too.
-    pub fn start(root: &Path, query: &str, all: bool) -> Self {
+    /// are searched too. Without `rules_above`, the ignore rules come only from `root` down.
+    pub fn start(root: &Path, query: &str, all: bool, rules_above: bool) -> Self {
         let (sender, found) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let searched = Arc::new(AtomicUsize::new(0));
@@ -82,6 +82,7 @@ impl Grep {
             let needle = if fold { fold_case(&query_owned) } else { query_owned.clone() };
             WalkBuilder::new(&root)
                 .standard_filters(!all)
+                .parents(!all && rules_above)
                 .filter_entry(move |e| {
                     all || e.depth() == 0 || !SKIP_DIRS.contains(&e.file_name().to_string_lossy().as_ref())
                 })
@@ -252,8 +253,10 @@ fn search_file(path: &Path, query: &str, needle: &str, fold: bool) -> Searched {
         return Searched::Nothing;
     }
     let text = String::from_utf8_lossy(&bytes);
+    // A byte order mark isn't part of the text, and the editor's columns don't count it
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     // Most files don't have it at all, which one look at the whole text tells
-    let present = if fold { fold_case(&text).contains(needle) } else { text.contains(needle) };
+    let present = if fold { fold_case(text).contains(needle) } else { text.contains(needle) };
     if !present {
         return Searched::Nothing;
     }
@@ -298,7 +301,7 @@ mod tests {
         fs::write(root.join("blob.bin"), b"hello\0binary").unwrap();
         fs::write(root.join("other.txt"), "goodbye\n").unwrap();
 
-        let grep = finish(Grep::start(root, "hello", false));
+        let grep = finish(Grep::start(root, "hello", false, true));
         let found: Vec<(String, Vec<(usize, usize)>)> = grep
             .files
             .iter()
@@ -311,7 +314,7 @@ mod tests {
         assert_eq!(grep.matches(), 3);
 
         // A capital makes case matter
-        let grep = finish(Grep::start(root, "Hello", false));
+        let grep = finish(Grep::start(root, "Hello", false, true));
         assert_eq!(grep.files.len(), 1);
         assert_eq!(grep.files[0].hits.len(), 1);
     }
@@ -321,7 +324,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.txt"), "x\nx\n").unwrap();
         fs::write(dir.path().join("b.txt"), "x\n").unwrap();
-        let mut grep = finish(Grep::start(dir.path(), "x", false));
+        let mut grep = finish(Grep::start(dir.path(), "x", false, true));
         assert_eq!(grep.selected_row(), 1);
         grep.step(2);
         assert_eq!(grep.selected, (1, 0));
@@ -344,7 +347,7 @@ mod tests {
         fs::write(root.join("big.txt"), "needle\n".repeat(2 << 20)).unwrap();
         fs::write(root.join("big.bin"), [b"needle\0".as_slice(), &vec![b'x'; 11 << 20]].concat()).unwrap();
 
-        let grep = finish(Grep::start(root, "needle", false));
+        let grep = finish(Grep::start(root, "needle", false, true));
         assert_eq!(grep.files.len(), 1);
         let hit = &grep.files[0].hits[0];
         assert_eq!(hit.col, 5000);
@@ -354,7 +357,7 @@ mod tests {
         assert_eq!(grep.rows(), 3);
 
         for query in ["οδοσ", "istanbul"] {
-            let grep = finish(Grep::start(root, query, false));
+            let grep = finish(Grep::start(root, query, false, true));
             assert_eq!(grep.files.len(), 1, "{query}");
             assert_eq!(grep.files[0].hits.len(), 1, "{query}");
         }

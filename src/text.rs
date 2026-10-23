@@ -1,17 +1,19 @@
 //! Column arithmetic for terminal text (tabs, wide characters), search, and
 //! turning a source line into styled spans.
 
-use std::ops::Range;
+use std::{borrow::Cow, ops::Range};
 
 use ratatui::{
     style::Style,
     text::{Line, Span},
 };
-use unicode_width::UnicodeWidthChar;
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 pub const TAB_WIDTH: usize = 4;
 
-/// Screen columns `c` takes when it starts at column `col`; a tab runs to the next tab stop.
+/// Screen columns `c` takes on its own when it starts at column `col`; a tab runs to
+/// the next tab stop.
 pub fn char_cols(c: char, col: usize) -> usize {
     if c == '\t' {
         TAB_WIDTH - col % TAB_WIDTH
@@ -22,33 +24,88 @@ pub fn char_cols(c: char, col: usize) -> usize {
     }
 }
 
+/// Screen columns a grapheme takes from column `col`: a character with whatever joins
+/// onto it (accents, an emoji's skin tone or presentation, a family joined by ZWJs),
+/// measured whole, as ratatui lays it out.
+fn grapheme_cols(g: &str, col: usize) -> usize {
+    match g.chars().next() {
+        Some(c) if c == '\t' || c.is_control() => char_cols(c, col),
+        _ => g.width(),
+    }
+}
+
+/// Each char of `s` with its byte offset and the columns it takes, from column `col`
+/// on. A grapheme's columns all go to its first char; what joins onto it takes none.
+pub fn cells(s: &str, mut col: usize) -> impl Iterator<Item = (usize, char, usize)> + '_ {
+    s.grapheme_indices(true).flat_map(move |(byte, g)| {
+        let width = grapheme_cols(g, col);
+        col += width;
+        g.char_indices().map(move |(i, c)| (byte + i, c, if i == 0 { width } else { 0 }))
+    })
+}
+
 /// The screen column where char `idx` of `line` starts.
 pub fn display_col(line: &str, idx: usize) -> usize {
-    line.chars().take(idx).fold(0, |col, c| col + char_cols(c, col))
+    display_col_from(line, Place::default(), idx)
+}
+
+/// The screen column where char `idx` of `line` starts, counted from `from`, a place
+/// at or before it.
+pub fn display_col_from(line: &str, from: Place, idx: usize) -> usize {
+    let rest = &line[from.byte.min(line.len())..];
+    from.col + cells(rest, from.col).take(idx.saturating_sub(from.char)).map(|(_, _, w)| w).sum::<usize>()
 }
 
 /// The char of `line` under screen column `target`, or the end of the line if it's shorter.
 pub fn char_at_col(line: &str, target: usize) -> usize {
-    let mut col = 0;
-    for (i, c) in line.chars().enumerate() {
-        let w = char_cols(c, col);
+    char_at_col_from(line, Place::default(), target)
+}
+
+/// The char of `line` under screen column `target`, looked for from `from`, a place at
+/// or before it; the end of the line if it's shorter.
+pub fn char_at_col_from(line: &str, from: Place, target: usize) -> usize {
+    let (mut col, mut count) = (from.col, from.char);
+    for (i, (_, _, w)) in cells(&line[from.byte.min(line.len())..], from.col).enumerate() {
         if w > 0 && target < col + w {
-            return i;
+            return from.char + i;
         }
         col += w;
+        count = from.char + i + 1;
     }
-    line.chars().count()
+    count
 }
 
 pub fn str_width(s: &str) -> usize {
-    display_col(s, usize::MAX)
+    cells(s, 0).map(|(_, _, w)| w).sum()
+}
+
+/// Whether `s` takes more than `cols` columns, found out without measuring all of a long line.
+pub fn wider_than(s: &str, cols: usize) -> bool {
+    let mut col = 0;
+    cells(s, 0).any(|(_, _, w)| {
+        col += w;
+        col > cols
+    })
+}
+
+/// The end of `s` that fits in `width` columns.
+pub fn tail_width(s: &str, width: usize) -> &str {
+    let (mut col, mut start) = (0, s.len());
+    for (byte, g) in s.grapheme_indices(true).rev() {
+        col += grapheme_cols(g, 0);
+        if col > width {
+            break;
+        }
+        start = byte;
+    }
+    &s[start..]
 }
 
 /// Splits `s` after at most `width` columns.
 pub fn split_at_width(s: &str, width: usize) -> (&str, &str) {
     let mut col = 0;
-    for (i, c) in s.char_indices() {
-        col += char_cols(c, col);
+    for (i, _, w) in cells(s, 0) {
+        col += w;
         if col > width {
             return s.split_at(i);
         }
@@ -56,30 +113,56 @@ pub fn split_at_width(s: &str, width: usize) -> (&str, &str) {
     (s, "")
 }
 
-/// The chars where each screen row of `line` starts when it's wrapped to `width`
-/// columns, breaking after a space where there is one.
-pub fn wrap_points(line: &str, width: usize) -> Vec<usize> {
-    let width = width.max(1);
-    let chars: Vec<char> = line.chars().collect();
-    // Start column of each char, then the end of the line
-    let mut cols = Vec::with_capacity(chars.len() + 1);
-    let mut col = 0;
-    for &c in &chars {
-        cols.push(col);
-        col += char_cols(c, col);
+/// Text as it can be shown: a tab as spaces, and other control characters (which the
+/// terminal would act on, and ratatui leaves out) as �.
+pub fn printable(text: &str) -> Cow<'_, str> {
+    if !text.chars().any(|c| c.is_control() && c != '\n') {
+        return Cow::Borrowed(text);
     }
-    cols.push(col);
-    let mut starts = vec![0];
-    let mut row = 0;
-    let mut after_space = None;
-    for i in 0..chars.len() {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\t' => out.push_str(&" ".repeat(TAB_WIDTH)),
+            '\n' => out.push(c),
+            c if c.is_control() => out.push('\u{fffd}'),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// A place in a line: a char, the byte it starts at, and the screen column it's in.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Place {
+    pub char: usize,
+    pub byte: usize,
+    pub col: usize,
+}
+
+/// Where each screen row of `line` starts when it's wrapped to `width` columns,
+/// breaking after a space where there is one. Worked out in one pass, without a copy of
+/// the line, since a line can be megabytes long.
+pub fn wrap_points(line: &str, width: usize) -> Vec<Place> {
+    let width = width.max(1);
+    let mut starts = vec![Place::default()];
+    let mut row = Place::default();
+    let mut after_space: Option<Place> = None;
+    let mut col = 0;
+    for (i, (byte, c, w)) in cells(line, 0).enumerate() {
+        let here = Place { char: i, byte, col };
+        col += w;
         // Spaces never start a row; they hang off the end of the one before
-        if chars[i] == ' ' || chars[i] == '\t' {
-            after_space = Some(i + 1);
+        if c == ' ' || c == '\t' {
+            after_space = Some(Place { char: i + 1, byte: byte + c.len_utf8(), col });
             continue;
         }
-        while cols[i + 1] - cols[row] > width && i > row {
-            let at = after_space.filter(|&s| s > row && s <= i).unwrap_or(i);
+        // Nor does what joins onto a character (an emoji's skin tone, an accent): a
+        // character too wide for the row goes on it whole, and the next starts the next
+        if w == 0 {
+            continue;
+        }
+        while col - row.col > width && i > row.char {
+            let at = after_space.filter(|s| s.char > row.char && s.char <= i).unwrap_or(here);
             starts.push(at);
             row = at;
             after_space = None;
@@ -89,8 +172,8 @@ pub fn wrap_points(line: &str, width: usize) -> Vec<usize> {
 }
 
 /// Which row (from `wrap_points`) char `col` falls in.
-pub fn row_of(starts: &[usize], col: usize) -> usize {
-    starts.partition_point(|&s| s <= col).saturating_sub(1)
+pub fn row_of(starts: &[Place], col: usize) -> usize {
+    starts.partition_point(|s| s.char <= col).saturating_sub(1)
 }
 
 /// A styled line scrolled `left` columns sideways, except for its first `keep`
@@ -102,11 +185,11 @@ pub fn slice_line(line: &Line<'static>, keep: usize, left: usize) -> Line<'stati
     let mut spans = Vec::new();
     let mut col = 0;
     for span in &line.spans {
-        for c in span.content.chars() {
+        for g in span.content.graphemes(true) {
             let start = col;
-            col += char_cols(c, col);
+            col += grapheme_cols(g, col);
             if start < keep || start >= keep + left {
-                push_span(&mut spans, c.encode_utf8(&mut [0; 4]), span.style);
+                push_span(&mut spans, g, span.style);
             } else if col > keep + left {
                 // A wide character cut by the edge
                 push_span(&mut spans, " ", span.style);
@@ -193,51 +276,64 @@ pub fn push_span(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
 
 /// The visible part of a source line, `width` columns from column `left`: syntax colors
 /// from `colors` (byte ranges), tabs expanded, and `marks` (char ranges with an overlay
-/// style) on top. A mark that ends at `usize::MAX` also covers one cell past the end of
-/// the line, so a selection that runs on to the next line shows.
+/// style, later ones on top) over them. The line is read from `from` on, a place at or
+/// before the view, so a wrapped row doesn't go through the whole line before it. A mark
+/// that ends at `usize::MAX` also covers one cell past the end of the line, so a
+/// selection that runs on to the next line shows.
 pub fn line_spans(
     line: &str,
     colors: &[(Style, Range<usize>)],
+    from: Place,
     left: usize,
     width: usize,
     marks: &[(usize, usize, Style)],
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     let mut colors = colors.iter().peekable();
-    let overlay = |idx: usize, base: Style| {
-        marks.iter().filter(|(s, e, _)| idx >= *s && idx < *e).fold(base, |style, (_, _, mark)| style.patch(*mark))
-    };
-    let mut col = 0;
+    // The marks in the order they start, each with its place in `marks`; only those
+    // reached and not yet over are looked at, as a long line can have thousands
+    let mut order: Vec<(usize, &(usize, usize, Style))> = marks.iter().enumerate().collect();
+    order.sort_by_key(|(_, m)| m.0);
+    let (mut next, mut active) = (0, Vec::new());
+    let (mut col, mut idx) = (from.col, from.char);
     let mut cut_off = false;
-    for (idx, (byte, c)) in line.char_indices().enumerate() {
+    for (offset, g) in line[from.byte.min(line.len())..].grapheme_indices(true) {
         if col >= left + width {
             cut_off = true;
             break;
+        }
+        let (byte, at) = (from.byte + offset, idx);
+        idx += g.chars().count();
+        let (start, end) = (col, col + grapheme_cols(g, col));
+        col = end;
+        if end <= left {
+            continue;
         }
         while colors.peek().is_some_and(|(_, r)| r.end <= byte) {
             colors.next();
         }
         let base = colors.peek().filter(|(_, r)| r.start <= byte).map(|(s, _)| *s).unwrap_or_default();
-        let style = overlay(idx, base);
-        let (start, end) = (col, col + char_cols(c, col));
-        col = end;
-        if end <= left {
-            continue;
+        while next < order.len() && order[next].1.0 <= at {
+            active.push(order[next]);
+            next += 1;
         }
+        active.retain(|(_, m)| m.1 > at);
+        active.sort_by_key(|(n, _)| *n);
+        let style = active.iter().fold(base, |style, (_, (_, _, mark))| style.patch(*mark));
         let visible = end.min(left + width).saturating_sub(start.max(left));
-        if c == '\t' || start < left || end > left + width {
+        let first = g.chars().next().unwrap_or(' ');
+        if first == '\t' || start < left || end > left + width {
             push_span(&mut spans, &" ".repeat(visible), style);
-        } else if c.is_control() {
+        } else if first.is_control() {
             push_span(&mut spans, "\u{fffd}", style);
         } else {
-            push_span(&mut spans, c.encode_utf8(&mut [0; 4]), style);
+            push_span(&mut spans, g, style);
         }
     }
-    let len = line.chars().count();
     if !cut_off
         && col >= left
         && col < left + width
-        && let Some((_, _, mark)) = marks.iter().find(|(s, e, _)| *e == usize::MAX && *s <= len)
+        && let Some((_, _, mark)) = marks.iter().find(|(s, e, _)| *e == usize::MAX && *s <= idx)
     {
         push_span(&mut spans, " ", Style::default().patch(*mark));
     }
@@ -261,14 +357,47 @@ mod tests {
 
     #[test]
     fn wraps_after_spaces() {
-        assert_eq!(wrap_points("hello world foo", 11), vec![0, 12]);
-        assert_eq!(wrap_points("hello world foo", 6), vec![0, 6, 12]);
-        assert_eq!(wrap_points("abcdefghij", 4), vec![0, 4, 8]);
-        assert_eq!(wrap_points("ab", 10), vec![0]);
-        assert_eq!(wrap_points("", 10), vec![0]);
-        assert_eq!(row_of(&[0, 6, 12], 5), 0);
-        assert_eq!(row_of(&[0, 6, 12], 6), 1);
-        assert_eq!(row_of(&[0, 6, 12], 20), 2);
+        let chars = |line: &str, width| wrap_points(line, width).iter().map(|p| p.char).collect::<Vec<_>>();
+        assert_eq!(chars("hello world foo", 11), vec![0, 12]);
+        assert_eq!(chars("hello world foo", 6), vec![0, 6, 12]);
+        assert_eq!(chars("abcdefghij", 4), vec![0, 4, 8]);
+        assert_eq!(chars("ab", 10), vec![0]);
+        assert_eq!(chars("", 10), vec![0]);
+        // Each row start knows its byte and column, for drawing from there
+        assert_eq!(wrap_points("é é é", 2)[1], Place { char: 2, byte: 3, col: 2 });
+        // Breaking after the tab, which counts as a space
+        assert_eq!(wrap_points("\tab", 5)[1], Place { char: 1, byte: 1, col: 4 });
+        // An emoji wider than the row stays whole, with its skin tone
+        assert_eq!(chars("👍🏽x", 1), vec![0, 2]);
+        let starts = wrap_points("hello world foo", 6);
+        assert_eq!(row_of(&starts, 5), 0);
+        assert_eq!(row_of(&starts, 6), 1);
+        assert_eq!(row_of(&starts, 20), 2);
+    }
+
+    #[test]
+    fn emoji_take_the_width_ratatui_gives_them() {
+        // A warning sign made emoji, a family joined by ZWJs, a thumb with a skin tone,
+        // and an accent written as its own mark
+        for (text, cols) in [("\u{26a0}\u{fe0f}", 2), ("👨\u{200d}👩\u{200d}👧", 2), ("👍🏽", 2), ("e\u{301}", 1)]
+        {
+            assert_eq!(str_width(text), cols, "{text:?}");
+            assert_eq!(str_width(text), Line::from(text).width(), "{text:?}");
+        }
+        let line = "\u{26a0}\u{fe0f} Note";
+        assert_eq!(display_col(line, 2), 2);
+        assert_eq!(char_at_col(line, 1), 0);
+        assert_eq!(char_at_col(line, 2), 2);
+        assert_eq!(split_at_width(line, 1).0, "");
+        assert_eq!(split_at_width(line, 2).0, "\u{26a0}\u{fe0f}");
+        assert!(wider_than(line, 6) && !wider_than(line, 7));
+    }
+
+    #[test]
+    fn printable_text() {
+        assert_eq!(printable("a\tb"), "a    b");
+        assert_eq!(printable("x\u{1b}[31my\n"), "x\u{fffd}[31my\n");
+        assert!(matches!(printable("plain"), Cow::Borrowed(_)));
     }
 
     #[test]
@@ -297,8 +426,33 @@ mod tests {
     #[test]
     fn spans_scroll_and_expand_tabs() {
         let text = |spans: Vec<Span>| spans.iter().map(|s| s.content.to_string()).collect::<String>();
-        assert_eq!(text(line_spans("\tabc", &[], 0, 10, &[])), "    abc");
-        assert_eq!(text(line_spans("\tabc", &[], 2, 10, &[])), "  abc");
-        assert_eq!(text(line_spans("abcdef", &[], 2, 3, &[])), "cde");
+        let start = Place::default();
+        assert_eq!(text(line_spans("\tabc", &[], start, 0, 10, &[])), "    abc");
+        assert_eq!(text(line_spans("\tabc", &[], start, 2, 10, &[])), "  abc");
+        assert_eq!(text(line_spans("abcdef", &[], start, 2, 3, &[])), "cde");
+        // From a row's start in the middle of the line
+        let row = wrap_points("abc\tdef", 5)[1];
+        assert_eq!(text(line_spans("abc\tdef", &[], row, row.col, 5, &[])), "def");
+    }
+
+    #[test]
+    fn marks_go_on_top_in_order_and_only_where_they_are() {
+        use ratatui::style::Color;
+        let red = Style::new().fg(Color::Red);
+        let blue = Style::new().bg(Color::Blue);
+        // Thousands of matches on a long line, and a selection over some of them
+        let line = "ab".repeat(5000);
+        let mut marks: Vec<(usize, usize, Style)> = (0..5000).map(|i| (2 * i, 2 * i + 1, red)).collect();
+        marks.push((9990, usize::MAX, blue));
+        let spans = line_spans(&line, &[], Place::default(), 9988, 20, &marks);
+        let styles: Vec<(String, Style)> = spans.iter().map(|s| (s.content.to_string(), s.style)).collect();
+        assert_eq!(styles[0], ("a".into(), red));
+        assert_eq!(styles[1], ("b".into(), Style::default()));
+        assert_eq!(styles[2], ("a".into(), red.patch(blue)));
+        assert_eq!(styles[3], ("b".into(), blue));
+        assert_eq!(styles[4], ("a".into(), red.patch(blue)));
+        // The selection runs on past the end of the line
+        let last = spans.last().unwrap();
+        assert!(last.content.ends_with(' ') && last.style == blue, "{last:?}");
     }
 }

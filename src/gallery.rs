@@ -5,7 +5,11 @@ use std::{
     fs,
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
 };
 
@@ -43,10 +47,17 @@ pub const WIDTHS: (u32, u32) = (50, 400);
 /// The decoding threads' name: a panic in one fails just its thumbnail
 pub const WORKER: &str = "thumbnails";
 
-/// The images directly in `dir`, by name.
+/// The images directly in `dir`, by name. Hidden ones are left out, as the tree leaves
+/// them out: macOS's `._IMG_0001.JPG` beside every photo on a shared drive, say.
 pub fn images_in(dir: &Path) -> Vec<PathBuf> {
-    let mut images: Vec<PathBuf> =
-        fs::read_dir(dir).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| picture::is_image(p)).collect();
+    let hidden = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
+    let mut images: Vec<PathBuf> = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| picture::is_image(p) && !hidden(p))
+        .collect();
     images.retain(|p| p.is_file());
     images.sort_by_cached_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
     images
@@ -93,6 +104,14 @@ enum Thumb {
     Ready(Box<StatefulProtocol>),
 }
 
+/// What a worker made of a thumbnail it was asked for.
+enum Decoded {
+    Image(DynamicImage),
+    Failed,
+    /// Scrolled far out of view before its turn came; asked for again if it comes back
+    Skipped,
+}
+
 pub struct Gallery {
     pub dir: PathBuf,
     pub images: Vec<PathBuf>,
@@ -107,7 +126,9 @@ pub struct Gallery {
     /// Thumbnail width in pixels
     pub width_px: u32,
     jobs: mpsc::Sender<(usize, PathBuf)>,
-    done: mpsc::Receiver<(usize, Option<DynamicImage>)>,
+    done: mpsc::Receiver<(usize, Decoded)>,
+    /// The thumbnails worth decoding, from the last draw: the workers pass over others
+    wanted: Arc<[AtomicUsize; 2]>,
     /// Where each thumbnail and its name were drawn, for the mouse
     hits: Vec<(Rect, usize)>,
     /// Thumbnails across, and rows of them on screen, at the last draw
@@ -120,9 +141,10 @@ impl Gallery {
         let (jobs, queue) = mpsc::channel::<(usize, PathBuf)>();
         let (finished, done) = mpsc::channel();
         let queue = Arc::new(Mutex::new(queue));
+        let wanted = Arc::new([AtomicUsize::new(0), AtomicUsize::new(usize::MAX)]);
         // Every core but the one the screen needs
         for _ in 0..crate::cores().saturating_sub(1).max(1) {
-            let (queue, finished) = (queue.clone(), finished.clone());
+            let (queue, finished, wanted) = (queue.clone(), finished.clone(), wanted.clone());
             // They end when the gallery goes away and takes its sender with it
             let _ = thread::Builder::new().name(WORKER.into()).spawn(move || {
                 loop {
@@ -131,9 +153,19 @@ impl Gallery {
                         Err(_) => None,
                     };
                     let Some((i, path)) = job else { break };
-                    // A decoder that panics on a broken file fails just that thumbnail
-                    let image = panic::catch_unwind(AssertUnwindSafe(|| decode(&path, &DECODING))).ok().flatten();
-                    if finished.send((i, image)).is_err() {
+                    // Scrolling past a big folder asks for screens of thumbnails on the way;
+                    // the ones on screen now shouldn't wait behind them
+                    let decoded =
+                        if !(wanted[0].load(Ordering::Relaxed)..wanted[1].load(Ordering::Relaxed)).contains(&i) {
+                            Decoded::Skipped
+                        } else {
+                            // A decoder that panics on a broken file fails just that thumbnail
+                            match panic::catch_unwind(AssertUnwindSafe(|| decode(&path, &DECODING))) {
+                                Ok(Some(image)) => Decoded::Image(image),
+                                _ => Decoded::Failed,
+                            }
+                        };
+                    if finished.send((i, decoded)).is_err() {
                         break;
                     }
                 }
@@ -152,6 +184,7 @@ impl Gallery {
             width_px: 100,
             jobs,
             done,
+            wanted,
             hits: Vec::new(),
             per_row: 1,
             rows_shown: 1,
@@ -183,13 +216,14 @@ impl Gallery {
     }
 
     fn take_finished(&mut self, picker: &Picker) {
-        while let Ok((i, image)) = self.done.try_recv() {
-            self.thumbs[i] = match image {
-                Some(image) => {
+        while let Ok((i, decoded)) = self.done.try_recv() {
+            self.thumbs[i] = match decoded {
+                Decoded::Image(image) => {
                     self.aspects[i] = Some(image.height() as f32 / image.width().max(1) as f32);
                     Thumb::Ready(Box::new(picker.new_resize_protocol(image)))
                 }
-                None => Thumb::Failed,
+                Decoded::Failed => Thumb::Failed,
+                Decoded::Skipped => Thumb::Waiting,
             };
         }
     }
@@ -247,6 +281,12 @@ impl Gallery {
             self.top = first;
         }
 
+        // What's worth decoding, roughly, before anything's asked for: a worker that took a
+        // job straight away would otherwise go by where the view was before
+        let screen = per_row * self.rows_shown.max(1);
+        let around = (self.top * per_row).saturating_sub(screen * KEEP_SCREENS);
+        self.wanted[0].store(around, Ordering::Relaxed);
+        self.wanted[1].store(self.top * per_row + screen * (KEEP_SCREENS + 2), Ordering::Relaxed);
         let mut y = area.y;
         let mut last = self.top;
         self.rows_shown = 0;
@@ -260,12 +300,15 @@ impl Gallery {
                 let x = area.x + k as u16 * (cols + GAP);
                 let (w, h) = self.size(i, picker);
                 let picture = Rect::new(x, y, w, h);
-                // A thumbnail cut off by the bottom edge waits for the next scroll
+                // A thumbnail cut off by the bottom edge waits for the next scroll, unless
+                // it's bigger than the whole grid (made big in a short pane), and is drawn
+                // smaller, to what there's room for
                 let fits = picture.bottom() <= area.bottom() && picture.right() <= area.right();
+                let never_fits = h > area.height || w > area.width;
                 match &mut self.thumbs[i] {
-                    Thumb::Ready(protocol) if fits => {
+                    Thumb::Ready(protocol) if fits || never_fits => {
                         let image = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
-                        f.render_stateful_widget(image, picture, protocol.as_mut());
+                        f.render_stateful_widget(image, picture.intersection(area), protocol.as_mut());
                     }
                     Thumb::Failed => note(f, picture.intersection(area), "can't read"),
                     Thumb::Ready(_) => {}
@@ -296,6 +339,8 @@ impl Gallery {
         }
         // Let go of thumbnails far from the view, so a huge folder doesn't fill memory
         let keep = (self.top * per_row).saturating_sub(screen * KEEP_SCREENS)..ahead + screen * KEEP_SCREENS;
+        self.wanted[0].store(keep.start, Ordering::Relaxed);
+        self.wanted[1].store(keep.end, Ordering::Relaxed);
         for (i, thumb) in self.thumbs.iter_mut().enumerate() {
             if !keep.contains(&i) && matches!(thumb, Thumb::Ready(_)) {
                 *thumb = Thumb::Waiting;
@@ -315,11 +360,10 @@ fn decode(path: &Path, budget: &Budget) -> Option<DynamicImage> {
         return None;
     }
     let _held = budget.take(need.max(1));
-    let mut reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(LARGEST);
-    reader.limits(limits);
-    let image = reader.decode().ok()?;
+    let image = picture::decode_upright(reader, limits).ok()?;
     Some(image.thumbnail(DECODED.0, DECODED.1))
 }
 

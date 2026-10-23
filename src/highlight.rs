@@ -119,12 +119,23 @@ impl LineCache {
             let path = std::mem::take(&mut self.path);
             *self = Self::new(&path, lines);
         } else {
-            self.invalidate(from);
+            self.forget(from);
+        }
+    }
+
+    /// The text was edited from line `from` on. A first line typed in (`#!/bin/sh`) can
+    /// set the syntax, and a long line pasted in turns highlighting off (syntect takes
+    /// seconds over a minified line) until it's gone, as if the file were opened now.
+    pub fn invalidate(&mut self, lines: &[String], from: usize) {
+        if from == 0 || self.disabled != too_slow(lines) {
+            self.replaced(lines, 0);
+        } else {
+            self.forget(from);
         }
     }
 
     /// Forgets everything from line `from` on.
-    pub fn invalidate(&mut self, from: usize) {
+    fn forget(&mut self, from: usize) {
         if from >= self.lines.len() {
             return;
         }
@@ -178,14 +189,24 @@ impl LineCache {
     }
 }
 
+/// Lines longer than this (minified code) would make syntect crawl.
+const MAX_LINE: usize = 10_000;
+
 /// Huge files and minified lines would make syntect crawl.
 fn too_slow(lines: &[String]) -> bool {
-    lines.len() > 100_000 || lines.iter().any(|l| l.len() > 10_000)
+    lines.len() > 100_000 || lines.iter().any(|l| l.len() > MAX_LINE)
 }
 
-/// Highlights a fenced code block. None if the language isn't known, or highlighting
-/// hasn't loaded yet.
+/// Most code a fenced block may have to be highlighted. Rendering happens all at once,
+/// and again for every new width, so a big block shows without colors.
+const MAX_BLOCK: usize = 256 << 10;
+
+/// Highlights a fenced code block. None if the language isn't known, highlighting
+/// hasn't loaded yet, or the block is too big or has lines too long to do quickly.
 pub fn block(lang: &str, code: &str) -> Option<Vec<Vec<(Style, String)>>> {
+    if code.len() > MAX_BLOCK || code.lines().any(|l| l.len() > MAX_LINE) {
+        return None;
+    }
     let hl = get()?;
     let syntax = hl.syntaxes.find_syntax_by_token(lang)?;
     let mut lines = HighlightLines::new(syntax, &hl.theme);
@@ -228,6 +249,27 @@ mod tests {
         // The first line can change the syntax (#!/bin/sh), so that starts again
         cache.replaced(&more, 0);
         assert!(cache.lines.is_empty());
+    }
+
+    #[test]
+    fn edits_can_change_the_syntax_or_turn_colors_off() {
+        load();
+        let mut text: Vec<String> = vec!["echo hi".into(); 3];
+        let mut cache = LineCache::new(Path::new("script"), &text);
+        while !cache.ensure(&text, 3) {}
+        assert!(cache.get(0).iter().all(|(s, _)| s.fg.is_none()), "no syntax yet");
+        text.insert(0, "#!/bin/sh".into());
+        cache.invalidate(&text, 0);
+        while !cache.ensure(&text, 4) {}
+        assert!(cache.syntax.flatten().is_some_and(|s| s.name.contains("Bourne") || s.name.contains("Shell")));
+        // A minified line pasted in turns highlighting off, until it's gone
+        text.push("x".repeat(20_000));
+        cache.invalidate(&text, 4);
+        assert!(cache.disabled);
+        text.pop();
+        cache.invalidate(&text, 4);
+        assert!(!cache.disabled);
+        assert!(block("js", &"x".repeat(20_000)).is_none());
     }
 
     impl LineCache {

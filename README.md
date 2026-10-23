@@ -43,10 +43,13 @@ on Linux.
 
 ## The tree
 
-Directories come first and fold open as you click them. Dotfiles and whatever
-`.gitignore` leaves out (`target/`, `node_modules/`) stay hidden until you press `.`.
-Git repositories show a ⎇. The tree reads the disk again every couple of seconds, so new
-files appear on their own.
+Directories come first and fold open as you click them. `..` at the top, or `Backspace`,
+moves the tree up a folder, with the one you were in left open. Dotfiles and whatever
+`.gitignore` leaves out (`target/`, `node_modules/`) stay hidden until you press `.`, and
+the header says how many there are. A folder that a repository above it ignores as a
+whole, such as one in a home folder kept in git with `*` in its `.gitignore`, still shows
+what's in it. Git repositories show a ⎇. The tree reads the disk again every couple of
+seconds, so new files appear on their own.
 
 Press `/` and type to filter the whole tree by name. Every word has to match somewhere in
 the path, so `src ar` finds `src/archive.rs` and `src/markdown.rs` but not
@@ -171,8 +174,10 @@ overwritten, and an open file follows its new name.
 ## Live reload
 
 When something else changes the open file, readme reloads it and keeps your place, so
-you can watch a log grow or an agent write. If you have unsaved changes of your own, it
-keeps them and marks the file as changed on disk instead.
+you can watch a log grow or an agent write. An image redrawn on disk (a plot, a
+screenshot) shows the new one at the same zoom. If you have unsaved changes of your own,
+readme keeps them and marks the file as changed on disk instead; undo them and the new
+contents come in, or save, and it asks before writing over the other changes.
 
 ## Web pages and videos
 

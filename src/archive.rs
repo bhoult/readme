@@ -13,6 +13,12 @@ use anyhow::{Context, Result, bail};
 
 const MAX_ENTRIES: usize = 100_000;
 const MAX_READ: u64 = 50 << 20;
+/// Longer names than any file system takes are left out: a crafted archive could use
+/// names tens of kilobytes long
+const MAX_NAME: usize = 4096;
+/// Most memory the folders that only show up in paths may take. Every folder a path
+/// goes through gets a name of its own, so a few deep paths can make gigabytes of them
+const MAX_DIR_BYTES: usize = 64 << 20;
 /// How long reading through a tar archive may take. It blocks the screen, and a tar
 /// file has no index: reaching a file means decompressing everything before it.
 const MAX_WAIT: Duration = Duration::from_secs(3);
@@ -127,7 +133,9 @@ fn list_until(path: &Path, until: Instant) -> Result<Vec<Entry>> {
         let zip = zip(path)?;
         for name in zip.file_names().take(MAX_ENTRIES) {
             let name = name?;
-            names.push((clean(&name), name.ends_with('/')));
+            if name.len() <= MAX_NAME {
+                names.push((clean(&name), name.ends_with('/')));
+            }
         }
         if zip.len() > MAX_ENTRIES {
             rest = Some(TOO_MANY);
@@ -149,15 +157,27 @@ fn list_until(path: &Path, until: Instant) -> Result<Vec<Entry>> {
                 break;
             }
             let is_dir = entry.header().entry_type().is_dir();
-            names.push((clean(&entry.path()?.to_string_lossy()), is_dir));
+            let name = entry.path()?;
+            if name.as_os_str().len() <= MAX_NAME {
+                names.push((clean(&name.to_string_lossy()), is_dir));
+            }
         }
     }
-    let mut dirs: BTreeSet<String> = names.iter().filter(|(_, d)| *d).map(|(n, _)| n.clone()).collect();
-    for (name, _) in &names {
-        let mut rest = name.as_str();
-        while let Some((parent, _)) = rest.rsplit_once('/') {
-            dirs.insert(parent.to_string());
-            rest = parent;
+    // Each folder, and the folders it's in, which an archive needn't list. A folder
+    // already found has its own folders in already, so most paths stop at once.
+    let mut dirs: BTreeSet<String> = BTreeSet::new();
+    let mut room = MAX_DIR_BYTES;
+    'names: for (name, is_dir) in &names {
+        let mut dir = if *is_dir { Some(name.as_str()) } else { name.rsplit_once('/').map(|(parent, _)| parent) };
+        while let Some(path) = dir.filter(|d| !d.is_empty() && !dirs.contains(*d)) {
+            let size = path.len() + 64;
+            if size > room {
+                rest = rest.or(Some(TOO_MANY));
+                break 'names;
+            }
+            room -= size;
+            dirs.insert(path.to_string());
+            dir = path.rsplit_once('/').map(|(parent, _)| parent);
         }
     }
     let mut entries: Vec<Entry> = names
@@ -259,5 +279,29 @@ mod tests {
         let (archive, inner) = split(&tgz_path.join("src/main.rs")).unwrap();
         assert_eq!((archive, inner.as_str()), (tgz_path.clone(), "src/main.rs"));
         assert!(split(&dir.path().join("missing/file")).is_none());
+    }
+
+    #[test]
+    fn deep_long_names_dont_take_gigabytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("deep.zip");
+        let mut zip = zip::ZipWriter::new(File::create(&zip_path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        // Names that are nearly all folders: 32k of them each, unless they're kept out
+        for first in ["a", "b", "c", "d", "e"] {
+            zip.start_file(format!("{first}/{}x", "x/".repeat(32_000)), options).unwrap();
+        }
+        // ...and ones a real archive has, which still list as they should
+        zip.start_file("docs/deep/readme.md", options).unwrap();
+        zip.add_directory("empty/", options).unwrap();
+        zip.finish().unwrap();
+        let listed = names(&list(&zip_path).unwrap());
+        let want: Vec<(String, bool)> = vec![
+            ("docs".into(), true),
+            ("docs/deep".into(), true),
+            ("docs/deep/readme.md".into(), false),
+            ("empty".into(), true),
+        ];
+        assert_eq!(listed, want);
     }
 }

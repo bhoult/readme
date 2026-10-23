@@ -9,7 +9,7 @@ use ratatui::{
 
 use crate::{
     highlight,
-    text::{find_all, push_span, split_at_width, str_width},
+    text::{find_all, printable, push_span, split_at_width, str_width},
 };
 
 pub struct Rendered {
@@ -39,6 +39,10 @@ type Frag = (String, Style);
 
 /// Table cells wider than this are cut short with "…"
 const MAX_CELL: usize = 60;
+/// Roughly the most memory a table may take laid out. Every cell is padded to its
+/// column's width and kept as text of its own, so a table of many short or empty cells
+/// takes a hundred times its size or more; one past this shows as a note instead.
+const MAX_TABLE_BYTES: usize = 128 << 20;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -174,7 +178,8 @@ impl Renderer {
 
     fn push(&mut self, text: &str, style: Style) {
         let style = self.styles.last().copied().unwrap_or_default().patch(style);
-        self.inline.push((text.to_string(), style));
+        // A tab or a control character would be left out on screen, but counted in the wrapping
+        self.inline.push((printable(text).into_owned(), style));
         self.inline_src.push(self.at);
     }
 
@@ -423,8 +428,8 @@ impl Renderer {
         let first = self.src;
         for (i, line) in code.lines().enumerate() {
             let frags: Vec<Frag> = match &colors {
-                Some(colors) => colors[i].iter().map(|(s, t)| (t.replace('\t', "    "), *s)).collect(),
-                None => vec![(line.replace('\t', "    "), Style::new().fg(Color::Yellow))],
+                Some(colors) => colors[i].iter().map(|(s, t)| (printable(t).into_owned(), *s)).collect(),
+                None => vec![(printable(line).into_owned(), Style::new().fg(Color::Yellow))],
             };
             self.src = first + i;
             let pieces = if self.wrap_code { hard_wrap(&frags, room) } else { vec![frags] };
@@ -454,6 +459,14 @@ impl Renderer {
         // very long cells are cut short
         for width in &mut widths {
             *width = (*width).min(MAX_CELL);
+        }
+        // Each cell and the bar after it are a span apiece, each with text of its own on the heap
+        let row_bytes = widths.iter().sum::<usize>() + cols * (3 + 2 * (size_of::<ratatui::text::Span>() + 32));
+        if table.rows.len().saturating_mul(row_bytes) > MAX_TABLE_BYTES {
+            let mut out = self.prefix();
+            let size = format!("{} rows by {cols} columns", table.rows.len());
+            out.push((format!("(a table too big to lay out here, {size}; m shows the text)"), dim()));
+            return self.emit(out, false);
         }
         for (r, row) in table.rows.iter().enumerate() {
             self.src = table.srcs.get(r).copied().unwrap_or(self.src);
@@ -646,11 +659,14 @@ pub fn mark_matches(line: &Line<'static>, query: &str, style: Style) -> Line<'st
     if hits.is_empty() {
         return line.clone();
     }
+    // The matches come in order and don't overlap, so one pass goes through both
+    let mut hits = hits.into_iter().peekable();
     let mut spans = Vec::new();
     let mut idx = 0;
     for span in &line.spans {
         for c in span.content.chars() {
-            let hit = hits.iter().any(|&(s, e)| idx >= s && idx < e);
+            while hits.next_if(|&(_, e)| e <= idx).is_some() {}
+            let hit = hits.peek().is_some_and(|&(s, _)| s <= idx);
             push_span(&mut spans, c.encode_utf8(&mut [0; 4]), if hit { span.style.patch(style) } else { span.style });
             idx += 1;
         }
@@ -665,6 +681,21 @@ mod tests {
     fn plain(md: &str, width: u16) -> Vec<String> {
         let r = render(md, width, true);
         (0..r.lines.len()).map(|i| r.text(i)).collect()
+    }
+
+    #[test]
+    fn emoji_and_tabs_keep_table_columns_lined_up() {
+        let out = plain("| a | b |\n|---|---|\n| \u{26a0}\u{fe0f} | x |\n| ok\tgo | y |\n| plain | z |\n", 40);
+        // Where each row's column bar falls, as the screen shows it
+        let bars: Vec<usize> = out
+            .iter()
+            .filter(|l| l.contains('│'))
+            .map(|l| Line::from(l.split('│').next().unwrap_or("").to_string()).width())
+            .collect();
+        assert!(bars.len() == 4 && bars.iter().all(|&b| b == bars[0]), "{out:?}");
+        // A tab in the text shows as spaces rather than vanishing
+        let out = plain("Name:\tJohn\n", 40);
+        assert_eq!(out, vec!["Name:    John"]);
     }
 
     #[test]

@@ -8,6 +8,8 @@ use std::{
 };
 
 use anyhow::{Result, bail};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthChar;
 
 use crate::text::{char_at_col, display_col};
 
@@ -25,7 +27,7 @@ impl Pos {
 }
 
 pub enum Loaded {
-    Text(Buffer),
+    Text(Box<Buffer>),
     Binary(u64),
     TooBig(u64),
 }
@@ -41,14 +43,18 @@ struct Snapshot {
     lines: Vec<String>,
     crlf: Vec<bool>,
     cursor: Pos,
-    /// Roughly how much text `lines` holds
+    /// Which text this is (see Buffer::state)
+    state: u64,
+    /// Roughly how much memory it takes
     bytes: usize,
 }
 
 impl Snapshot {
-    fn new(lines: Vec<String>, crlf: Vec<bool>, cursor: Pos) -> Self {
-        let bytes = lines.iter().map(|l| l.len() + 1).sum();
-        Self { lines, crlf, cursor, bytes }
+    fn new(lines: Vec<String>, crlf: Vec<bool>, cursor: Pos, state: u64) -> Self {
+        // Each line's text, and what its String costs besides: the header, and the
+        // allocator's rounding up, which for short lines is most of it
+        let bytes = lines.iter().map(|l| l.len() + 64).sum();
+        Self { lines, crlf, cursor, state, bytes }
     }
 }
 
@@ -78,6 +84,14 @@ pub struct Buffer {
     pub version: u64,
     /// The first line changed since the highlighter last caught up
     pub changed_from: Option<usize>,
+    /// Which text this is: a new one with every change, and an old one back with undo
+    /// or redo, so undoing back to what was saved leaves nothing unsaved
+    state: u64,
+    /// The state that was last read from the file or saved to it
+    saved: u64,
+    /// The file starts with a byte order mark, which isn't part of the text, so it can't
+    /// be typed in front of or deleted, and is saved back where it was
+    bom: bool,
     /// Screen column kept while moving up and down through shorter lines
     want_col: Option<usize>,
     /// Whether each line ends in CRLF rather than LF, so a file that mixes the two
@@ -93,8 +107,12 @@ fn byte_at(line: &str, col: usize) -> usize {
     line.char_indices().nth(col).map_or(line.len(), |(i, _)| i)
 }
 
+/// Part of a word: a letter, digit or _, or a mark that joins onto one (an accent
+/// written on its own, a virama, a ZWJ or ZWNJ), which takes no columns of its own. Not
+/// everything without columns joins: a zero-width space, bidi marks and the BOM separate.
 fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    let separates = matches!(c, '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{206F}' | '\u{FEFF}');
+    c.is_alphanumeric() || c == '_' || (!c.is_control() && !separates && c.width() == Some(0))
 }
 
 impl Buffer {
@@ -127,17 +145,21 @@ impl Buffer {
         if bytes[..bytes.len().min(SNIFF as usize)].contains(&0) {
             return Loaded::Binary(size);
         }
-        Loaded::Text(match String::from_utf8(bytes) {
+        Loaded::Text(Box::new(match String::from_utf8(bytes) {
             Ok(text) => Self::from_text(&text),
             Err(e) => {
                 let mut buf = Self::from_text(&String::from_utf8_lossy(e.as_bytes()));
                 buf.read_only = Some("not UTF-8");
                 buf
             }
-        })
+        }))
     }
 
     pub fn from_text(text: &str) -> Self {
+        let (bom, text) = match text.strip_prefix('\u{feff}') {
+            Some(rest) => (true, rest),
+            None => (false, text),
+        };
         let final_newline = text.is_empty() || text.ends_with('\n');
         let body = text.strip_suffix('\n').unwrap_or(text);
         let (mut lines, mut crlf): (Vec<String>, Vec<bool>) = body
@@ -156,14 +178,18 @@ impl Buffer {
             }
             crlf[n - 1] = n > 1 && crlf[n - 2];
         }
+        let version = next_version();
         Self {
             lines,
             cursor: Pos::default(),
             anchor: None,
             dirty: false,
             read_only: None,
-            version: next_version(),
+            version,
             changed_from: None,
+            state: version,
+            saved: version,
+            bom,
             want_col: None,
             crlf,
             final_newline,
@@ -175,7 +201,10 @@ impl Buffer {
 
     /// The file contents, with the original line endings.
     pub fn text(&self) -> String {
-        let mut text = String::with_capacity(self.lines.iter().map(|l| l.len() + 2).sum());
+        let mut text = String::with_capacity(self.lines.iter().map(|l| l.len() + 2).sum::<usize>() + 3);
+        if self.bom {
+            text.push('\u{feff}');
+        }
         let last = self.lines.len() - 1;
         for (i, (line, &crlf)) in self.lines.iter().zip(&self.crlf).enumerate() {
             text.push_str(line);
@@ -188,6 +217,7 @@ impl Buffer {
 
     pub fn save(&mut self, path: &Path) -> Result<()> {
         fs::write(path, self.text())?;
+        self.saved = self.state;
         self.dirty = false;
         Ok(())
     }
@@ -284,7 +314,11 @@ impl Buffer {
             }
             Pos::new(line, i)
         } else {
-            Pos::new(line, col - 1)
+            // A whole character, with whatever joins onto it (an accent, an emoji's
+            // modifiers), so the cursor always visibly moves
+            let text = &self.lines[line];
+            let before = &text[..byte_at(text, col)];
+            Pos::new(line, col - before.graphemes(true).next_back().map_or(1, |g| g.chars().count()))
         };
         self.move_to(to, select);
     }
@@ -305,7 +339,9 @@ impl Buffer {
             }
             Pos::new(line, i)
         } else {
-            Pos::new(line, col + 1)
+            let text = &self.lines[line];
+            let after = &text[byte_at(text, col)..];
+            Pos::new(line, col + after.graphemes(true).next().map_or(1, |g| g.chars().count()))
         };
         self.move_to(to, select);
     }
@@ -425,19 +461,24 @@ impl Buffer {
     fn step_history(&mut self, undo: bool) -> bool {
         let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
         let Some(snap) = from.pop() else { return false };
+        // The colors above the first line it changes still stand
+        let same = self.lines.iter().zip(&snap.lines).take_while(|(a, b)| a == b).count();
         let lines = std::mem::replace(&mut self.lines, snap.lines);
-        to.push(Snapshot::new(lines, std::mem::replace(&mut self.crlf, snap.crlf), self.cursor));
+        to.push(Snapshot::new(lines, std::mem::replace(&mut self.crlf, snap.crlf), self.cursor, self.state));
         self.cursor = snap.cursor;
         self.anchor = None;
         self.last_edit = None;
-        self.changed(0);
+        self.changed(same.min(self.lines.len() - 1));
+        // Back to what was saved, nothing is unsaved
+        self.state = snap.state;
+        self.dirty = self.state != self.saved;
         true
     }
 
     /// Records an undo step, except that a run of typing (or of deleting) undoes as one.
     fn begin(&mut self, kind: Edit) {
         if kind == Edit::Other || self.last_edit != Some(kind) {
-            self.undo.push(Snapshot::new(self.lines.clone(), self.crlf.clone(), self.cursor));
+            self.undo.push(Snapshot::new(self.lines.clone(), self.crlf.clone(), self.cursor, self.state));
             let mut bytes: usize = self.undo.iter().map(|s| s.bytes).sum();
             while self.undo.len() > MAX_UNDO || (self.undo.len() > 1 && bytes > MAX_UNDO_BYTES) {
                 bytes -= self.undo.remove(0).bytes;
@@ -450,6 +491,7 @@ impl Buffer {
     fn changed(&mut self, from: usize) {
         self.dirty = true;
         self.version = next_version();
+        self.state = self.version;
         self.want_col = None;
         self.changed_from = Some(self.changed_from.map_or(from, |l| l.min(from)));
     }
@@ -599,6 +641,72 @@ mod tests {
         b.backspace();
         b.insert("e");
         assert_eq!(b.lines, vec!["onetwo"]);
+    }
+
+    #[test]
+    fn undoing_back_to_what_was_saved_leaves_nothing_unsaved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.txt");
+        let mut b = buf("one\n");
+        b.insert("x");
+        assert!(b.dirty);
+        b.undo();
+        assert!(!b.dirty);
+        b.redo();
+        assert!(b.dirty);
+        b.save(&path).unwrap();
+        assert!(!b.dirty);
+        b.undo();
+        assert!(b.dirty);
+        b.redo();
+        assert!(!b.dirty);
+        // Undo colors again only from the first line it changes
+        let mut b = buf("a\nb\nc\n");
+        b.move_to(Pos::new(2, 1), false);
+        b.insert("x");
+        b.changed_from = None;
+        b.undo();
+        assert_eq!(b.changed_from, Some(2));
+    }
+
+    #[test]
+    fn a_byte_order_mark_stays_at_the_start() {
+        let mut b = buf("\u{feff}id,name\r\n1,a\r\n");
+        assert_eq!(b.lines[0], "id,name");
+        b.insert("X");
+        b.newline();
+        assert_eq!(b.text(), "\u{feff}X\r\nid,name\r\n1,a\r\n");
+        b.select_all();
+        b.insert("new");
+        assert_eq!(b.text(), "\u{feff}new\r\n");
+    }
+
+    #[test]
+    fn accents_and_emoji_move_as_one_character() {
+        // e with its accent written as a separate mark, and a thumb with a skin tone
+        let mut b = buf("cafe\u{301} 👍🏽 hi\n");
+        b.line_end(false);
+        for _ in 0..3 {
+            b.left(false, false);
+        }
+        assert_eq!(b.cursor.col, 8);
+        b.left(false, false);
+        assert_eq!(b.cursor.col, 6, "over the thumb and its skin tone at once");
+        b.left(false, false);
+        b.left(false, false);
+        assert_eq!(b.cursor.col, 3, "over the e and its accent at once");
+        b.right(false, false);
+        assert_eq!(b.cursor.col, 5);
+        // A word goes on through a joining mark
+        b.select_word(Pos::new(0, 1));
+        assert_eq!(b.selected_text().as_deref(), Some("cafe\u{301}"));
+        let mut b = buf("हिन्दी text\n");
+        b.select_word(Pos::new(0, 0));
+        assert_eq!(b.selected_text().as_deref(), Some("हिन्दी"));
+        // A zero-width space is where a word ends
+        let mut b = buf("foo\u{200B}bar\n");
+        b.select_word(Pos::new(0, 1));
+        assert_eq!(b.selected_text().as_deref(), Some("foo"));
     }
 
     #[test]
