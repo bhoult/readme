@@ -2,6 +2,7 @@
 
 use std::{
     cell::RefCell,
+    cmp::Reverse,
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
@@ -563,8 +564,9 @@ struct BranchView {
     git: git::Branches,
     /// What each branch did, coming in
     survey: git::Survey,
-    /// Once the survey's done, the branches in the order shown, and how many at the top
-    /// changed the scope
+    /// The survey's done and the branches are listed: those shown, in order, and how
+    /// many at the top changed the scope
+    ready: bool,
     order: Vec<usize>,
     changing: usize,
     selected: usize,
@@ -582,6 +584,107 @@ impl BranchView {
 
     fn what(&self) -> String {
         scope_name(&self.repo, &self.scope, self.file.as_deref())
+    }
+
+    /// Whose a branch is: whoever made most of its own commits, or if it has none,
+    /// whoever made its last one.
+    fn owner(&self, i: usize) -> &str {
+        self.survey.work[i].as_ref().and_then(|w| w.owner.as_ref()).map_or(&self.git.list[i].author, |o| &o.0)
+    }
+
+    /// Lists the branches `filter` lets through, those that changed the scope first and
+    /// then the rest, each part in `sort`'s order. The selected branch stays selected
+    /// while it's listed.
+    fn arrange(&mut self, sort: BranchSort, filter: BranchFilter, height: usize) {
+        let (list, work, base) = (&self.git.list, &self.survey.work, self.git.base);
+        let changed = |i: usize| i != base && work[i].as_ref().is_some_and(|w| !w.changes.is_empty());
+        let mut order: Vec<usize> = (0..list.len()).filter(|&i| filter.lets(&list[i])).collect();
+        // Newest first, which the other orders keep among equals
+        order.sort_by_key(|&i| Reverse(list[i].time));
+        match sort {
+            BranchSort::Newest => {}
+            BranchSort::Name => order.sort_by_cached_key(|&i| (own_name(&list[i]).to_lowercase(), list[i].remote)),
+            BranchSort::Owner => order.sort_by_cached_key(|&i| self.owner(i).to_lowercase()),
+        }
+        order.sort_by_key(|&i| !changed(i));
+        let changing = order.iter().filter(|&&i| changed(i)).count();
+        let selected = self.order.get(self.selected).copied();
+        self.selected = selected.and_then(|s| order.iter().position(|&i| i == s)).unwrap_or(0);
+        (self.order, self.changing, self.ready) = (order, changing, true);
+        step(&mut self.selected, &mut self.scroll, self.order.len(), 0, height);
+    }
+}
+
+/// The order branches are listed in, within those that changed the file or folder and
+/// the rest.
+#[derive(Clone, Copy, PartialEq)]
+enum BranchSort {
+    /// Last updated, newest first
+    Newest,
+    Name,
+    Owner,
+}
+
+impl BranchSort {
+    fn next(self) -> Self {
+        match self {
+            Self::Newest => Self::Name,
+            Self::Name => Self::Owner,
+            Self::Owner => Self::Newest,
+        }
+    }
+
+    /// For the header
+    fn label(self) -> &'static str {
+        match self {
+            Self::Newest => "newest",
+            Self::Name => "by name",
+            Self::Owner => "by owner",
+        }
+    }
+}
+
+/// Which branches are listed.
+#[derive(Clone, Copy, PartialEq)]
+enum BranchFilter {
+    /// The local ones, and the remotes' that no local one stands in for
+    All,
+    Local,
+    Remote,
+}
+
+impl BranchFilter {
+    fn next(self) -> Self {
+        match self {
+            Self::All => Self::Local,
+            Self::Local => Self::Remote,
+            Self::Remote => Self::All,
+        }
+    }
+
+    fn lets(self, branch: &git::Branch) -> bool {
+        match self {
+            Self::All => !branch.twin,
+            Self::Local => !branch.remote,
+            Self::Remote => branch.remote,
+        }
+    }
+
+    /// Before "branches"
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "",
+            Self::Local => "local ",
+            Self::Remote => "remote ",
+        }
+    }
+}
+
+/// A branch's name without its remote's: "feature" for origin/feature.
+fn own_name(branch: &git::Branch) -> &str {
+    match branch.name.split_once('/') {
+        Some((_, own)) if branch.remote => own,
+        _ => &branch.name,
     }
 }
 
@@ -682,6 +785,9 @@ pub struct App {
     history: Option<History>,
     /// The left pane shows the branches instead of the files
     branches: Option<BranchView>,
+    /// How the branches are listed, and which, kept from one list of them to the next
+    branch_sort: BranchSort,
+    branch_filter: BranchFilter,
     picker: Picker,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
@@ -726,6 +832,8 @@ impl App {
             wrap: false,
             history: None,
             branches: None,
+            branch_sort: BranchSort::Newest,
+            branch_filter: BranchFilter::All,
             picker: Picker::halfblocks(),
             gallery_stash: None,
             grep: None,
@@ -1647,6 +1755,7 @@ impl App {
                     file,
                     git: list,
                     survey,
+                    ready: false,
                     order: Vec::new(),
                     changing: 0,
                     selected: 0,
@@ -1665,25 +1774,45 @@ impl App {
         }
     }
 
-    /// Takes in what's been found about the branches. Once it's all in, they're put in
-    /// order, those that changed the file or folder first, and the first one shows.
+    /// Takes in what's been found about the branches. Once it's all in, they're listed,
+    /// those that changed the file or folder first, and the first one shows.
     fn branches_poll(&mut self) {
+        let (sort, filter, height) = (self.branch_sort, self.branch_filter, self.tree_area.height.max(1) as usize);
         let Some(b) = &mut self.branches else { return };
-        if !b.order.is_empty() {
+        if b.ready {
             return;
         }
         b.survey.poll();
         if b.survey.left > 0 {
             return;
         }
-        let (base, work) = (b.git.base, &b.survey.work);
-        let changed = |i: &usize| *i != base && work[*i].as_ref().is_some_and(|w| !w.changes.is_empty());
-        // Newest first within each part, as they're listed
-        let (mut order, rest): (Vec<usize>, Vec<usize>) = (0..b.git.list.len()).partition(changed);
-        b.changing = order.len();
-        order.extend(rest);
-        b.order = order;
+        b.arrange(sort, filter, height);
         self.branches_preview();
+    }
+
+    /// Lists the branches in another order (`s`) or another set of them (`f`).
+    fn branches_rearrange(&mut self, sort: BranchSort, filter: BranchFilter) {
+        let height = self.tree_area.height.max(1) as usize;
+        let Some(b) = self.branches.as_mut().filter(|b| b.opened.is_none()) else { return };
+        let before = b.order.get(b.selected).copied();
+        // While they're still being looked into, it's for when they're listed
+        if b.ready {
+            b.arrange(sort, filter, height);
+        }
+        let moved = b.order.get(b.selected).copied() != before;
+        let said = if sort != self.branch_sort {
+            match sort {
+                BranchSort::Newest => "Newest first".to_string(),
+                _ => format!("Sorted {}", sort.label()),
+            }
+        } else {
+            format!("Showing {}branches", if filter == BranchFilter::All { "all " } else { filter.label() })
+        };
+        (self.branch_sort, self.branch_filter) = (sort, filter);
+        if moved {
+            self.branches_preview();
+        }
+        self.say(said);
     }
 
     /// Shows the selected branch's page, or the selected file of the opened branch, as
@@ -1695,7 +1824,13 @@ impl App {
             return self.say("Save or discard your changes first, to see other files");
         }
         let Some(b) = &self.branches else { return };
-        let Some(&i) = b.order.get(b.selected) else { return };
+        let Some(&i) = b.order.get(b.selected) else {
+            // None are listed, rather than not yet
+            if b.ready {
+                self.shown = Shown::Nothing;
+            }
+            return;
+        };
         let (repo, branch) = (&b.repo, &b.git.list[i]);
         let (path, bytes, label) = match &b.opened {
             None => {
@@ -1742,6 +1877,8 @@ impl App {
                 }
             }
             KeyCode::Char('a') => self.branches_all_files(),
+            KeyCode::Char('s') => self.branches_rearrange(self.branch_sort.next(), self.branch_filter),
+            KeyCode::Char('f') => self.branches_rearrange(self.branch_sort, self.branch_filter.next()),
             KeyCode::Char('B') => self.toggle_branches(),
             KeyCode::Char('H') => {
                 if let Some(scope) = self.branches.as_ref().map(|b| b.scope.clone()) {
@@ -3056,6 +3193,7 @@ impl App {
         let focused = self.focus == Focus::Tree;
         let list = self.tree_area;
         let (height, width) = (list.height as usize, list.width as usize);
+        let (sort, filter) = (self.branch_sort, self.branch_filter);
         let Some(b) = &mut self.branches else { return };
         let mut lines = Vec::new();
         let row_style = |selected: bool| match (selected, focused) {
@@ -3074,16 +3212,17 @@ impl App {
             return;
         }
         let back = if b.scope == b.repo { " ⎇ " } else { " ◂ " };
-        let total = b.git.list.len();
-        let count = if b.order.is_empty() {
-            format!("{}/{}… ", total - 1 - b.survey.left.min(total - 1), total - 1)
+        let count = if !b.ready {
+            format!("{}/{}… ", b.survey.jobs - b.survey.left, b.survey.jobs)
         } else {
-            // How many changed it, of how many
-            format!("{} of {total}{} ", b.changing, if b.git.more { "+" } else { "" })
+            // How many changed it, of how many listed, and in what order
+            format!("{} of {}{} · {} ", b.changing, b.order.len(), if b.git.more { "+" } else { "" }, sort.label())
         };
-        header(f, header_area, &format!("{back}{} branches", b.what()), &count, focused);
-        if b.order.is_empty() {
-            lines.push(Line::styled(format!("  Looking into {total} branches…"), dim()));
+        header(f, header_area, &format!("{back}{} {}branches", b.what(), filter.label()), &count, focused);
+        if !b.ready {
+            lines.push(Line::styled(format!("  Looking into {} branches…", b.git.list.len()), dim()));
+        } else if b.order.is_empty() {
+            lines.push(Line::styled(format!("  No {}branches", filter.label()), dim()));
         }
         b.scroll = b.scroll.min(b.order.len().saturating_sub(height));
         for (row, &i) in b.order.iter().enumerate().skip(b.scroll).take(height) {
@@ -3093,8 +3232,7 @@ impl App {
             if row >= b.changing {
                 style = style.add_modifier(Modifier::DIM);
             }
-            let owner = b.survey.work[i].as_ref().and_then(|w| w.owner.as_ref()).map_or(&branch.author, |o| &o.0);
-            let right = format!(" {} {:>3} ", short_name(owner, 12), git::age(branch.time));
+            let right = format!(" {} {:>3} ", short_name(b.owner(i), 12), git::age(branch.time));
             let tag = if i == b.git.base { " base" } else { "" };
             let room = width.saturating_sub(1 + str_width(&right) + tag.len());
             let name = printable(&branch.name);
@@ -3348,7 +3486,7 @@ impl App {
                 "↑↓ files · d diff/file · a all files · ← branches · ⇥ view · q quit"
             }
             (_, Focus::Tree) if self.branches.is_some() => {
-                "↑↓ branches · ⏎ its files · ← wider · Esc files · H history · q quit"
+                "↑↓ branches · ⏎ its files · s sort · f local/remote · ← wider · Esc files · H history · q quit"
             }
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) if !self.tree.marks.is_empty() => {
@@ -3551,7 +3689,8 @@ fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
         Style::new().add_modifier(Modifier::BOLD | Modifier::DIM)
     };
     let width = area.width as usize;
-    let room = width.saturating_sub(str_width(right));
+    // A space always parts the title from what's on the right
+    let room = width.saturating_sub(str_width(right) + usize::from(!right.is_empty()));
     // Long paths lose their beginning, not the file name
     let mut title = title.to_string();
     if str_width(&title) > room {
@@ -3749,7 +3888,7 @@ mod tests {
         /// Draws until every branch has been looked into.
         fn wait_for_branches(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(10);
-            while self.app.branches.as_ref().is_some_and(|b| b.order.is_empty()) && Instant::now() < deadline {
+            while self.app.branches.as_ref().is_some_and(|b| !b.ready) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
                 self.draw();
             }
@@ -4772,6 +4911,88 @@ mod tests {
         assert!(h.app.branches.is_none() && h.app.history.as_ref().is_some_and(|h| h.file.is_some()));
         h.key(KeyCode::Char('B'));
         assert!(h.app.history.is_none() && h.app.branches.is_some());
+
+        // Without a remote, there are no remote branches to list
+        h.wait_for_branches();
+        h.key(KeyCode::Char('f'));
+        h.key(KeyCode::Char('f'));
+        assert!(h.screen().contains("No remote branches") && h.screen().contains("0 of 0"), "{}", h.screen());
+    }
+
+    #[test]
+    fn branches_sort_by_update_name_or_owner_and_show_local_or_remote_ones() {
+        let mut h = Harness::new(&[("a.txt", "one\n")]);
+        let (root, t0, day) = (h.root.clone(), 1_700_000_000, 86_400);
+        // Upstream, out of the tree: zed by Bo, the newest, and able by Cy, the oldest
+        let upstream = tempfile::tempdir().unwrap();
+        let up = upstream.path();
+        fs::write(up.join("a.txt"), "one\n").unwrap();
+        git_as(up, "Ann", t0, &["init", "-q", "-b", "main"]);
+        git_as(up, "Ann", t0, &["add", "."]);
+        git_as(up, "Ann", t0, &["commit", "-q", "-m", "start"]);
+        for (name, who, when) in [("zed", "Bo", t0 + 3 * day), ("able", "Cy", t0 + day)] {
+            git_as(up, "Ann", t0, &["checkout", "-q", "-b", name, "main"]);
+            fs::write(up.join("a.txt"), format!("{name}\n")).unwrap();
+            git_as(up, who, when, &["commit", "-q", "-am", name]);
+        }
+        // Its default branch, which a fetch takes as origin/HEAD
+        git_as(up, "Ann", t0, &["checkout", "-q", "main"]);
+        // Here: the same first commit, so origin/main is main, and mid by Al
+        git_as(&root, "Ann", t0, &["init", "-q", "-b", "main"]);
+        git_as(&root, "Ann", t0, &["add", "."]);
+        git_as(&root, "Ann", t0, &["commit", "-q", "-m", "start"]);
+        git_as(&root, "Ann", t0, &["remote", "add", "origin", &up.to_string_lossy()]);
+        git_as(&root, "Ann", t0, &["fetch", "-q", "origin"]);
+        git_as(&root, "Ann", t0, &["checkout", "-q", "-b", "mid"]);
+        fs::write(root.join("a.txt"), "mid\n").unwrap();
+        git_as(&root, "Al", t0 + 2 * day, &["commit", "-q", "-am", "mid"]);
+        git_as(&root, "Ann", t0, &["checkout", "-q", "main"]);
+        h.app.tree_width = 44;
+        h.app.tree.refresh();
+        h.draw();
+        let listed = |h: &Harness| {
+            let b = h.app.branches.as_ref().unwrap();
+            b.order.iter().map(|&i| b.git.list[i].name.as_str()).collect::<Vec<_>>().join(" ")
+        };
+        let selected = |h: &Harness| {
+            let b = h.app.branches.as_ref().unwrap();
+            b.git.list[b.order[b.selected]].name.clone()
+        };
+
+        // Newest first, those that changed a.txt above the rest, and origin/main left to main
+        h.key(KeyCode::Char('B'));
+        h.wait_for_branches();
+        assert_eq!(listed(&h), "origin/zed mid origin/able main");
+        assert!(h.screen().contains("3 of 4 · newest"), "{}", h.screen());
+        h.key(KeyCode::Char('s'));
+        assert_eq!(listed(&h), "origin/able mid origin/zed main", "by name, the remote's aside");
+        assert!(h.screen().contains("3 of 4 · by name") && h.screen().contains("Sorted by name"), "{}", h.screen());
+        assert_eq!(selected(&h), "origin/zed", "the same branch stays selected");
+        h.key(KeyCode::Char('s'));
+        assert_eq!(listed(&h), "mid origin/zed origin/able main", "by owner: Al, Bo, Cy, then Ann's");
+        h.key(KeyCode::Char('s'));
+        assert_eq!(listed(&h), "origin/zed mid origin/able main");
+        assert!(h.screen().contains("Newest first"), "{}", h.screen());
+
+        // Only the local ones, and then only the remote's, where origin/main is listed too
+        h.key(KeyCode::Char('f'));
+        assert_eq!(listed(&h), "mid main");
+        assert!(h.screen().contains("a.txt local branches") && h.screen().contains("1 of 2"), "{}", h.screen());
+        assert_eq!(selected(&h), "mid", "origin/zed isn't listed, so the first one is selected");
+        assert!(h.screen().contains("⎇ mid"), "and shown:\n{}", h.screen());
+        h.key(KeyCode::Char('f'));
+        assert_eq!(listed(&h), "origin/zed origin/able origin/main");
+        assert!(h.screen().contains("a.txt remote branches") && h.screen().contains("2 of 3"), "{}", h.screen());
+        h.key(KeyCode::Char('f'));
+        assert_eq!(listed(&h), "origin/zed mid origin/able main");
+        assert!(h.screen().contains("Showing all branches"), "{}", h.screen());
+
+        // Kept for the next list of branches
+        h.key(KeyCode::Char('s'));
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Char('B'));
+        h.wait_for_branches();
+        assert_eq!(listed(&h), "origin/able mid origin/zed main");
     }
 
     #[test]

@@ -268,7 +268,7 @@ pub fn age(time: u64) -> String {
 
 // Branches
 
-/// A local branch, or a remote's that no local branch matches.
+/// A local branch, or a remote's.
 pub struct Branch {
     /// "main", or "origin/feature" for a remote's
     pub name: String,
@@ -283,6 +283,9 @@ pub struct Branch {
     pub email: String,
     /// The one checked out
     pub current: bool,
+    /// A remote's, at the same commit as the local branch of the same name, which stands
+    /// in for it among all the branches
+    pub twin: bool,
 }
 
 pub struct Branches {
@@ -290,14 +293,14 @@ pub struct Branches {
     pub list: Vec<Branch>,
     /// The one the others are compared with
     pub base: usize,
-    /// There were more than MAX_BRANCHES, and only the newest are listed
+    /// There were more than MAX_BRANCHES, not counting twins, and only the newest are listed
     pub more: bool,
 }
 
 /// The repository's branches, and the one the others are compared with: the remote's
 /// default branch (the one origin/HEAD names), or else main, master, or the one checked
-/// out. A remote's branch is left out where a local one of the same name is at the same
-/// commit.
+/// out. A remote's branch is marked as a twin where a local one of the same name is at
+/// the same commit.
 pub fn branches(repo: &Path) -> Result<Branches> {
     const FORMAT: &str = "--format=%(objectname)%00%(refname)%00%(committerdate:unix)%00\
         %(committerdate:format-local:%Y-%m-%d %H:%M)%00%(HEAD)%00%(symref)%00%(objecttype)%00\
@@ -336,6 +339,7 @@ pub fn branches(repo: &Path) -> Result<Branches> {
             author: author.to_string(),
             email: email.to_string(),
             current: head == "*",
+            twin: false,
         };
         refs.push((refname, branch));
     }
@@ -361,31 +365,42 @@ pub fn branches(repo: &Path) -> Result<Branches> {
     let Some(base) = base else { bail!("no branches yet") };
     let base = matched[base].unwrap_or(base);
 
-    let mut list = Vec::new();
-    let mut base_at = 0;
-    for (i, (_, branch)) in refs.into_iter().enumerate() {
-        if matched[i].is_none() {
+    let mut list: Vec<Branch> = refs.into_iter().map(|(_, branch)| branch).collect();
+    for (branch, matched) in list.iter_mut().zip(&matched) {
+        branch.twin = matched.is_some();
+    }
+    let (list, base, more) = newest(list, base, MAX_BRANCHES);
+    Ok(Branches { list, base, more })
+}
+
+/// The newest `max` branches, not counting a remote's twins, and the base however old it
+/// is: the list, where the base is in it, and whether any were left out.
+fn newest(list: Vec<Branch>, base: usize, max: usize) -> (Vec<Branch>, usize, bool) {
+    if list.iter().filter(|b| !b.twin).count() <= max {
+        return (list, base, false);
+    }
+    // One place is the base's. A twin comes along until the first branch with no room.
+    let (mut room, mut full) = (max.saturating_sub(1), false);
+    let keep: Vec<bool> = list
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
             if i == base {
-                base_at = list.len();
+                return true;
             }
-            list.push(branch);
-        }
-    }
-    let more = list.len() > MAX_BRANCHES;
-    if more {
-        // The base stays, however old it is
-        let kept = (base_at >= MAX_BRANCHES).then(|| list.remove(base_at));
-        list.truncate(MAX_BRANCHES - usize::from(kept.is_some()));
-        if let Some(branch) = kept {
-            base_at = list.len();
-            list.push(branch);
-        }
-    }
-    Ok(Branches { list, base: base_at, more })
+            if !b.twin {
+                full |= room == 0;
+                room = room.saturating_sub(1);
+            }
+            !full
+        })
+        .collect();
+    let base = keep[..base].iter().filter(|&&k| k).count();
+    (list.into_iter().zip(keep).filter_map(|(b, k)| k.then_some(b)).collect(), base, true)
 }
 
 /// What a branch did on its own, since it split off from the base.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Work {
     /// Its own commits: on it, and not on the base
     pub commits: usize,
@@ -560,8 +575,12 @@ fn commit_lines(repo: &Path, range: &str, scope: Option<&Path>) -> Result<Vec<St
 pub struct Survey {
     /// Each branch's, once it's come in; never the base's
     pub work: Vec<Option<Work>>,
-    /// How many are still to come
+    /// How many commits there are to look into, and how many are still to come.
+    /// Branches at the same commit did the same, so each commit is looked into once.
+    pub jobs: usize,
     pub left: usize,
+    /// The branches at each of those commits
+    at: Vec<Vec<usize>>,
     stop: Arc<AtomicBool>,
     found: mpsc::Receiver<(usize, Work)>,
 }
@@ -570,29 +589,32 @@ impl Survey {
     /// Starts looking into what each branch but the base did to `scope`.
     pub fn start(repo: &Path, branches: &Branches, scope: Option<&Path>) -> Self {
         let base = branches.list[branches.base].tip.clone();
-        let jobs: Vec<(usize, String)> = branches
-            .list
-            .iter()
-            .enumerate()
-            .filter(|&(i, _)| i != branches.base)
-            .map(|(i, b)| (i, b.tip.clone()))
-            .collect();
+        let (mut tips, mut at, mut job) = (Vec::new(), Vec::<Vec<usize>>::new(), HashMap::new());
+        for (i, branch) in branches.list.iter().enumerate().filter(|&(i, _)| i != branches.base) {
+            let j = *job.entry(branch.tip.as_str()).or_insert_with(|| {
+                tips.push(branch.tip.clone());
+                at.push(Vec::new());
+                tips.len() - 1
+            });
+            at[j].push(i);
+        }
         let (sender, found) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
-        let left = jobs.len();
+        let jobs = tips.len();
         let (repo, scope, halt) = (repo.to_path_buf(), scope.map(Path::to_path_buf), stop.clone());
         thread::spawn(move || {
             let next = AtomicUsize::new(0);
-            let (jobs, next, repo, scope, base, halt) = (&jobs, &next, &repo, &scope, &base, &halt);
+            let (tips, next, repo, scope, base, halt) = (&tips, &next, &repo, &scope, &base, &halt);
             thread::scope(|s| {
-                for _ in 0..cores().min(jobs.len()) {
+                for _ in 0..cores().min(tips.len()) {
                     let sender = sender.clone();
                     s.spawn(move || {
                         while !halt.load(Ordering::Relaxed) {
-                            let Some((i, tip)) = jobs.get(next.fetch_add(1, Ordering::Relaxed)) else { break };
+                            let j = next.fetch_add(1, Ordering::Relaxed);
+                            let Some(tip) = tips.get(j) else { break };
                             let work = branch_work(repo, base, tip, scope.as_deref())
                                 .unwrap_or_else(|e| Work { error: Some(format!("{e:#}")), ..Work::default() });
-                            if sender.send((*i, work)).is_err() {
+                            if sender.send((j, work)).is_err() {
                                 break;
                             }
                         }
@@ -600,15 +622,17 @@ impl Survey {
                 }
             });
         });
-        Self { work: branches.list.iter().map(|_| None).collect(), left, stop, found }
+        Self { work: branches.list.iter().map(|_| None).collect(), jobs, left: jobs, at, stop, found }
     }
 
     /// Takes in what's been found since last time.
     pub fn poll(&mut self) {
         loop {
             match self.found.try_recv() {
-                Ok((i, work)) => {
-                    self.work[i] = Some(work);
+                Ok((j, work)) => {
+                    for &i in &self.at[j] {
+                        self.work[i] = Some(work.clone());
+                    }
                     self.left = self.left.saturating_sub(1);
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -711,22 +735,24 @@ mod tests {
 
         let b = branches(&root).unwrap();
         let names: Vec<&str> = b.list.iter().map(|b| b.name.as_str()).collect();
-        assert_eq!(names, vec!["origin/pages", "main", "feature"], "newest first, origin's own left out");
+        assert_eq!(names, vec!["origin/pages", "main", "origin/main", "feature", "origin/feature"], "newest first");
+        let twins: Vec<bool> = b.list.iter().map(|b| b.twin).collect();
+        assert_eq!(twins, vec![false, false, true, false, true], "origin's own, where local ones stand in");
         assert_eq!((b.list[b.base].name.as_str(), b.list[b.base].current), ("main", true));
-        assert_eq!((b.list[2].author.as_str(), b.list[2].email.as_str()), ("Bob", "bob@x"));
-        assert!(b.list[0].remote && !b.more);
+        assert_eq!((b.list[3].author.as_str(), b.list[3].email.as_str()), ("Bob", "bob@x"));
+        assert!(b.list[0].remote && !b.list[3].remote && !b.more);
 
         // The feature's own commits and changes, not main's since it split off
         let base = &b.list[b.base].tip;
-        let work = branch_work(&root, base, &b.list[2].tip, Some(&src)).unwrap();
+        let work = branch_work(&root, base, &b.list[3].tip, Some(&src)).unwrap();
         assert_eq!(work.commits, 3);
         assert_eq!(work.owner.as_ref().map(|o| (o.0.as_str(), o.1.as_str(), o.2)), Some(("Alice", "alice@x", 2)));
         let changed: Vec<(char, &str)> = work.changes.iter().map(|c| (c.status, c.path.as_str())).collect();
         assert_eq!(changed, vec![('M', "src/a.txt"), ('A', "src/b.txt")]);
-        let readme = branch_work(&root, base, &b.list[2].tip, Some(&root.join("README"))).unwrap();
+        let readme = branch_work(&root, base, &b.list[3].tip, Some(&root.join("README"))).unwrap();
         assert!(readme.changes.is_empty() && readme.commits == 3);
 
-        let page = branch_text(&root, &b, 2, Some(&work), Some(&src), "src/").unwrap();
+        let page = branch_text(&root, &b, 3, Some(&work), Some(&src), "src/").unwrap();
         let page = String::from_utf8(page).unwrap();
         assert!(page.contains("Owner     Alice <alice@x>, who made 2 of its 3 commits"), "{page}");
         assert!(page.contains("by Bob <bob@x>") && page.contains("Compared  with main"), "{page}");
@@ -741,8 +767,10 @@ mod tests {
         let page = String::from_utf8(branch_text(&root, &b, b.base, None, Some(&src), "src/").unwrap()).unwrap();
         assert!(page.contains("The branch the others are compared with") && page.contains("start"), "{page}");
 
-        // The survey finds the same on all the cores, for every branch but the base
+        // The survey finds the same on all the cores, for every branch but the base, and
+        // looks into each commit once: feature and origin/feature are at the same one
         let mut survey = Survey::start(&root, &b, Some(&src));
+        assert_eq!(survey.jobs, 3);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while survey.left > 0 && std::time::Instant::now() < deadline {
             survey.poll();
@@ -750,8 +778,38 @@ mod tests {
         }
         assert_eq!(survey.left, 0);
         assert!(survey.work[b.base].is_none());
-        assert_eq!(survey.work[2].as_ref().unwrap().changes.len(), 2);
+        assert_eq!(survey.work[3].as_ref().unwrap().changes.len(), 2);
+        assert_eq!(survey.work[4].as_ref().unwrap().changes.len(), 2);
+        assert_eq!(survey.work[2].as_ref().unwrap().commits, 0, "origin/main is main");
         assert!(survey.work[0].as_ref().unwrap().split.is_none());
+    }
+
+    #[test]
+    fn the_newest_branches_are_kept_and_twins_come_free() {
+        let branch = |name: &str, twin: bool| Branch {
+            name: name.to_string(),
+            remote: twin,
+            tip: String::new(),
+            time: 0,
+            date: String::new(),
+            author: String::new(),
+            email: String::new(),
+            current: false,
+            twin,
+        };
+        let list = || {
+            let names =
+                [("a", false), ("origin/a", true), ("b", false), ("origin/b", true), ("c", false), ("main", false)];
+            names.map(|(name, twin)| branch(name, twin)).into_iter().collect::<Vec<_>>()
+        };
+        let kept = |(list, base, more): (Vec<Branch>, usize, bool)| {
+            (list.iter().map(|b| b.name.as_str()).collect::<Vec<_>>().join(" "), base, more)
+        };
+        assert_eq!(kept(newest(list(), 5, 4)), ("a origin/a b origin/b c main".into(), 5, false));
+        // The newest two, their twins, and the base, old as it is
+        assert_eq!(kept(newest(list(), 5, 3)), ("a origin/a b origin/b main".into(), 4, true));
+        // The base among the newest
+        assert_eq!(kept(newest(list(), 0, 2)), ("a origin/a b origin/b".into(), 0, true));
     }
 
     #[test]

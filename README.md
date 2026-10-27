@@ -155,11 +155,17 @@ folder and on up to the whole repository.
 ## Git branches
 
 Press `B` on any file or folder in a git repository to see all the repository's
-branches, with whose each one is and when it was last updated. The branches that changed what you pressed it
-on come first, and the rest are dimmed. Each branch is compared with the repository's
-main branch (the one `origin/HEAD` names, or else `main` or `master`) from where it split
-off, so you see only what that branch did. Its owner is whoever made most of those
-commits. A remote's branches are included too, as of your last `git fetch`.
+branches, with whose each one is and when it was last updated. The branches that changed
+what you pressed it on come first, and the rest are dimmed. Each branch is compared with
+the repository's main branch (the one `origin/HEAD` names, or else `main` or `master`)
+from where it split off, so you see only what that branch did. Its owner is whoever made
+most of those commits. A remote's branches are included too, as of your last `git fetch`;
+one at the same commit as the local branch of the same name is listed once, as the local
+one.
+
+`s` sorts the branches newest first, by name or by owner, and `f` switches between all
+of them, just the local ones and just the remote's. Either way, the ones that changed
+what you pressed `B` on stay at the top.
 
 Moving through the list shows each branch's page: its owner, when it changed, its
 commits, and the diff. `Enter` opens a branch to go through the files it changed, each as
@@ -257,7 +263,7 @@ date too.
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
-| Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `←` back, or wider · `H` history · `Esc` leave |
+| Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches · `←` back, or wider · `H` history · `Esc` leave |
 
 `Tab` always switches panes, even while editing, so there is no key that inserts a tab
 character. `Enter` keeps the line's indentation. With word wrap on, the arrow keys move

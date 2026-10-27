@@ -111,6 +111,7 @@ Keys
                was last updated, those that changed it first
                ↑↓ branches · Enter the files it changed · d diff or file
                a all the files it changed · ← back, or wider · H its history
+               s newest first, by name or by owner · f all, local or remote
                Esc leave
   Anywhere     ? help, with the version (F1 while typing)
                Ctrl+Q or Ctrl+C quit (q when not editing; while editing,
