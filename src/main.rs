@@ -92,7 +92,7 @@ Keys
   Tree         ↑↓/jk move · Enter open · ←→/hl fold · / filter by name
                Backspace or .. up a folder
                F find text in all the files (Esc back to the tree)
-               . hidden files · r refresh · H git history
+               . hidden files · r refresh · H git history · B branches
                Space mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
                F2 rename · drag marked files onto a folder to move them
   File         ↑↓ PgUp PgDn Home End scroll · ← back to the tree
@@ -105,8 +105,14 @@ Keys
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
   History      H on a file or folder · ↑↓ commits · Enter its files
                d diff or file · a all files · ← back, or a wider history
+               B its branches · Esc leave
+  Branches     B on a file or folder: every branch, with its owner and when it
+               was last updated, those that changed it first
+               ↑↓ branches · Enter the files it changed · d diff or file
+               a all the files it changed · ← back, or wider · H its history
                Esc leave
-  Anywhere     Ctrl+Q quit (q when not editing)
+  Anywhere     Ctrl+Q or Ctrl+C quit (q when not editing; while editing,
+               Ctrl+C copies the selected text if there is some)
 
 Mouse
   Click a directory or archive to fold it, a file to open it; double-click a

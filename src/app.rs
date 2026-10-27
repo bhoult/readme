@@ -82,6 +82,8 @@ enum Source {
     Disk,
     Archive,
     History,
+    /// A branch's page, or a file as a branch has it
+    Branch,
 }
 
 /// An open text file and how it's being shown.
@@ -547,6 +549,49 @@ struct Opened {
     scroll: usize,
 }
 
+/// The left pane's branches view: every branch, those that changed the file or folder
+/// first, and the files one of them changed once it's opened.
+struct BranchView {
+    repo: PathBuf,
+    /// The file or folder asked about
+    scope: PathBuf,
+    /// For a file, its path in the repository
+    file: Option<String>,
+    git: git::Branches,
+    /// What each branch did, coming in
+    survey: git::Survey,
+    /// Once the survey's done, the branches in the order shown, and how many at the top
+    /// changed the scope
+    order: Vec<usize>,
+    changing: usize,
+    selected: usize,
+    scroll: usize,
+    opened: Option<OpenedBranch>,
+    /// Files show as they are on the branch rather than as diffs
+    whole: bool,
+}
+
+impl BranchView {
+    /// The file or folder asked about, for git: none for the whole repository.
+    fn scope_arg(&self) -> Option<&Path> {
+        (self.scope != self.repo).then_some(self.scope.as_path())
+    }
+
+    fn what(&self) -> String {
+        scope_name(&self.repo, &self.scope, self.file.as_deref())
+    }
+}
+
+struct OpenedBranch {
+    /// Which branch, in the list
+    branch: usize,
+    files: Vec<git::Change>,
+    /// Every file it changed, not just the ones under the scope
+    all: bool,
+    selected: usize,
+    scroll: usize,
+}
+
 enum Prompt {
     Unsaved(After),
     /// Saving would write over changes made on disk since the file was read; what to do
@@ -588,6 +633,7 @@ enum After {
 enum Preview {
     Tree,
     History,
+    Branches,
     Grep,
 }
 
@@ -631,6 +677,8 @@ pub struct App {
     wrap: bool,
     /// The left pane shows git history instead of the files
     history: Option<History>,
+    /// The left pane shows the branches instead of the files
+    branches: Option<BranchView>,
     picker: Picker,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
@@ -674,6 +722,7 @@ impl App {
             filtering: false,
             wrap: false,
             history: None,
+            branches: None,
             picker: Picker::halfblocks(),
             gallery_stash: None,
             grep: None,
@@ -737,7 +786,7 @@ impl App {
             // A note (moved to the trash, couldn't be read) is tried again
             Shown::Note(..) | Shown::Nothing => return false,
         };
-        self.shown_path() == Some(path) && source != Source::History
+        self.shown_path() == Some(path) && !matches!(source, Source::History | Source::Branch)
     }
 
     /// How images are drawn, once the terminal has been asked. The image on screen, if
@@ -758,6 +807,11 @@ impl App {
     /// Typing goes into the file.
     pub fn editing(&self) -> bool {
         self.focus == Focus::Content && matches!(&self.shown, Shown::Doc(doc) if doc.editing)
+    }
+
+    /// Text is selected in the editor, which Ctrl+C copies.
+    fn copying(&self) -> bool {
+        self.editing() && matches!(&self.shown, Shown::Doc(doc) if doc.buf.selection().is_some())
     }
 
     /// Whether there's drawing left that the next frames do, so they should come soon.
@@ -856,6 +910,7 @@ impl App {
                     Source::Disk => None,
                     Source::Archive => Some("in an archive"),
                     Source::History => Some("from history"),
+                    Source::Branch => Some("from a branch"),
                 });
                 Shown::Doc(Box::new(Doc::new(path, *buf, self.wrap, source, label)))
             }
@@ -1013,6 +1068,7 @@ impl App {
         match self.pending.take() {
             Some(Preview::Tree) => self.preview(),
             Some(Preview::History) => self.history_preview(),
+            Some(Preview::Branches) => self.branches_preview(),
             Some(Preview::Grep) => self.grep_preview(),
             None => {}
         }
@@ -1038,13 +1094,20 @@ impl App {
         if matches!(self.drag, Drag::Tree { .. }) {
             self.drag = Drag::None;
         }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        // Ctrl+C quits, as it does in most terminal programs, though in the editor it
+        // copies what's selected. The question about unsaved changes takes it as a no.
+        let ctrl_c = ctrl && key.code == KeyCode::Char('c');
         if let Some(prompt) = self.prompt.take() {
+            if ctrl_c && !matches!(prompt, Prompt::Unsaved(_)) {
+                return self.request_quit();
+            }
             return self.prompt_key(prompt, key);
         }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Char('q') if ctrl => return self.request_quit(),
+            KeyCode::Char('c') if ctrl && !self.copying() => return self.request_quit(),
             KeyCode::Char('s') if ctrl => return self.save_then(None),
             KeyCode::Char('z') if alt => return self.toggle_wrap(),
             KeyCode::Tab | KeyCode::BackTab => {
@@ -1057,6 +1120,7 @@ impl App {
         match self.focus {
             Focus::Tree if self.grep.is_some() => self.grep_key(key),
             Focus::Tree if self.history.is_some() => self.history_key(key),
+            Focus::Tree if self.branches.is_some() => self.branches_key(key),
             Focus::Tree if self.filtering => self.filter_key(key),
             Focus::Tree => self.tree_key(key),
             Focus::Content if self.editing() => self.edit_key(key),
@@ -1198,6 +1262,7 @@ impl App {
             }
             KeyCode::Char('r') | KeyCode::F(5) => self.tree.refresh(),
             KeyCode::Char('H') => self.toggle_history(),
+            KeyCode::Char('B') => self.toggle_branches(),
             KeyCode::Char('F') => self.prompt = Some(Prompt::Grep(self.last_grep.clone())),
             KeyCode::Char('q') => self.request_quit(),
             _ => {}
@@ -1213,6 +1278,7 @@ impl App {
         }
         self.last_grep = query.clone();
         self.history = None;
+        self.branches = None;
         self.filtering = false;
         self.grep = Some(Grep::start(&self.tree.root, &query, self.tree.show_hidden, self.tree.rules_above));
         self.focus = Focus::Tree;
@@ -1311,31 +1377,45 @@ impl App {
         if self.history.take().is_some() {
             return self.say("Back to the files");
         }
-        // The history of what's selected in the tree, or of what's open
+        let scope = self.picked();
+        self.show_history(scope);
+    }
+
+    /// What the history or the branches are of: what's selected in the tree, or what's open.
+    fn picked(&self) -> PathBuf {
         let picked = match self.focus {
             Focus::Tree => self.tree.selected_entry().map(|r| r.path.clone()),
             Focus::Content => self.shown_path().map(Path::to_path_buf),
         };
-        let scope = picked.filter(|p| p.exists()).unwrap_or_else(|| self.tree.root.clone());
-        self.show_history(scope);
+        picked.filter(|p| p.exists()).unwrap_or_else(|| self.tree.root.clone())
     }
 
-    /// The commits that touched a file or folder.
-    fn show_history(&mut self, scope: PathBuf) {
+    /// The repository a file or folder is in, the file or folder as git sees it, and for
+    /// a file, its path in the repository. If it isn't in one, the status line says so.
+    fn in_repo(&mut self, scope: PathBuf) -> Option<(PathBuf, PathBuf, Option<String>)> {
         let dir = if scope.is_dir() { scope.clone() } else { scope.parent().unwrap_or(&scope).to_path_buf() };
         let Some(repo) = git::repo_root(&dir) else {
-            return self.say(format!("{} isn't in a git repository", file_name(&scope)));
+            self.say(format!("{} isn't in a git repository", file_name(&scope)));
+            return None;
         };
         // git gives the repository's real path, which may differ from ours by symlinks
         let scope = scope.canonicalize().unwrap_or(scope);
         let file = scope.is_file().then(|| scope.strip_prefix(&repo).unwrap_or(&scope).to_string_lossy().into_owned());
+        Some((repo, scope, file))
+    }
+
+    /// The commits that touched a file or folder.
+    fn show_history(&mut self, scope: PathBuf) {
+        let Some((repo, scope, file)) = self.in_repo(scope) else { return };
         match git::log(&repo, &scope, file.is_some()) {
             Ok(commits) if commits.is_empty() => self.say(format!("No commits for {} yet", file_name(&scope))),
             Ok(commits) => {
                 self.history =
                     Some(History { repo, scope, file, commits, selected: 0, scroll: 0, opened: None, diff: false });
-                // It takes the left pane, which find-in-files' results would otherwise keep
+                // It takes the left pane, which find-in-files' results or the branches would
+                // otherwise keep
                 self.grep = None;
+                self.branches = None;
                 self.focus = Focus::Tree;
                 self.filtering = false;
                 self.history_preview();
@@ -1425,6 +1505,11 @@ impl App {
             }
             KeyCode::Char('a') => self.history_all_files(),
             KeyCode::Char('H') => self.toggle_history(),
+            KeyCode::Char('B') => {
+                if let Some(scope) = self.history.as_ref().map(|h| h.scope.clone()) {
+                    self.show_branches(scope);
+                }
+            }
             KeyCode::Char('q') => self.request_quit(),
             _ => {}
         }
@@ -1433,18 +1518,9 @@ impl App {
     fn history_move(&mut self, delta: isize) {
         let height = self.tree_area.height.max(1) as usize;
         let Some(h) = &mut self.history else { return };
-        let (selected, scroll, len) = match &mut h.opened {
-            Some(o) => (&mut o.selected, &mut o.scroll, o.files.len()),
-            None => (&mut h.selected, &mut h.scroll, h.commits.len()),
-        };
-        if len == 0 {
-            return;
-        }
-        *selected = selected.saturating_add_signed(delta).min(len - 1);
-        if *selected < *scroll {
-            *scroll = *selected;
-        } else if *selected >= *scroll + height {
-            *scroll = *selected + 1 - height;
+        match &mut h.opened {
+            Some(o) => step(&mut o.selected, &mut o.scroll, o.files.len(), delta, height),
+            None => step(&mut h.selected, &mut h.scroll, h.commits.len(), delta, height),
         }
         self.pending = Some(Preview::History);
     }
@@ -1526,6 +1602,240 @@ impl App {
         let all = opened.all;
         self.history_preview();
         self.say(if all { "All files at this commit" } else { "Files this commit changed" });
+    }
+
+    // Branches
+
+    fn toggle_branches(&mut self) {
+        if self.branches.take().is_some() {
+            return self.say("Back to the files");
+        }
+        let scope = self.picked();
+        self.show_branches(scope);
+    }
+
+    /// Every branch of the repository a file or folder is in, those that changed it first
+    /// once each one's been looked into.
+    fn show_branches(&mut self, scope: PathBuf) {
+        let Some((repo, scope, file)) = self.in_repo(scope) else { return };
+        match git::branches(&repo) {
+            Ok(list) => {
+                let survey = git::Survey::start(&repo, &list, (scope != repo).then_some(scope.as_path()));
+                self.branches = Some(BranchView {
+                    repo,
+                    scope,
+                    file,
+                    git: list,
+                    survey,
+                    order: Vec::new(),
+                    changing: 0,
+                    selected: 0,
+                    scroll: 0,
+                    opened: None,
+                    whole: false,
+                });
+                // It takes the left pane from the history or find-in-files' results
+                self.history = None;
+                self.grep = None;
+                self.focus = Focus::Tree;
+                self.filtering = false;
+                self.branches_poll();
+            }
+            Err(e) => self.say(format!("Couldn't read the branches: {e}")),
+        }
+    }
+
+    /// Takes in what's been found about the branches. Once it's all in, they're put in
+    /// order, those that changed the file or folder first, and the first one shows.
+    fn branches_poll(&mut self) {
+        let Some(b) = &mut self.branches else { return };
+        if !b.order.is_empty() {
+            return;
+        }
+        b.survey.poll();
+        if b.survey.left > 0 {
+            return;
+        }
+        let (base, work) = (b.git.base, &b.survey.work);
+        let changed = |i: &usize| *i != base && work[*i].as_ref().is_some_and(|w| !w.changes.is_empty());
+        // Newest first within each part, as they're listed
+        let (mut order, rest): (Vec<usize>, Vec<usize>) = (0..b.git.list.len()).partition(changed);
+        b.changing = order.len();
+        order.extend(rest);
+        b.order = order;
+        self.branches_preview();
+    }
+
+    /// Shows the selected branch's page, or the selected file of the opened branch, as
+    /// what the branch changed or as it is there.
+    fn branches_preview(&mut self) {
+        self.pending = None;
+        // The branches still show, but a file with unsaved changes stays on screen
+        if self.dirty() {
+            return self.say("Save or discard your changes first, to see other files");
+        }
+        let Some(b) = &self.branches else { return };
+        let Some(&i) = b.order.get(b.selected) else { return };
+        let (repo, branch) = (&b.repo, &b.git.list[i]);
+        let (path, bytes, label) = match &b.opened {
+            None => {
+                let bytes = git::branch_text(repo, &b.git, i, b.survey.work[i].as_ref(), b.scope_arg(), &b.what());
+                (repo.join(format!("{}.diff", branch.name)), bytes, format!(" ⎇ {}", branch.name))
+            }
+            Some(o) => {
+                let Some(change) = o.files.get(o.selected) else { return };
+                let Some(split) = b.survey.work[o.branch].as_ref().and_then(|w| w.split.as_deref()) else { return };
+                let (file, branch) = (&change.path, &b.git.list[o.branch]);
+                if !b.whole {
+                    let bytes = git::diff_between(repo, split, &branch.tip, file, change.from.as_deref());
+                    (repo.join(format!("{file}.diff")), bytes, format!(" {file} · diff on {}", branch.name))
+                } else if change.status == 'D' {
+                    // A file the branch deleted, as it was where the branch split off
+                    let label = format!(" {file} · before {} deleted it", branch.name);
+                    (repo.join(file), git::show(repo, split, file), label)
+                } else {
+                    (repo.join(file), git::show(repo, &branch.tip, file), format!(" {file} @ {}", branch.name))
+                }
+            }
+        };
+        self.shown = self.show_bytes(&path, bytes, Source::Branch, Some(label));
+    }
+
+    fn branches_key(&mut self, key: KeyEvent) {
+        let page = self.tree_area.height.max(1) as isize;
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => self.branches_move(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.branches_move(1),
+            KeyCode::PageUp => self.branches_move(-page),
+            KeyCode::PageDown => self.branches_move(page),
+            KeyCode::Home | KeyCode::Char('g') => self.branches_move(isize::MIN / 2),
+            KeyCode::End | KeyCode::Char('G') => self.branches_move(isize::MAX / 2),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.branches_enter(),
+            KeyCode::Left | KeyCode::Char('h') | KeyCode::Backspace => self.branches_back(),
+            KeyCode::Esc => self.branches_leave(),
+            KeyCode::Char('d') => {
+                if let Some(b) = &mut self.branches {
+                    b.whole = !b.whole;
+                    let whole = b.whole;
+                    self.branches_preview();
+                    self.say(if whole { "Showing files as they are on the branch" } else { "Showing what it changed" });
+                }
+            }
+            KeyCode::Char('a') => self.branches_all_files(),
+            KeyCode::Char('B') => self.toggle_branches(),
+            KeyCode::Char('H') => {
+                if let Some(scope) = self.branches.as_ref().map(|b| b.scope.clone()) {
+                    self.show_history(scope);
+                }
+            }
+            KeyCode::Char('q') => self.request_quit(),
+            _ => {}
+        }
+    }
+
+    fn branches_move(&mut self, delta: isize) {
+        let height = self.tree_area.height.max(1) as usize;
+        let Some(b) = &mut self.branches else { return };
+        match &mut b.opened {
+            Some(o) => step(&mut o.selected, &mut o.scroll, o.files.len(), delta, height),
+            None => step(&mut b.selected, &mut b.scroll, b.order.len(), delta, height),
+        }
+        self.pending = Some(Preview::Branches);
+    }
+
+    /// Opens the selected branch's files: those it changed under the file or folder, or
+    /// if none, all it changed. From its files, moves into the selected one.
+    fn branches_enter(&mut self) {
+        let height = self.tree_area.height as usize;
+        let Some(b) = &mut self.branches else { return };
+        if b.opened.is_some() {
+            self.focus = Focus::Content;
+            return;
+        }
+        let Some(&i) = b.order.get(b.selected) else { return };
+        let (name, base) = (b.git.list[i].name.clone(), b.git.list[b.git.base].name.clone());
+        let (work, split) = match b.survey.work[i].as_ref() {
+            _ if i == b.git.base => return self.say(format!("{name} is the branch the others are compared with")),
+            Some(git::Work { error: Some(why), .. }) => {
+                let message = format!("Couldn't look into {name}: {why}");
+                return self.say(message);
+            }
+            Some(work) if work.commits == 0 => return self.say(format!("{name} has no commits of its own")),
+            Some(work @ git::Work { split: Some(split), .. }) => (work, split),
+            Some(_) => return self.say(format!("{name} has no history in common with {base}")),
+            None => return,
+        };
+        let all = work.changes.is_empty();
+        let files = if all {
+            match git::changes_between(&b.repo, split, &b.git.list[i].tip, None) {
+                Ok(files) => files,
+                Err(e) => return self.say(format!("Couldn't read what {name} changed: {e}")),
+            }
+        } else {
+            work.changes.clone()
+        };
+        if files.is_empty() {
+            return self.say(format!("In all, {name} changes nothing"));
+        }
+        let message = all.then(|| format!("Nothing under {}; these are all the files {name} changed", b.what()));
+        // For a file, start on it
+        let start = b.file.as_ref().and_then(|f| files.iter().position(|c| c.path == *f)).unwrap_or(0);
+        b.opened =
+            Some(OpenedBranch { branch: i, files, all, selected: start, scroll: start.saturating_sub(height / 2) });
+        self.branches_preview();
+        if let Some(message) = message {
+            self.say(message);
+        }
+    }
+
+    /// Back from a branch's files to the branches; from the branches, out to the folder
+    /// around (up to the whole repository), and from there back to the files.
+    fn branches_back(&mut self) {
+        let Some(b) = &mut self.branches else { return };
+        if b.opened.take().is_some() {
+            return self.branches_preview();
+        }
+        if b.scope != b.repo
+            && let Some(parent) = b.scope.parent().map(Path::to_path_buf)
+        {
+            return self.show_branches(parent);
+        }
+        self.branches_leave();
+    }
+
+    /// Out of a branch's files, or else out of the branches.
+    fn branches_leave(&mut self) {
+        let Some(b) = &mut self.branches else { return };
+        if b.opened.take().is_some() {
+            return self.branches_preview();
+        }
+        self.branches = None;
+        self.say("Back to the files");
+    }
+
+    /// Switches an opened branch between the files it changed under the file or folder
+    /// and all the files it changed.
+    fn branches_all_files(&mut self) {
+        let height = self.tree_area.height as usize;
+        let Some(b) = &mut self.branches else { return };
+        let scope = b.scope_arg().map(Path::to_path_buf);
+        let what = b.what();
+        let Some(o) = &mut b.opened else { return };
+        let tip = &b.git.list[o.branch].tip;
+        let Some(split) = b.survey.work[o.branch].as_ref().and_then(|w| w.split.as_deref()) else { return };
+        let all = !o.all;
+        let files = match git::changes_between(&b.repo, split, tip, if all { None } else { scope.as_deref() }) {
+            Ok(files) if files.is_empty() => return self.say(format!("Nothing it changed is under {what}")),
+            Ok(files) => files,
+            Err(e) => return self.say(format!("Couldn't read what it changed: {e}")),
+        };
+        let current = o.files.get(o.selected).map(|c| c.path.clone());
+        o.files = files;
+        o.all = all;
+        o.selected = current.and_then(|p| o.files.iter().position(|c| c.path == p)).unwrap_or(0);
+        o.scroll = o.selected.saturating_sub(height / 2);
+        self.branches_preview();
+        self.say(if all { "All the files it changed".to_string() } else { format!("The files it changed in {what}") });
     }
 
     /// Typing in the tree's filter box.
@@ -1710,9 +2020,9 @@ impl App {
             KeyCode::Char('n') => return self.find(true, false),
             KeyCode::Char('N') => return self.find(false, false),
             KeyCode::Char('y') => return self.copy_selection(),
-            KeyCode::Char('c') if ctrl => return self.copy_selection(),
             KeyCode::Char('w') => return self.toggle_wrap(),
             KeyCode::Char('H') => return self.toggle_history(),
+            KeyCode::Char('B') => return self.toggle_branches(),
             KeyCode::Char('F') => return self.prompt = Some(Prompt::Grep(self.last_grep.clone())),
             KeyCode::Esc => {
                 self.search = None;
@@ -1994,6 +2304,9 @@ impl App {
                 } else if self.history.is_some() && x < self.divider_x && y < self.content_area.bottom() {
                     self.focus = Focus::Tree;
                     self.history_click(y, double);
+                } else if self.branches.is_some() && x < self.divider_x && y < self.content_area.bottom() {
+                    self.focus = Focus::Tree;
+                    self.branches_click(y, double);
                 } else if self.filter_area.contains(at) {
                     self.focus = Focus::Tree;
                     self.filtering = true;
@@ -2073,6 +2386,15 @@ impl App {
                         };
                         *scroll = scroll.saturating_add_signed(delta).min(len.saturating_sub(height));
                     }
+                } else if self.tree_area.contains(at) && self.branches.is_some() {
+                    let height = self.tree_area.height as usize;
+                    if let Some(b) = &mut self.branches {
+                        let (scroll, len) = match &mut b.opened {
+                            Some(o) => (&mut o.scroll, o.files.len()),
+                            None => (&mut b.scroll, b.order.len()),
+                        };
+                        *scroll = scroll.saturating_add_signed(delta).min(len.saturating_sub(height));
+                    }
                 } else if self.tree_area.contains(at) {
                     let max = self.tree.rows.len().saturating_sub(self.tree_area.height as usize);
                     self.tree.scroll = self.tree.scroll.saturating_add_signed(delta).min(max);
@@ -2124,6 +2446,33 @@ impl App {
         }
         if double {
             self.history_enter();
+        }
+    }
+
+    /// A click in the branches pane: its title goes back, a row selects (or with a
+    /// double-click, opens).
+    fn branches_click(&mut self, y: u16, double: bool) {
+        if y < self.tree_area.y {
+            // Once for a double-click, which would otherwise go back two steps
+            if !double {
+                self.branches_back();
+            }
+            return;
+        }
+        let Some(b) = &self.branches else { return };
+        let (scroll, selected, len) = match &b.opened {
+            Some(o) => (o.scroll, o.selected, o.files.len()),
+            None => (b.scroll, b.selected, b.order.len()),
+        };
+        let row = scroll + (y - self.tree_area.y) as usize;
+        if row >= len {
+            return;
+        }
+        if row != selected {
+            self.branches_move(row as isize - selected as isize);
+        }
+        if double {
+            self.branches_enter();
         }
     }
 
@@ -2493,7 +2842,10 @@ impl App {
                 self.grep_preview();
             }
         }
-        let filter = u16::from(self.tree.filter.is_some() && self.history.is_none() && self.grep.is_none());
+        self.branches_poll();
+        let filter = u16::from(
+            self.tree.filter.is_some() && self.history.is_none() && self.branches.is_none() && self.grep.is_none(),
+        );
         self.divider_x = area.x + tw;
         self.filter_area = Rect::new(area.x, area.y + 1, tw, filter);
         self.tree_area = Rect::new(area.x, area.y + 1 + filter, tw, body - 1 - filter);
@@ -2503,6 +2855,8 @@ impl App {
             self.draw_grep(f, Rect::new(area.x, area.y, tw, 1));
         } else if self.history.is_some() {
             self.draw_history(f, Rect::new(area.x, area.y, tw, 1));
+        } else if self.branches.is_some() {
+            self.draw_branches(f, Rect::new(area.x, area.y, tw, 1));
         } else {
             self.draw_tree(f, Rect::new(area.x, area.y, tw, 1));
         }
@@ -2639,11 +2993,7 @@ impl App {
         };
         match &mut h.opened {
             None => {
-                let what = match &h.file {
-                    Some(file) => file.rsplit('/').next().unwrap_or(file).to_string(),
-                    None if h.scope == h.repo => file_name(&h.repo),
-                    None => format!("{}/", h.scope.strip_prefix(&h.repo).unwrap_or(&h.scope).display()),
-                };
+                let what = scope_name(&h.repo, &h.scope, h.file.as_deref());
                 let back = if h.scope == h.repo { " ⎇ " } else { " ◂ " };
                 header(f, header_area, &format!("{back}{what} history"), &format!("{} ", h.commits.len()), focused);
                 h.scroll = h.scroll.min(h.commits.len().saturating_sub(height));
@@ -2675,27 +3025,77 @@ impl App {
                 header(f, header_area, &format!(" ◂ {} {subject}", c.short), what, focused);
                 o.scroll = o.scroll.min(o.files.len().saturating_sub(height));
                 for (i, (status, path)) in o.files.iter().enumerate().skip(o.scroll).take(height) {
-                    let base = row_style(i == o.selected);
-                    let color = match status {
-                        'A' => Color::Green,
-                        'D' => Color::Red,
-                        'R' | 'C' => Color::Cyan,
-                        ' ' => Color::Reset,
-                        _ => Color::Yellow,
-                    };
-                    let text = printable(path);
-                    let room = width.saturating_sub(4);
-                    // Long paths keep their end
-                    let shown = tail_width(&text, room).to_string();
-                    let pad = room.saturating_sub(str_width(&shown));
-                    let path_style = if *status == ' ' { base.add_modifier(Modifier::DIM) } else { base };
-                    lines.push(Line::from(vec![
-                        Span::styled(format!(" {status} "), base.fg(color).add_modifier(Modifier::BOLD)),
-                        Span::styled(shown, path_style),
-                        Span::styled(" ".repeat(pad + 1), base),
-                    ]));
+                    lines.push(file_line(*status, path, row_style(i == o.selected), width));
                 }
             }
+        }
+        f.render_widget(Paragraph::new(lines), list);
+    }
+
+    fn draw_branches(&mut self, f: &mut Frame, header_area: Rect) {
+        let focused = self.focus == Focus::Tree;
+        let list = self.tree_area;
+        let (height, width) = (list.height as usize, list.width as usize);
+        let Some(b) = &mut self.branches else { return };
+        let mut lines = Vec::new();
+        let row_style = |selected: bool| match (selected, focused) {
+            (true, true) => Style::new().add_modifier(Modifier::REVERSED),
+            (true, false) => Style::new().add_modifier(Modifier::UNDERLINED),
+            _ => Style::new(),
+        };
+        if let Some(o) = &mut b.opened {
+            let name = printable(&b.git.list[o.branch].name).into_owned();
+            header(f, header_area, &format!(" ◂ {name}"), if o.all { "all files " } else { "" }, focused);
+            o.scroll = o.scroll.min(o.files.len().saturating_sub(height));
+            for (i, change) in o.files.iter().enumerate().skip(o.scroll).take(height) {
+                lines.push(file_line(change.status, &change.path, row_style(i == o.selected), width));
+            }
+            f.render_widget(Paragraph::new(lines), list);
+            return;
+        }
+        let back = if b.scope == b.repo { " ⎇ " } else { " ◂ " };
+        let total = b.git.list.len();
+        let count = if b.order.is_empty() {
+            format!("{}/{}… ", total - 1 - b.survey.left.min(total - 1), total - 1)
+        } else {
+            // How many changed it, of how many
+            format!("{} of {total}{} ", b.changing, if b.git.more { "+" } else { "" })
+        };
+        header(f, header_area, &format!("{back}{} branches", b.what()), &count, focused);
+        if b.order.is_empty() {
+            lines.push(Line::styled(format!("  Looking into {total} branches…"), dim()));
+        }
+        b.scroll = b.scroll.min(b.order.len().saturating_sub(height));
+        for (row, &i) in b.order.iter().enumerate().skip(b.scroll).take(height) {
+            let branch = &b.git.list[i];
+            let mut style = row_style(row == b.selected);
+            // The ones that left it as it was
+            if row >= b.changing {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            let owner = b.survey.work[i].as_ref().and_then(|w| w.owner.as_ref()).map_or(&branch.author, |o| &o.0);
+            let right = format!(" {} {:>3} ", short_name(owner, 12), git::age(branch.time));
+            let tag = if i == b.git.base { " base" } else { "" };
+            let room = width.saturating_sub(1 + str_width(&right) + tag.len());
+            let name = printable(&branch.name);
+            let name = if str_width(&name) > room {
+                format!("{}…", split_at_width(&name, room.saturating_sub(1)).0)
+            } else {
+                name.into_owned()
+            };
+            // A remote's name, before the branch's own, is quieter
+            let remote = branch.name.find('/').map(|n| n + 1).filter(|&n| branch.remote && name.is_char_boundary(n));
+            let (remote, own) = name.split_at(remote.unwrap_or(0));
+            let own_style = if branch.current { style.fg(Color::Green).add_modifier(Modifier::BOLD) } else { style };
+            let pad = room.saturating_sub(str_width(&name));
+            lines.push(Line::from(vec![
+                Span::styled(if branch.current { "*" } else { " " }, own_style),
+                Span::styled(remote.to_string(), style.add_modifier(Modifier::DIM)),
+                Span::styled(own.to_string(), own_style),
+                Span::styled(tag, style.fg(Color::Magenta)),
+                Span::styled(" ".repeat(pad), style),
+                Span::styled(right, style.fg(Color::Cyan)),
+            ]));
         }
         f.render_widget(Paragraph::new(lines), list);
     }
@@ -2887,7 +3287,7 @@ impl App {
         }
         let (mode, color) = match self.focus {
             Focus::Tree if self.grep.is_some() => (" FIND ", Color::Yellow),
-            Focus::Tree if self.history.is_some() => (" GIT ", Color::Magenta),
+            Focus::Tree if self.history.is_some() || self.branches.is_some() => (" GIT ", Color::Magenta),
             Focus::Tree => (" TREE ", Color::Blue),
             Focus::Content if self.editing() => (" EDIT ", Color::Green),
             Focus::Content => (" VIEW ", Color::Cyan),
@@ -2924,12 +3324,18 @@ impl App {
                 "↑↓ commits · d diff/file · ⏎ its files · ← whole folder · Esc files · q quit"
             }
             (_, Focus::Tree) if self.history.is_some() => "↑↓ commits · ⏎ its files · ← wider · Esc files · q quit",
+            (_, Focus::Tree) if self.branches.as_ref().is_some_and(|b| b.opened.is_some()) => {
+                "↑↓ files · d diff/file · a all files · ← branches · ⇥ view · q quit"
+            }
+            (_, Focus::Tree) if self.branches.is_some() => {
+                "↑↓ branches · ⏎ its files · ← wider · Esc files · H history · q quit"
+            }
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) if !self.tree.marks.is_empty() => {
                 "Space mark · drag onto a folder to move · Del trash · Esc unmark"
             }
             (_, Focus::Tree) => {
-                "↑↓ move · ⏎ open · F find in files · H git history · / filter · Space mark · Del trash · F2 rename · q quit"
+                "↑↓ move · ⏎ open · F find in files · H git history · B branches · / filter · Space mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
@@ -3136,6 +3542,58 @@ fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
     f.render_widget(Paragraph::new(line).style(style), Rect::new(area.x, area.y, area.width, 1));
 }
 
+/// Moves a list's selection `delta` rows, scrolling to keep it among the `height` on screen.
+fn step(selected: &mut usize, scroll: &mut usize, len: usize, delta: isize, height: usize) {
+    if len == 0 {
+        return;
+    }
+    *selected = selected.saturating_add_signed(delta).min(len - 1);
+    if *selected < *scroll {
+        *scroll = *selected;
+    } else if *selected >= *scroll + height {
+        *scroll = *selected + 1 - height;
+    }
+}
+
+/// What a history or the branches are of: "notes.md", "src/", or the repository's name.
+fn scope_name(repo: &Path, scope: &Path, file: Option<&str>) -> String {
+    match file {
+        Some(file) => file.rsplit('/').next().unwrap_or(file).to_string(),
+        None if scope == repo => file_name(repo),
+        None => format!("{}/", scope.strip_prefix(repo).unwrap_or(scope).display()),
+    }
+}
+
+/// A changed file's line in a list: its status letter in color (a space for one that
+/// didn't change), and its path, the end of it if it's long.
+fn file_line(status: char, path: &str, base: Style, width: usize) -> Line<'static> {
+    let color = match status {
+        'A' => Color::Green,
+        'D' => Color::Red,
+        'R' | 'C' => Color::Cyan,
+        ' ' => Color::Reset,
+        _ => Color::Yellow,
+    };
+    let text = printable(path);
+    let room = width.saturating_sub(4);
+    // Long paths keep their end
+    let shown = tail_width(&text, room).to_string();
+    let pad = room.saturating_sub(str_width(&shown));
+    let path_style = if status == ' ' { base.add_modifier(Modifier::DIM) } else { base };
+    Line::from(vec![
+        Span::styled(format!(" {status} "), base.fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(shown, path_style),
+        Span::styled(" ".repeat(pad + 1), base),
+    ])
+}
+
+/// A person's name short enough for a list: all of it, or the first name, cut to fit.
+fn short_name(name: &str, width: usize) -> String {
+    let name = printable(name);
+    let short = if str_width(&name) > width { name.split_whitespace().next().unwrap_or(&name) } else { &name };
+    split_at_width(short, width).0.to_string()
+}
+
 /// "notes.md", or "3 items".
 fn describe(items: &[PathBuf]) -> String {
     match items {
@@ -3267,6 +3725,35 @@ mod tests {
         fn cursor(&mut self) -> Pos {
             self.app.doc().unwrap().buf.cursor
         }
+
+        /// Draws until every branch has been looked into.
+        fn wait_for_branches(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while self.app.branches.as_ref().is_some_and(|b| b.order.is_empty()) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                self.draw();
+            }
+        }
+    }
+
+    /// git in `dir` as `who` <who@x>, at `when` seconds since the epoch, away from the
+    /// user's own settings.
+    fn git_as(dir: &Path, who: &str, when: u64, args: &[&str]) {
+        let (date, email) = (format!("{when} +0000"), format!("{}@x", who.to_lowercase()));
+        let ok = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .envs([("GIT_CONFIG_GLOBAL", "/dev/null"), ("GIT_CONFIG_NOSYSTEM", "1")])
+            .envs([("GIT_AUTHOR_NAME", who), ("GIT_COMMITTER_NAME", who)])
+            .envs([("GIT_AUTHOR_EMAIL", &email), ("GIT_COMMITTER_EMAIL", &email)])
+            .envs([("GIT_AUTHOR_DATE", &date), ("GIT_COMMITTER_DATE", &date)])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(ok, "git {args:?}");
     }
 
     #[test]
@@ -4186,5 +4673,117 @@ mod tests {
         let area = h.app.content_area;
         h.click(area.x + 10, area.y);
         assert!(h.app.doc().is_some());
+    }
+
+    #[test]
+    fn branches_show_whose_they_are_and_what_they_changed() {
+        let mut h = Harness::new(&[("a.txt", "one\n"), ("b.txt", "b\n")]);
+        let (root, t0, day) = (h.root.clone(), 1_700_000_000, 86_400);
+        git_as(&root, "Ann", t0, &["init", "-q", "-b", "main"]);
+        git_as(&root, "Ann", t0, &["add", "."]);
+        git_as(&root, "Ann", t0, &["commit", "-q", "-m", "start"]);
+        // feature: Alice changes a.txt twice, then Bob changes b.txt
+        git_as(&root, "Ann", t0, &["checkout", "-q", "-b", "feature"]);
+        fs::write(root.join("a.txt"), "two\n").unwrap();
+        git_as(&root, "Alice", t0 + day, &["commit", "-q", "-am", "two"]);
+        fs::write(root.join("a.txt"), "two\nmore\n").unwrap();
+        git_as(&root, "Alice", t0 + 2 * day, &["commit", "-q", "-am", "more"]);
+        fs::write(root.join("b.txt"), "bob\n").unwrap();
+        git_as(&root, "Bob", t0 + 3 * day, &["commit", "-q", "-am", "bob's"]);
+        // other: later, and only b.txt
+        git_as(&root, "Ann", t0, &["checkout", "-q", "-b", "other", "main"]);
+        fs::write(root.join("b.txt"), "carl\n").unwrap();
+        git_as(&root, "Carl", t0 + 4 * day, &["commit", "-q", "-am", "carl's"]);
+        git_as(&root, "Ann", t0, &["checkout", "-q", "main"]);
+        h.app.tree_width = 34;
+        h.app.tree.refresh();
+        h.draw();
+
+        // B on a.txt: the branch that changed it comes first, then the rest, newest first
+        h.key(KeyCode::Char('B'));
+        h.wait_for_branches();
+        let screen = h.screen();
+        assert!(screen.contains("a.txt branches") && screen.contains("1 of 3"), "{screen}");
+        let left = |y: u16| h.row(y).chars().take(34).collect::<String>();
+        assert!(left(1).contains(" feature") && left(1).contains("Alice"), "whose it is:\n{screen}");
+        assert!(left(2).contains(" other") && left(2).contains("Carl"), "{screen}");
+        assert!(left(3).contains("*main base"), "the one checked out, and the base:\n{screen}");
+        let page = h.app.doc().unwrap().buf.lines.join("\n");
+        assert!(page.contains("Owner     Alice <alice@x>, who made 2 of its 3 commits"), "{page}");
+        assert!(page.contains("-one") && page.contains("+two") && !page.contains("+bob"), "{page}");
+
+        // Its files, each as a diff, or with d as it is on the branch; a for all of them
+        h.key(KeyCode::Enter);
+        let screen = h.screen();
+        assert!(screen.contains(" M a.txt") && !screen.contains(" M b.txt"), "{screen}");
+        assert!(screen.contains("+more"), "{screen}");
+        h.key(KeyCode::Char('a'));
+        assert!(h.screen().contains(" M b.txt"), "{}", h.screen());
+        h.key(KeyCode::Char('d'));
+        assert!(h.screen().contains("2  more"), "{}", h.screen());
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('e'));
+        assert!(h.screen().contains("Can't edit this file: from a branch"), "{}", h.screen());
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('d'));
+
+        // A branch that left a.txt alone opens on everything it changed
+        h.key(KeyCode::Left);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Enter);
+        let screen = h.screen();
+        assert!(screen.contains(" M b.txt") && screen.contains("Nothing under a.txt"), "{screen}");
+        assert!(screen.contains("+carl"), "{screen}");
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("main is the branch the others are compared with"), "{}", h.screen());
+
+        // ← widens to the whole repository, where both changed something, then leaves
+        h.key(KeyCode::Left);
+        h.wait_for_branches();
+        assert!(h.screen().contains("2 of 3"), "{}", h.screen());
+        h.key(KeyCode::Left);
+        assert!(h.app.branches.is_none());
+
+        // H and B switch between the history and the branches of the same thing
+        h.key(KeyCode::Char('B'));
+        h.key(KeyCode::Char('H'));
+        assert!(h.app.branches.is_none() && h.app.history.as_ref().is_some_and(|h| h.file.is_some()));
+        h.key(KeyCode::Char('B'));
+        assert!(h.app.history.is_none() && h.app.branches.is_some());
+    }
+
+    #[test]
+    fn ctrl_c_quits_but_copies_while_editing() {
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(h.app.quit);
+
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.key_with(KeyCode::End, KeyModifiers::SHIFT);
+        h.key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!h.app.quit, "with text selected in the editor, it copies");
+        assert_eq!(clipboard::COPIED.with(|c| c.borrow().last().cloned()).as_deref(), Some("hello"));
+
+        // With nothing selected it quits, asking about unsaved changes first, and a second
+        // Ctrl+C there is a no
+        h.key(KeyCode::End);
+        h.typing("!");
+        h.key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!h.app.quit && h.screen().contains("Unsaved changes to a.txt"), "{}", h.screen());
+        h.key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(!h.app.quit && h.app.prompt.is_none() && h.app.dirty());
+
+        // From the search box too
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Char('/'));
+        h.key_with(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert!(h.screen().contains("Unsaved changes to a.txt"), "{}", h.screen());
+        h.key(KeyCode::Char('d'));
+        assert!(h.app.quit);
+        assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "hello\n");
     }
 }

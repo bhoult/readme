@@ -36,6 +36,7 @@ on Linux.
 - [**Thumbnails**](#thumbnails) of a folder of images, in a grid
 - [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
 - [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
+- [**Git branches**](#git-branches): whose each one is, when it last changed, and what it changed, file by file
 - [**Find in files**](#find-in-files) across the whole tree, on every CPU core
 - [**Managing files**](#managing-files): mark, drag to move, rename, send to the trash
 - [**Live reload**](#live-reload) when another program changes the open file
@@ -151,6 +152,21 @@ folder and on up to the whole repository.
 
 ![The history of report.py, with one commit's diff](docs/screenshots/history.png)
 
+## Git branches
+
+Press `B` on any file or folder in a git repository to see all the repository's
+branches, with whose each one is and when it was last updated. The branches that changed what you pressed it
+on come first, and the rest are dimmed. Each branch is compared with the repository's
+main branch (the one `origin/HEAD` names, or else `main` or `master`) from where it split
+off, so you see only what that branch did. Its owner is whoever made most of those
+commits. A remote's branches are included too, as of your last `git fetch`.
+
+Moving through the list shows each branch's page: its owner, when it changed, its
+commits, and the diff. `Enter` opens a branch to go through the files it changed, each as
+a diff, or with `d` as the branch has it. `a` lists every file it changed, not just the
+ones under the file or folder, `←` widens to the folder around and on up to the whole
+repository, and `H` switches to the history.
+
 ## Find in files
 
 `F` searches the text of every file under the tree's folder, on all the CPU cores.
@@ -205,7 +221,7 @@ The easy way: point Claude Code, Codex or another coding agent at
 out what's needed.
 
 By hand, you need Rust 1.90 or newer and a C compiler (for the xz and zstd decoders),
-plus `git` for the history view. herdr isn't needed; any terminal will do, and one with
+plus `git` for the history and branches. herdr isn't needed; any terminal will do, and one with
 Kitty graphics or Sixel support shows images at full resolution.
 
 ```
@@ -227,8 +243,8 @@ readme src/main.rs  # open a file, with its directory in the tree
 
 | Where | Keys |
 |---|---|
-| Anywhere | `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` quit |
-| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `F` find in files · `q` quit |
+| Anywhere | `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
+| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
 | Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
 | Find in files | `↑↓` matches · `Enter` go to it · `n` `N` within the file · `F` search again · `Esc` back to the tree |
@@ -236,11 +252,13 @@ readme src/main.rs  # open a file, with its directory in the tree
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
-| History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `Esc` leave |
+| History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
+| Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `←` back, or wider · `H` history · `Esc` leave |
 
 `Tab` always switches panes, even while editing, so there is no key that inserts a tab
 character. `Enter` keeps the line's indentation. With word wrap on, the arrow keys move
-by screen row.
+by screen row. `Ctrl+C` copies while you're editing with text selected; anywhere else it
+quits, asking first if there are unsaved changes.
 
 ### Mouse
 
@@ -250,8 +268,8 @@ by screen row.
 - Drag across text to select and copy it. While editing, a click moves the cursor and a
   double-click selects a word; while viewing, a double-click starts editing there.
   Middle-click pastes the primary selection while editing.
-- In the history, click a commit or file to show it, double-click to open it, and click
-  the title to go back.
+- In the history and the branches, click a commit, branch or file to show it,
+  double-click to open it, and click the title to go back.
 - `Ctrl`+click marks files in the tree; drag a file, or marked files, onto a folder to
   move them there.
 - On an image, the wheel zooms toward the pointer, dragging moves it, and a double-click
@@ -317,7 +335,7 @@ drags included.
 | `src/picture.rs` | images, and asking the terminal how to draw them |
 | `src/gallery.rs` | the thumbnail grid |
 | `src/archive.rs` | reading zip and tar archives |
-| `src/git.rs` | history, through the `git` command |
+| `src/git.rs` | history and branches, through the `git` command |
 | `src/grep.rs` | find in files |
 | `src/fileops.rs` | trash, rename and move |
 | `src/external.rs` | opening web pages and videos in other programs |
