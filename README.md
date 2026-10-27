@@ -167,6 +167,12 @@ one.
 of them, just the local ones and just the remote's. Either way, the ones that changed
 what you pressed `B` on stay at the top.
 
+Showing just the remote's fetches them, in the background: they're listed as of your
+last fetch, then again once it's done, with the same branch selected. It's done at most
+once a minute per repository. Nothing in it can ask for a password or passphrase, so a
+remote that needs one you haven't given an ssh agent or credential helper says it can't
+be fetched, as does one that hasn't answered within a minute.
+
 Moving through the list shows each branch's page: its owner, when it changed, its
 commits, and the diff. `Enter` opens a branch to go through the files it changed, each as
 a diff, or with `d` as the branch has it. `a` lists every file it changed, not just the
@@ -263,7 +269,7 @@ date too.
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
-| Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches · `←` back, or wider · `H` history · `Esc` leave |
+| Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches (fetching the remote's) · `←` back, or wider · `H` history · `Esc` leave |
 
 `Tab` always switches panes, even while editing, so there is no key that inserts a tab
 character. `Enter` keeps the line's indentation. With word wrap on, the arrow keys move

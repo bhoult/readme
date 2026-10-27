@@ -3,7 +3,7 @@
 use std::{
     cell::RefCell,
     cmp::Reverse,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     rc::Rc,
@@ -41,6 +41,8 @@ use crate::{
 };
 
 const MESSAGE_FOR: Duration = Duration::from_secs(4);
+/// How soon a repository's remote branches are fetched again
+const FETCH_AGAIN: Duration = Duration::from_secs(60);
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
 const TREE_REFRESH: Duration = Duration::from_secs(2);
 const WHEEL: isize = 3;
@@ -574,6 +576,8 @@ struct BranchView {
     opened: Option<OpenedBranch>,
     /// Files show as they are on the branch rather than as diffs
     whole: bool,
+    /// The branches as they are since a fetch, being looked into before they're listed
+    next: Option<(git::Branches, git::Survey)>,
 }
 
 impl BranchView {
@@ -592,10 +596,15 @@ impl BranchView {
         self.survey.work[i].as_ref().and_then(|w| w.owner.as_ref()).map_or(&self.git.list[i].author, |o| &o.0)
     }
 
+    /// The selected branch's name, with the list showing.
+    fn selected_name(&self) -> Option<String> {
+        self.order.get(self.selected).map(|&i| self.git.list[i].name.clone())
+    }
+
     /// Lists the branches `filter` lets through, those that changed the scope first and
-    /// then the rest, each part in `sort`'s order. The selected branch stays selected
-    /// while it's listed.
-    fn arrange(&mut self, sort: BranchSort, filter: BranchFilter, height: usize) {
+    /// then the rest, each part in `sort`'s order, with the one named `keep` selected if
+    /// it's listed.
+    fn arrange(&mut self, sort: BranchSort, filter: BranchFilter, height: usize, keep: Option<&str>) {
         let (list, work, base) = (&self.git.list, &self.survey.work, self.git.base);
         let changed = |i: usize| i != base && work[i].as_ref().is_some_and(|w| !w.changes.is_empty());
         let mut order: Vec<usize> = (0..list.len()).filter(|&i| filter.lets(&list[i])).collect();
@@ -608,8 +617,7 @@ impl BranchView {
         }
         order.sort_by_key(|&i| !changed(i));
         let changing = order.iter().filter(|&&i| changed(i)).count();
-        let selected = self.order.get(self.selected).copied();
-        self.selected = selected.and_then(|s| order.iter().position(|&i| i == s)).unwrap_or(0);
+        self.selected = keep.and_then(|name| order.iter().position(|&i| list[i].name == name)).unwrap_or(0);
         (self.order, self.changing, self.ready) = (order, changing, true);
         step(&mut self.selected, &mut self.scroll, self.order.len(), 0, height);
     }
@@ -788,6 +796,9 @@ pub struct App {
     /// How the branches are listed, and which, kept from one list of them to the next
     branch_sort: BranchSort,
     branch_filter: BranchFilter,
+    /// The remote branches being fetched, and when each repository's last were
+    fetch: Option<git::Fetch>,
+    fetched: HashMap<PathBuf, Instant>,
     picker: Picker,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
@@ -834,6 +845,8 @@ impl App {
             branches: None,
             branch_sort: BranchSort::Newest,
             branch_filter: BranchFilter::All,
+            fetch: None,
+            fetched: HashMap::new(),
             picker: Picker::halfblocks(),
             gallery_stash: None,
             grep: None,
@@ -1762,6 +1775,7 @@ impl App {
                     scroll: 0,
                     opened: None,
                     whole: false,
+                    next: None,
                 });
                 // It takes the left pane from the history or find-in-files' results
                 self.history = None;
@@ -1769,6 +1783,7 @@ impl App {
                 self.focus = Focus::Tree;
                 self.filtering = false;
                 self.branches_poll();
+                self.fetch_remote();
             }
             Err(e) => self.say(format!("Couldn't read the branches: {e}")),
         }
@@ -1779,6 +1794,19 @@ impl App {
     fn branches_poll(&mut self) {
         let (sort, filter, height) = (self.branch_sort, self.branch_filter, self.tree_area.height.max(1) as usize);
         let Some(b) = &mut self.branches else { return };
+        // The branches as a fetch left them take over once they've been looked into, but
+        // not while a branch is open, since its files go by its place in the list
+        if let Some((_, survey)) = &mut b.next {
+            survey.poll();
+        }
+        if b.opened.is_none() && b.next.as_ref().is_some_and(|(_, survey)| survey.left == 0) {
+            let keep = b.selected_name();
+            if let Some((list, survey)) = b.next.take() {
+                (b.git, b.survey) = (list, survey);
+                b.arrange(sort, filter, height, keep.as_deref());
+                return self.branches_preview();
+            }
+        }
         if b.ready {
             return;
         }
@@ -1786,7 +1814,7 @@ impl App {
         if b.survey.left > 0 {
             return;
         }
-        b.arrange(sort, filter, height);
+        b.arrange(sort, filter, height, None);
         self.branches_preview();
     }
 
@@ -1797,7 +1825,8 @@ impl App {
         let before = b.order.get(b.selected).copied();
         // While they're still being looked into, it's for when they're listed
         if b.ready {
-            b.arrange(sort, filter, height);
+            let keep = b.selected_name();
+            b.arrange(sort, filter, height, keep.as_deref());
         }
         let moved = b.order.get(b.selected).copied() != before;
         let said = if sort != self.branch_sort {
@@ -1808,10 +1837,56 @@ impl App {
         } else {
             format!("Showing {}branches", if filter == BranchFilter::All { "all " } else { filter.label() })
         };
+        let refiltered = filter != self.branch_filter;
         (self.branch_sort, self.branch_filter) = (sort, filter);
         if moved {
             self.branches_preview();
         }
+        self.say(said);
+        if refiltered {
+            self.fetch_remote();
+        }
+    }
+
+    /// With the remote branches showing, fetches them, unless that's under way or was
+    /// done in the last minute.
+    fn fetch_remote(&mut self) {
+        let Some(b) = &self.branches else { return };
+        let recent = self.fetched.get(&b.repo).is_some_and(|at| at.elapsed() < FETCH_AGAIN);
+        if self.branch_filter == BranchFilter::Remote && self.fetch.is_none() && !recent {
+            self.fetch = Some(git::Fetch::start(&b.repo));
+        }
+    }
+
+    /// Once a fetch is over, says how it went. If it brought anything new, the branches
+    /// are looked into again, to be listed as they are now.
+    fn fetch_poll(&mut self) {
+        let Some(result) = self.fetch.as_ref().and_then(git::Fetch::poll) else { return };
+        let Some(fetch) = self.fetch.take() else { return };
+        self.fetched.insert(fetch.repo.clone(), Instant::now());
+        if let Err(why) = result {
+            return self.say(format!("Couldn't fetch: {why}"));
+        }
+        // Gone on to other things, it's nothing to mention
+        let Some(b) = self.branches.as_mut().filter(|b| b.repo == fetch.repo) else { return };
+        let said = match git::branches(&b.repo) {
+            Err(e) => format!("Couldn't read the branches: {e:#}"),
+            Ok(now) => {
+                let had: HashSet<(&str, &str)> = b.git.list.iter().map(|x| (x.name.as_str(), x.tip.as_str())).collect();
+                let fresh = now.list.iter().filter(|x| !had.contains(&(x.name.as_str(), x.tip.as_str()))).count();
+                let names: HashSet<&str> = now.list.iter().map(|x| x.name.as_str()).collect();
+                let gone = b.git.list.iter().filter(|x| !names.contains(x.name.as_str())).count();
+                if fresh + gone == 0 {
+                    "Already up to date".to_string()
+                } else {
+                    let survey = git::Survey::start(&b.repo, &now, b.scope_arg());
+                    b.next = Some((now, survey));
+                    let fresh = (fresh > 0).then(|| format!("{fresh} new or updated"));
+                    let gone = (gone > 0).then(|| format!("{gone} gone"));
+                    format!("Fetched: {}", [fresh, gone].into_iter().flatten().collect::<Vec<_>>().join(", "))
+                }
+            }
+        };
         self.say(said);
     }
 
@@ -2990,6 +3065,7 @@ impl App {
             self.tree_width = (area.width * 3 / 10).clamp(16, 40);
         }
         self.tree_width = self.tree_width.clamp(8, area.width - 20);
+        self.fetch_poll();
         let (tw, body) = (self.tree_width, area.height - 1);
         if let Some(grep) = &mut self.grep {
             grep.poll();
@@ -3194,6 +3270,7 @@ impl App {
         let list = self.tree_area;
         let (height, width) = (list.height as usize, list.width as usize);
         let (sort, filter) = (self.branch_sort, self.branch_filter);
+        let fetching = self.fetch.as_ref().is_some_and(|f| self.branches.as_ref().is_some_and(|b| b.repo == f.repo));
         let Some(b) = &mut self.branches else { return };
         let mut lines = Vec::new();
         let row_style = |selected: bool| match (selected, focused) {
@@ -3215,8 +3292,10 @@ impl App {
         let count = if !b.ready {
             format!("{}/{}… ", b.survey.jobs - b.survey.left, b.survey.jobs)
         } else {
-            // How many changed it, of how many listed, and in what order
-            format!("{} of {}{} · {} ", b.changing, b.order.len(), if b.git.more { "+" } else { "" }, sort.label())
+            // How many changed it, of how many listed, and in what order, or that the
+            // remote's are being fetched
+            let order = if fetching { "fetching…" } else { sort.label() };
+            format!("{} of {}{} · {order} ", b.changing, b.order.len(), if b.git.more { "+" } else { "" })
         };
         header(f, header_area, &format!("{back}{} {}branches", b.what(), filter.label()), &count, focused);
         if !b.ready {
@@ -3889,6 +3968,16 @@ mod tests {
         fn wait_for_branches(&mut self) {
             let deadline = Instant::now() + Duration::from_secs(10);
             while self.app.branches.as_ref().is_some_and(|b| !b.ready) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+                self.draw();
+            }
+        }
+
+        /// Until a fetch is over, and the branches it brought are listed
+        fn wait_for_fetch(&mut self) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let busy = |app: &App| app.fetch.is_some() || app.branches.as_ref().is_some_and(|b| b.next.is_some());
+            while busy(&self.app) && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
                 self.draw();
             }
@@ -4993,6 +5082,54 @@ mod tests {
         h.key(KeyCode::Char('B'));
         h.wait_for_branches();
         assert_eq!(listed(&h), "origin/able mid origin/zed main");
+    }
+
+    #[test]
+    fn the_remotes_branches_are_fetched_when_they_show() {
+        let mut h = Harness::new(&[("a.txt", "one\n")]);
+        let (root, t0, day) = (h.root.clone(), 1_700_000_000, 86_400);
+        let upstream = tempfile::tempdir().unwrap();
+        let up = upstream.path();
+        fs::write(up.join("a.txt"), "one\n").unwrap();
+        for dir in [up, root.as_path()] {
+            git_as(dir, "Ann", t0, &["init", "-q", "-b", "main"]);
+            git_as(dir, "Ann", t0, &["add", "."]);
+            git_as(dir, "Ann", t0, &["commit", "-q", "-m", "start"]);
+        }
+        git_as(&root, "Ann", t0, &["remote", "add", "origin", &up.to_string_lossy()]);
+        git_as(&root, "Ann", t0, &["fetch", "-q", "origin"]);
+        // Since that fetch, the remote has gained a branch
+        git_as(up, "Ann", t0, &["checkout", "-q", "-b", "late"]);
+        fs::write(up.join("a.txt"), "late\n").unwrap();
+        git_as(up, "Bo", t0 + day, &["commit", "-q", "-am", "late"]);
+        git_as(up, "Ann", t0, &["checkout", "-q", "main"]);
+        h.app.tree.refresh();
+        h.draw();
+        let listed = |h: &Harness| {
+            let b = h.app.branches.as_ref().unwrap();
+            b.order.iter().map(|&i| b.git.list[i].name.as_str()).collect::<Vec<_>>().join(" ")
+        };
+
+        // All the branches show as they are
+        h.key(KeyCode::Char('B'));
+        h.wait_for_branches();
+        assert!(h.app.fetch.is_none());
+        // The remote's are fetched, then listed again, with the same one selected
+        h.key(KeyCode::Char('f'));
+        h.key(KeyCode::Char('f'));
+        assert_eq!(listed(&h), "origin/main");
+        assert!(h.app.fetch.is_some() && h.screen().contains("fetching…"), "{}", h.screen());
+        h.wait_for_fetch();
+        assert_eq!(listed(&h), "origin/late origin/main");
+        assert!(h.screen().contains("Fetched: 1 new or updated"), "{}", h.screen());
+        let b = h.app.branches.as_ref().unwrap();
+        assert_eq!(b.git.list[b.order[b.selected]].name, "origin/main");
+
+        // Not again within the minute
+        for _ in 0..3 {
+            h.key(KeyCode::Char('f'));
+        }
+        assert!(h.app.fetch.is_none());
     }
 
     #[test]

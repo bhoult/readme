@@ -1,25 +1,27 @@
 //! A folder's git history and branches, read with the git command: commits, what each
 //! one changed, files as they were at any commit, and what each branch did on its own.
+//! The one thing it changes is the remotes' branches, which it fetches.
 
 use std::{
     collections::HashMap,
-    io::Read,
+    io::{self, Read},
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result, bail};
 
 use crate::{
     cores,
-    text::{split_at_width, str_width},
+    text::{printable, split_at_width, str_width},
 };
 
 const MAX_COMMITS: usize = 5000;
@@ -27,6 +29,8 @@ const MAX_COMMITS: usize = 5000;
 const MAX_BRANCHES: usize = 500;
 /// Most of a branch's commits listed on its page
 const MAX_LISTED: usize = 200;
+/// How long a fetch has before it's stopped
+const FETCH_FOR: Duration = Duration::from_secs(60);
 
 pub struct Commit {
     pub hash: String,
@@ -652,6 +656,131 @@ impl Drop for Survey {
     }
 }
 
+/// Fetching every remote's branches, in the background. Nothing it runs can ask for a
+/// password or a passphrase, and it's stopped if it takes more than a minute.
+pub struct Fetch {
+    pub repo: PathBuf,
+    run: Arc<Mutex<Run>>,
+    done: mpsc::Receiver<Result<(), String>>,
+}
+
+enum Run {
+    Starting,
+    /// git's process group, which the ssh it starts is in too
+    Going(i32),
+    Over,
+}
+
+impl Fetch {
+    pub fn start(repo: &Path) -> Self {
+        let (sender, done) = mpsc::channel();
+        let run = Arc::new(Mutex::new(Run::Starting));
+        let (dir, watch) = (repo.to_path_buf(), run.clone());
+        thread::spawn(move || {
+            let _ = sender.send(fetch(&dir, &watch));
+        });
+        Self { repo: repo.to_path_buf(), run, done }
+    }
+
+    /// How it went, once it's over.
+    pub fn poll(&self) -> Option<Result<(), String>> {
+        match self.done.try_recv() {
+            Ok(result) => Some(result),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => Some(Err("it stopped".into())),
+        }
+    }
+}
+
+impl Drop for Fetch {
+    /// Stops git, and the ssh it started, rather than leave them running with no one
+    /// to stop them
+    fn drop(&mut self) {
+        let mut run = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        if let Run::Going(group) = *run {
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
+        *run = Run::Over;
+    }
+}
+
+/// Runs git fetch for every remote, in a session of its own. With no terminal, ssh can't
+/// write a passphrase prompt over the screen, and git and credential managers are told
+/// not to ask either. The first line git complains with is why it failed.
+fn fetch(repo: &Path, run: &Mutex<Run>) -> Result<(), String> {
+    let mut git = Command::new("git");
+    git.arg("-C")
+        .arg(repo)
+        .args(["fetch", "--all", "--quiet"])
+        .envs([("GIT_TERMINAL_PROMPT", "0"), ("SSH_ASKPASS_REQUIRE", "never"), ("GCM_INTERACTIVE", "never")])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    // setsid is safe between fork and exec, being a plain system call
+    unsafe {
+        git.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let mut child = {
+        let mut state = run.lock().unwrap_or_else(|e| e.into_inner());
+        if let Run::Over = *state {
+            return Err("stopped".into());
+        }
+        let child = git.spawn().map_err(|e| format!("couldn't run git: {e}"))?;
+        *state = Run::Going(child.id() as i32);
+        child
+    };
+    // Read alongside, so a chatty git can't stall on a full pipe
+    let mut stderr = child.stderr.take();
+    let errors = thread::spawn(move || {
+        let mut text = Vec::new();
+        if let Some(stderr) = &mut stderr {
+            let _ = stderr.take(64 << 10).read_to_end(&mut text);
+            let _ = io::copy(stderr, &mut io::sink());
+        }
+        text
+    });
+    let deadline = Instant::now() + FETCH_FOR;
+    let status = loop {
+        {
+            // Only while the lock is held is git known not to have been waited for, so
+            // its process group can't have been given to something else
+            let mut state = run.lock().unwrap_or_else(|e| e.into_inner());
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    *state = Run::Over;
+                    break status;
+                }
+                Ok(None) if Instant::now() < deadline => {}
+                _ => {
+                    unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
+                    let _ = child.wait();
+                    *state = Run::Over;
+                    return Err("no answer from the remote within a minute".into());
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(100));
+    };
+    let errors = errors.join().unwrap_or_default();
+    if status.success() {
+        return Ok(());
+    }
+    Err(why_not(&String::from_utf8_lossy(&errors)))
+}
+
+/// Why a fetch failed: the first thing it said, which is the most particular ("Permission
+/// denied (publickey)" before git's "Could not read from remote repository"), passing
+/// over ssh's warnings and git's hints.
+fn why_not(errors: &str) -> String {
+    let lines = || errors.lines().map(str::trim).filter(|line| !line.is_empty());
+    let aside = |line: &&str| line.starts_with("Warning:") || line.starts_with("hint:");
+    let why = lines().find(|line| !aside(line)).or_else(|| lines().next()).unwrap_or("git fetch failed");
+    split_at_width(&printable(why), 200).0.to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,6 +911,36 @@ mod tests {
         assert_eq!(survey.work[4].as_ref().unwrap().changes.len(), 2);
         assert_eq!(survey.work[2].as_ref().unwrap().commits, 0, "origin/main is main");
         assert!(survey.work[0].as_ref().unwrap().split.is_none());
+    }
+
+    #[test]
+    fn fetching_brings_in_the_remotes_branches_or_says_why_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = clone_with_branches(&dir.path().canonicalize().unwrap());
+        let up = dir.path().canonicalize().unwrap().join("up");
+        run_as(&up, "Ann", T0, &["branch", "-q", "late", "main"]);
+        let outcome = |fetch: Fetch| {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                if let Some(result) = fetch.poll() {
+                    return result;
+                }
+                assert!(std::time::Instant::now() < deadline, "still fetching");
+                thread::sleep(std::time::Duration::from_millis(10));
+            }
+        };
+        assert_eq!(outcome(Fetch::start(&root)), Ok(()));
+        assert!(branches(&root).unwrap().list.iter().any(|b| b.name == "origin/late"));
+
+        run_as(&root, "Ann", T0, &["remote", "add", "gone", "/nonexistent/readme-test-remote"]);
+        let why = outcome(Fetch::start(&root)).unwrap_err();
+        assert!(why.contains("readme-test-remote") && !why.contains('\n'), "{why}");
+
+        let said = "Warning: Permanently added 'x' (ED25519) to the list of known hosts.\r\n\
+            git@x: Permission denied (publickey).\nfatal: Could not read from remote repository.\n";
+        assert_eq!(why_not(said), "git@x: Permission denied (publickey).");
+        assert_eq!(why_not("\n  \n"), "git fetch failed");
+        assert_eq!(why_not("Warning: only this\n"), "Warning: only this");
     }
 
     #[test]
