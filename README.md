@@ -239,11 +239,15 @@ readme ~/src/project
 readme src/main.rs  # open a file, with its directory in the tree
 ```
 
+`?` (or `F1`) shows the help: the version and when it was built, a link to this
+repository, the features, and the keys. `readme --version` gives the version and build
+date too.
+
 ### Keys
 
 | Where | Keys |
 |---|---|
-| Anywhere | `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
+| Anywhere | `?` help (`F1` while typing) · `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
 | Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
 | Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |

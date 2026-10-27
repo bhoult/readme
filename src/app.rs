@@ -27,6 +27,7 @@ use crate::{
     gallery::{self, Gallery},
     git,
     grep::Grep,
+    help,
     highlight::{self, LineCache},
     markdown::{self, Rendered},
     picture::{self, Picture},
@@ -84,6 +85,8 @@ enum Source {
     History,
     /// A branch's page, or a file as a branch has it
     Branch,
+    /// The help page
+    Help,
 }
 
 /// An open text file and how it's being shown.
@@ -786,7 +789,7 @@ impl App {
             // A note (moved to the trash, couldn't be read) is tried again
             Shown::Note(..) | Shown::Nothing => return false,
         };
-        self.shown_path() == Some(path) && !matches!(source, Source::History | Source::Branch)
+        self.shown_path() == Some(path) && !matches!(source, Source::History | Source::Branch | Source::Help)
     }
 
     /// How images are drawn, once the terminal has been asked. The image on screen, if
@@ -911,12 +914,26 @@ impl App {
                     Source::Archive => Some("in an archive"),
                     Source::History => Some("from history"),
                     Source::Branch => Some("from a branch"),
+                    Source::Help => Some("built into readme"),
                 });
                 Shown::Doc(Box::new(Doc::new(path, *buf, self.wrap, source, label)))
             }
             Loaded::Binary(size) => Shown::Note(path.into(), format!("Binary file, {}", human_size(size))),
             Loaded::TooBig(size) => Shown::Note(path.into(), format!("Too large to open ({})", human_size(size))),
         }
+    }
+
+    /// Shows the help page in place of the file: which readme this is, what it does,
+    /// and its keys.
+    fn show_help(&mut self) {
+        if self.dirty() {
+            return self.say("Save or discard your changes first, to see the help");
+        }
+        // A preview still waiting to be shown would take its place
+        self.pending = None;
+        let path = self.tree.root.join("readme help.md");
+        self.shown = self.show_bytes(&path, Ok(help::page().into_bytes()), Source::Help, Some(" readme help".into()));
+        self.focus = Focus::Content;
     }
 
     /// Opens `path`, asking first what to do with unsaved changes.
@@ -1096,7 +1113,7 @@ impl App {
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         // Ctrl+C quits, as it does in most terminal programs, though in the editor it
-        // copies what's selected. The question about unsaved changes takes it as a no.
+        // copies what's selected. The question about unsaved changes takes it as Esc.
         let ctrl_c = ctrl && key.code == KeyCode::Char('c');
         if let Some(prompt) = self.prompt.take() {
             if ctrl_c && !matches!(prompt, Prompt::Unsaved(_)) {
@@ -1115,6 +1132,9 @@ impl App {
                 self.focus = if self.focus == Focus::Tree { Focus::Content } else { Focus::Tree };
                 return;
             }
+            // In the editor and the filter, ? is typing, so there it's F1
+            KeyCode::F(1) => return self.show_help(),
+            KeyCode::Char('?') if !self.editing() && !self.filtering => return self.show_help(),
             _ => {}
         }
         match self.focus {
@@ -3335,7 +3355,7 @@ impl App {
                 "Space mark · drag onto a folder to move · Del trash · Esc unmark"
             }
             (_, Focus::Tree) => {
-                "↑↓ move · ⏎ open · F find in files · H git history · B branches · / filter · Space mark · Del trash · F2 rename · q quit"
+                "? help · ↑↓ move · ⏎ open · F find in files · H git history · B branches · / filter · Space mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
@@ -4785,5 +4805,35 @@ mod tests {
         h.key(KeyCode::Char('d'));
         assert!(h.app.quit);
         assert_eq!(fs::read_to_string(h.root.join("a.txt")).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn help_says_which_readme_this_is_and_what_it_does() {
+        let mut h = Harness::new(&[("a.txt", "hello\n")]);
+        h.key(KeyCode::Char('?'));
+        let screen = h.screen();
+        assert!(screen.contains(" readme help") && screen.contains("built into readme"), "{screen}");
+        assert!(screen.contains(&format!("readme {}", env!("CARGO_PKG_VERSION"))), "{screen}");
+        assert!(screen.contains("Version") && screen.contains("https://github.com/bhoult/readme"), "{screen}");
+        assert!(screen.contains("Features") && screen.contains("Tree of the folder"), "{screen}");
+        assert!(h.app.focus == Focus::Content);
+        h.key(KeyCode::PageDown);
+        assert!(h.screen().contains("Git branches: whose each one is"), "{}", h.screen());
+        h.key(KeyCode::End);
+        assert!(h.screen().contains("README_IMAGES"), "{}", h.screen());
+        h.key(KeyCode::Char('e'));
+        assert!(h.screen().contains("Can't edit this file: built into readme"), "{}", h.screen());
+
+        // In the editor ? is typing, and F1 waits for the changes to be saved or undone
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Enter);
+        h.key(KeyCode::Char('e'));
+        h.typing("?");
+        assert!(h.app.dirty() && !h.screen().contains(" readme help"), "{}", h.screen());
+        h.key(KeyCode::F(1));
+        assert!(h.screen().contains("Save or discard your changes first, to see the help"), "{}", h.screen());
+        h.key_with(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        h.key(KeyCode::F(1));
+        assert!(h.screen().contains(" readme help") && !h.app.editing(), "{}", h.screen());
     }
 }

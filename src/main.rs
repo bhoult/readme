@@ -10,6 +10,7 @@ mod fileops;
 mod gallery;
 mod git;
 mod grep;
+mod help;
 mod highlight;
 mod markdown;
 mod picture;
@@ -111,7 +112,8 @@ Keys
                ↑↓ branches · Enter the files it changed · d diff or file
                a all the files it changed · ← back, or wider · H its history
                Esc leave
-  Anywhere     Ctrl+Q or Ctrl+C quit (q when not editing; while editing,
+  Anywhere     ? help, with the version (F1 while typing)
+               Ctrl+Q or Ctrl+C quit (q when not editing; while editing,
                Ctrl+C copies the selected text if there is some)
 
 Mouse
@@ -208,7 +210,7 @@ fn main() -> Result<()> {
             return Ok(());
         }
         Some(arg) if arg == "-V" || arg == "--version" => {
-            println!("readme {}", env!("CARGO_PKG_VERSION"));
+            println!("{}", help::version());
             return Ok(());
         }
         Some(arg) => PathBuf::from(arg),
