@@ -39,28 +39,34 @@ enum Edit {
     Other,
 }
 
-struct Snapshot {
+/// An undo or redo step: the lines an edit replaced, which `new` lines from `start` on
+/// now stand for, and where the cursor was. Only those lines are kept, not the whole
+/// text, so an edit to a big file costs no more than one to a small one.
+struct Step {
+    start: usize,
+    new: usize,
     lines: Vec<String>,
     crlf: Vec<bool>,
     cursor: Pos,
-    /// Which text this is (see Buffer::state)
+    /// Which text it was (see Buffer::state)
     state: u64,
     /// Roughly how much memory it takes
     bytes: usize,
 }
 
-impl Snapshot {
-    fn new(lines: Vec<String>, crlf: Vec<bool>, cursor: Pos, state: u64) -> Self {
+impl Step {
+    fn new(start: usize, new: usize, lines: Vec<String>, crlf: Vec<bool>, cursor: Pos, state: u64) -> Self {
         // Each line's text, and what its String costs besides: the header, and the
         // allocator's rounding up, which for short lines is most of it
         let bytes = lines.iter().map(|l| l.len() + 64).sum();
-        Self { lines, crlf, cursor, state, bytes }
+        Self { start, new, lines, crlf, cursor, state, bytes }
     }
 }
 
 const MAX_FILE: u64 = 50 << 20;
 const MAX_UNDO: usize = 200;
-/// Every undo step is a whole copy of the text, so big files keep fewer of them
+/// Most memory the undo steps take: one that pasted over most of a big file keeps all
+/// that it replaced
 const MAX_UNDO_BYTES: usize = 256 << 20;
 /// How much of a file is checked for NUL bytes to tell binary from text
 const SNIFF: u64 = 8000;
@@ -98,8 +104,8 @@ pub struct Buffer {
     /// saves with each line's own ending; a line made by breaking one takes its ending
     crlf: Vec<bool>,
     final_newline: bool,
-    undo: Vec<Snapshot>,
-    redo: Vec<Snapshot>,
+    undo: Vec<Step>,
+    redo: Vec<Step>,
     last_edit: Option<Edit>,
 }
 
@@ -374,28 +380,28 @@ impl Buffer {
     pub fn insert(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let typing = text.chars().count() == 1 && text != "\n" && self.selection().is_none();
-        self.begin(if typing { Edit::Insert } else { Edit::Other });
-        self.delete_selection();
-        self.insert_raw(&text);
+        let (from, to) = self.at_cursor();
+        self.edit(if typing { Edit::Insert } else { Edit::Other }, from, to, |b| {
+            b.delete_selection();
+            b.insert_raw(&text);
+        });
     }
 
     /// Breaks the line, carrying its indentation over.
     pub fn newline(&mut self) {
-        self.begin(Edit::Other);
-        self.delete_selection();
-        let indent: String = self.lines[self.cursor.line]
-            .chars()
-            .take(self.cursor.col)
-            .take_while(|c| *c == ' ' || *c == '\t')
-            .collect();
-        self.insert_raw(&format!("\n{indent}"));
+        let (from, to) = self.at_cursor();
+        self.edit(Edit::Other, from, to, |b| {
+            b.delete_selection();
+            let indent: String =
+                b.lines[b.cursor.line].chars().take(b.cursor.col).take_while(|c| *c == ' ' || *c == '\t').collect();
+            b.insert_raw(&format!("\n{indent}"));
+        });
     }
 
     pub fn backspace(&mut self) {
         if self.selection().is_some() {
-            self.begin(Edit::Other);
-            self.delete_selection();
-            return;
+            let (from, to) = self.at_cursor();
+            return self.edit(Edit::Other, from, to, Self::delete_selection);
         }
         // An empty selection (a click leaves one) would become a real one once the cursor moves
         self.anchor = None;
@@ -403,26 +409,28 @@ impl Buffer {
         if col == 0 && line == 0 {
             return;
         }
-        self.begin(Edit::Delete);
-        if col > 0 {
-            let at = byte_at(&self.lines[line], col - 1);
-            self.lines[line].remove(at);
-            self.cursor.col -= 1;
-        } else {
-            let joined = self.lines.remove(line);
-            // The joined line ends the way the second one did
-            self.crlf[line - 1] = self.crlf.remove(line);
-            self.cursor = Pos::new(line - 1, self.line_len(line - 1));
-            self.lines[line - 1].push_str(&joined);
-        }
-        self.changed(self.cursor.line);
+        // At a line's start, it joins onto the line before
+        let from = if col > 0 { line } else { line - 1 };
+        self.edit(Edit::Delete, from, line, |b| {
+            if col > 0 {
+                let at = byte_at(&b.lines[line], col - 1);
+                b.lines[line].remove(at);
+                b.cursor.col -= 1;
+            } else {
+                let joined = b.lines.remove(line);
+                // The joined line ends the way the second one did
+                b.crlf[line - 1] = b.crlf.remove(line);
+                b.cursor = Pos::new(line - 1, b.line_len(line - 1));
+                b.lines[line - 1].push_str(&joined);
+            }
+            b.changed(b.cursor.line);
+        });
     }
 
     pub fn delete(&mut self) {
         if self.selection().is_some() {
-            self.begin(Edit::Other);
-            self.delete_selection();
-            return;
+            let (from, to) = self.at_cursor();
+            return self.edit(Edit::Other, from, to, Self::delete_selection);
         }
         self.anchor = None;
         let Pos { line, col } = self.cursor;
@@ -430,23 +438,25 @@ impl Buffer {
         if at_end && line + 1 >= self.lines.len() {
             return;
         }
-        self.begin(Edit::Delete);
-        if at_end {
-            let joined = self.lines.remove(line + 1);
-            self.crlf[line] = self.crlf.remove(line + 1);
-            self.lines[line].push_str(&joined);
-        } else {
-            let at = byte_at(&self.lines[line], col);
-            self.lines[line].remove(at);
-        }
-        self.changed(line);
+        // At a line's end, the next one joins onto it
+        self.edit(Edit::Delete, line, if at_end { line + 1 } else { line }, |b| {
+            if at_end {
+                let joined = b.lines.remove(line + 1);
+                b.crlf[line] = b.crlf.remove(line + 1);
+                b.lines[line].push_str(&joined);
+            } else {
+                let at = byte_at(&b.lines[line], col);
+                b.lines[line].remove(at);
+            }
+            b.changed(line);
+        });
     }
 
     /// Removes the selection and returns its text.
     pub fn cut(&mut self) -> Option<String> {
         let text = self.selected_text()?;
-        self.begin(Edit::Other);
-        self.delete_selection();
+        let (from, to) = self.at_cursor();
+        self.edit(Edit::Other, from, to, Self::delete_selection);
         Some(text)
     }
 
@@ -460,25 +470,37 @@ impl Buffer {
 
     fn step_history(&mut self, undo: bool) -> bool {
         let (from, to) = if undo { (&mut self.undo, &mut self.redo) } else { (&mut self.redo, &mut self.undo) };
-        let Some(snap) = from.pop() else { return false };
-        // The colors above the first line it changes still stand
-        let same = self.lines.iter().zip(&snap.lines).take_while(|(a, b)| a == b).count();
-        let lines = std::mem::replace(&mut self.lines, snap.lines);
-        to.push(Snapshot::new(lines, std::mem::replace(&mut self.crlf, snap.crlf), self.cursor, self.state));
-        self.cursor = snap.cursor;
+        let Some(step) = from.pop() else { return false };
+        // The lines it stands for go back to what they were, and are kept to go forward again
+        let (start, end, count) = (step.start, step.start + step.new, step.lines.len());
+        let lines = self.lines.splice(start..end, step.lines).collect();
+        let crlf = self.crlf.splice(start..end, step.crlf).collect();
+        to.push(Step::new(start, count, lines, crlf, self.cursor, self.state));
+        self.cursor = step.cursor;
         self.anchor = None;
         self.last_edit = None;
-        self.changed(same.min(self.lines.len() - 1));
+        // The colors above the first line it changes still stand
+        self.changed(start.min(self.lines.len() - 1));
         // Back to what was saved, nothing is unsaved
-        self.state = snap.state;
+        self.state = step.state;
         self.dirty = self.state != self.saved;
         true
     }
 
-    /// Records an undo step, except that a run of typing (or of deleting) undoes as one.
-    fn begin(&mut self, kind: Edit) {
-        if kind == Edit::Other || self.last_edit != Some(kind) {
-            self.undo.push(Snapshot::new(self.lines.clone(), self.crlf.clone(), self.cursor, self.state));
+    /// The lines an edit at the cursor changes: the selection's, or the cursor's.
+    fn at_cursor(&self) -> (usize, usize) {
+        self.selection().map_or((self.cursor.line, self.cursor.line), |(s, e)| (s.line, e.line))
+    }
+
+    /// Makes `change`, an edit to lines `from` to `to`, as an undo step of its own, except
+    /// that a run of typing (or of deleting) on the lines its step has undoes as one.
+    fn edit(&mut self, kind: Edit, from: usize, to: usize, change: impl FnOnce(&mut Self)) {
+        let goes_on = kind != Edit::Other
+            && self.last_edit == Some(kind)
+            && self.undo.last().is_some_and(|step| step.start <= from && to < step.start + step.new);
+        if !goes_on {
+            let (lines, crlf) = (self.lines[from..=to].to_vec(), self.crlf[from..=to].to_vec());
+            self.undo.push(Step::new(from, to + 1 - from, lines, crlf, self.cursor, self.state));
             let mut bytes: usize = self.undo.iter().map(|s| s.bytes).sum();
             while self.undo.len() > MAX_UNDO || (self.undo.len() > 1 && bytes > MAX_UNDO_BYTES) {
                 bytes -= self.undo.remove(0).bytes;
@@ -486,6 +508,12 @@ impl Buffer {
         }
         self.redo.clear();
         self.last_edit = Some(kind);
+        let (before, new) = (self.lines.len(), self.undo.last().map_or(0, |s| s.new));
+        change(self);
+        // Lines added or taken away change how many the step stands for
+        if let Some(step) = self.undo.last_mut() {
+            step.new = (new + self.lines.len()).saturating_sub(before);
+        }
     }
 
     fn changed(&mut self, from: usize) {
@@ -538,6 +566,65 @@ mod tests {
 
     fn buf(text: &str) -> Buffer {
         Buffer::from_text(text)
+    }
+
+    #[test]
+    fn undoing_and_redoing_any_edits_goes_back_and_forth_through_the_text() {
+        let mut b = buf("one\r\ntwo\n\tthree\nfour\nfive\r\nsix");
+        let mut seed = 3u64;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n.max(1)
+        };
+        // The text before each undo step began, and the text at the end
+        let mut stops = Vec::new();
+        for _ in 0..150 {
+            let line = next(b.lines.len());
+            b.move_to(Pos::new(line, next(b.line_len(line) + 1)), false);
+            if next(4) == 0 {
+                let line = next(b.lines.len());
+                b.move_to(Pos::new(line, next(b.line_len(line) + 1)), true);
+            }
+            let (before, steps) = (b.text(), b.undo.len());
+            match next(6) {
+                0 => b.insert(["x", "é", "\n", "ab\ncd", "\r\n", "q\nr\ns"][next(6)]),
+                1 => b.newline(),
+                2 => b.backspace(),
+                3 => b.delete(),
+                4 => drop(b.cut()),
+                _ => b.insert("y"),
+            }
+            if b.undo.len() > steps {
+                stops.push(before);
+            }
+        }
+        let last = b.text();
+        for (i, stop) in stops.iter().enumerate().rev() {
+            assert!(b.undo(), "{i}");
+            assert_eq!(&b.text(), stop, "undo to {i}");
+        }
+        assert!(!b.undo());
+        for (i, stop) in stops.iter().enumerate().skip(1) {
+            assert!(b.redo(), "{i}");
+            assert_eq!(&b.text(), stop, "redo to {i}");
+        }
+        assert!(b.redo() && !b.redo());
+        assert_eq!(b.text(), last);
+    }
+
+    #[test]
+    fn an_edit_to_a_big_file_keeps_only_what_it_changed() {
+        let text: String = (0..100_000).map(|i| format!("line {i}\n")).collect();
+        let mut b = buf(&text);
+        b.move_to(Pos::new(50_000, 2), false);
+        b.insert("x");
+        b.newline();
+        b.move_to(Pos::new(10, 0), false);
+        b.backspace();
+        let kept: usize = b.undo.iter().map(|s| s.bytes).sum();
+        assert!(kept < 1000, "{kept}");
+        while b.undo() {}
+        assert_eq!(b.text(), text);
     }
 
     #[test]

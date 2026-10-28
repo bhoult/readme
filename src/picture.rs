@@ -349,6 +349,24 @@ struct View {
 
 const ZOOMS: (f32, f32) = (0.1, 50.0);
 
+/// The part `crop` of `image` made `size`, when that's shrinking it by half or more: by
+/// averaging the pixels each one covers, which looks as good as filtering there and is
+/// several times faster. The pixels are read in the image's own type, not converted one by
+/// one.
+fn shrunk(image: &DynamicImage, (x, y, w, h): (u32, u32, u32, u32), size: (u32, u32)) -> Option<image::RgbaImage> {
+    use image::imageops::{crop_imm, thumbnail};
+    if size.0 * 2 > w || size.1 * 2 > h {
+        return None;
+    }
+    Some(match image {
+        DynamicImage::ImageRgb8(rgb) => {
+            DynamicImage::ImageRgb8(thumbnail(&*crop_imm(rgb, x, y, w, h), size.0, size.1)).into_rgba8()
+        }
+        DynamicImage::ImageRgba8(rgba) => thumbnail(&*crop_imm(rgba, x, y, w, h), size.0, size.1),
+        other => thumbnail(&*crop_imm(other, x, y, w, h), size.0, size.1),
+    })
+}
+
 /// The size of a `(w, h)` image scaled to fit a `room` of screen pixels, keeping its shape.
 /// The room is whole cells, so it's a little off the image's own shape.
 fn fit_within((w, h): (u32, u32), room: (f32, f32)) -> (u32, u32) {
@@ -430,8 +448,10 @@ impl Picture {
             let (x, y, w, h) = view.crop;
             let (cell_w, cell_h) = self.cell();
             let size = fit_within((w, h), (view.at.width as f32 * cell_w, view.at.height as f32 * cell_h));
-            let part = image::imageops::crop_imm(&self.image, x, y, w, h);
-            let screen = image::imageops::resize(&*part, size.0, size.1, FilterType::Triangle);
+            let screen = shrunk(&self.image, view.crop, size).unwrap_or_else(|| {
+                let part = image::imageops::crop_imm(&self.image, x, y, w, h);
+                image::imageops::resize(&*part, size.0, size.1, FilterType::Triangle)
+            });
             self.view = Some((view, self.picker.new_resize_protocol(DynamicImage::ImageRgba8(screen))));
         }
         let Some((last, protocol)) = &mut self.view else { return };

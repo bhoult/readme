@@ -39,8 +39,13 @@ const TALLEST: f32 = 2.0;
 const MAX_BYTES: u64 = 50 << 20;
 /// Nor are images that need more memory than this to decode
 const LARGEST: u64 = 512 << 20;
-/// What all the decoders may hold at once, in every gallery; a decode waits until it fits
-const BUDGET: u64 = 1 << 30;
+/// What all the decoders may hold at once, in every gallery; a decode waits until it fits,
+/// unless it's the only one. A photo of 12 megapixels takes 96 MB, so two of those go at
+/// once, or more smaller ones.
+const BUDGET: u64 = 256 << 20;
+/// The most decoding threads a gallery has: more only wait on the budget for big photos,
+/// and fight over the cores for small ones
+const WORKERS: usize = 6;
 /// Thumbnails further than this many screens from the view are let go
 const KEEP_SCREENS: usize = 3;
 pub const WIDTHS: (u32, u32) = (50, 400);
@@ -142,8 +147,8 @@ impl Gallery {
         let (finished, done) = mpsc::channel();
         let queue = Arc::new(Mutex::new(queue));
         let wanted = Arc::new([AtomicUsize::new(0), AtomicUsize::new(usize::MAX)]);
-        // Every core but the one the screen needs
-        for _ in 0..crate::cores().saturating_sub(1).max(1) {
+        // Every core but the one the screen needs, up to WORKERS
+        for _ in 0..crate::cores().saturating_sub(1).clamp(1, WORKERS) {
             let (queue, finished, wanted) = (queue.clone(), finished.clone(), wanted.clone());
             // They end when the gallery goes away and takes its sender with it
             let _ = thread::Builder::new().name(WORKER.into()).spawn(move || {
@@ -353,13 +358,14 @@ fn decode(path: &Path, budget: &Budget) -> Option<DynamicImage> {
     if fs::metadata(path).ok()?.len() > MAX_BYTES {
         return None;
     }
-    // The header gives the size, and so roughly what decoding will take
+    // The header gives the size, and so roughly what decoding will take: the picture,
+    // up to four bytes a pixel, and as much again for a photo turned upright
     let (width, height) = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?.into_dimensions().ok()?;
     let need = u64::from(width) * u64::from(height) * 4;
     if need > LARGEST {
         return None;
     }
-    let _held = budget.take(need.max(1));
+    let _held = budget.take(need.max(1) * 2);
     let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
     let mut limits = image::Limits::default();
     limits.max_alloc = Some(LARGEST);

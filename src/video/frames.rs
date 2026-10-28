@@ -26,6 +26,9 @@ pub const WORKER: &str = "video";
 
 /// Pictures decoded ahead of the one on screen
 const AHEAD: usize = 3;
+/// The most pictures a second worth making: terminals don't show more, and each is
+/// megabytes for them to read
+const MOST_A_SECOND: f64 = 60.0;
 
 /// A picture ready to draw.
 pub struct Frame {
@@ -171,7 +174,7 @@ fn decode(
     }
 
     let target = track.ticks(from);
-    let mut sender = Sender { track, tx, size, target, before: None, sent_any: false };
+    let mut sender = Sender { track, tx, size, target, before: None, sent_any: false, beat: Beat::default() };
     // Decoded in decoding order, so each picture's time is that of the oldest sample fed
     // in that hasn't given one yet
     let mut times: VecDeque<i64> = VecDeque::new();
@@ -179,6 +182,8 @@ fn decode(
     let mut buf = Vec::new();
     let mut errors = 0;
     let mut decoded_any = false;
+    // How long a picture is on screen, which takes looking through all the samples
+    let frame_ticks = track.frame_ticks();
     for i in track.start_for(from)..track.samples.len() {
         if stop.load(Ordering::Relaxed) {
             return Ok(());
@@ -197,7 +202,7 @@ fn decode(
         // A picture nothing refers to can be left out when it's before where showing
         // starts, or too late to show
         let unreferenced = nals.iter().all(|nal| nal.nal_ref_idc == 0 || !is_slice(nal.nal_unit_type));
-        let shown_before = sample.time + track.frame_ticks() <= target || track.seconds(sample.time) + 0.1 < late.get();
+        let shown_before = sample.time + frame_ticks <= target || track.seconds(sample.time) + 0.1 < late.get();
         let picture = nals.iter().any(|nal| is_slice(nal.nal_unit_type));
         if unreferenced && shown_before && picture {
             continue;
@@ -262,6 +267,35 @@ struct Sender<'a> {
     /// whether it's the one on screen at the target
     before: Option<Waiting>,
     sent_any: bool,
+    beat: Beat,
+}
+
+/// Which pictures to show of a video with more a second than [`MOST_A_SECOND`]: those on
+/// a steady beat of that many, so 120 a second show as every other one.
+#[derive(Default)]
+struct Beat {
+    /// When the next picture is due, in seconds; none before the first
+    due: Option<f64>,
+}
+
+impl Beat {
+    /// Whether the picture shown at `at` seconds is one to show.
+    fn keep(&mut self, at: f64) -> bool {
+        let step = 1.0 / MOST_A_SECOND;
+        match self.due {
+            // A little early still counts: times in ticks don't divide evenly
+            Some(due) if at < due - step / 8.0 => false,
+            // On the beat; or, after a gap, a new beat from here
+            Some(due) if at < due + step => {
+                self.due = Some(due + step);
+                true
+            }
+            _ => {
+                self.due = Some(at + step);
+                true
+            }
+        }
+    }
 }
 
 impl Sender<'_> {
@@ -287,11 +321,15 @@ impl Sender<'_> {
     }
 
     fn put(&mut self, waiting: Waiting) -> bool {
+        let at = self.track.seconds(waiting.time).max(0.0);
+        // Left out before it's made into RGB, which is most of the work of one
+        if !self.beat.keep(at) {
+            return true;
+        }
         let (width, height) = self.size.get();
         let (width, height) =
             if width == 0 || height == 0 { (waiting.yuv.width, waiting.yuv.height) } else { (width, height) };
         let rgb = to_rgb(&waiting.yuv, width, height);
-        let at = self.track.seconds(waiting.time).max(0.0);
         self.sent_any = true;
         self.tx.send(Decoded::Frame(Frame { at, width, height, rgb })).is_ok()
     }
@@ -340,55 +378,112 @@ struct Planes<'a> {
     hd: bool,
 }
 
+/// A pixel's 0–255 from its sum in 1/1024ths, rounding already added.
+#[inline(always)]
+fn clamp(n: i32) -> u8 {
+    (n >> 10).clamp(0, 255) as u8
+}
+
+/// What to multiply a sum of `count` samples by, then shift down 40 bits, to divide it
+/// by `count`: exact for any such sum while `count` is under 2^16, which keeps sum times
+/// count under 2^40. Zero where it wouldn't be exact, for dividing instead.
+fn reciprocal(count: usize) -> u64 {
+    if count < 1 << 16 { (1u64 << 40).div_ceil(count.max(1) as u64) } else { 0 }
+}
+
+/// `sum` over `count` samples, by `recip`, its [`reciprocal`].
+#[inline(always)]
+fn average(sum: u64, count: usize, recip: u64) -> i32 {
+    if recip != 0 { ((sum * recip) >> 40) as i32 } else { (sum / count as u64) as i32 }
+}
+
+/// Each output column's or row's span of source pixels, for `n` of `out` from `from` on,
+/// made from `src`: the pixels it covers, the ones at its edges whole.
+fn spans(out: usize, src: usize, from: usize, n: usize) -> Vec<(usize, usize)> {
+    (from..from + n)
+        .map(|i| {
+            let start = (i * src / out).min(src - 1);
+            (start, ((i + 1) * src).div_ceil(out).clamp(start + 1, src))
+        })
+        .collect()
+}
+
+/// `sums` set to the running sums along a row of `plane`'s columns, each summed down
+/// rows `y0..y1`: `sums[c]` is the sum of the columns before `c`, so any span's is a
+/// subtraction. `down` is room for the columns' sums.
+fn running_sums(sums: &mut [u64], down: &mut [u32], plane: &[u8], stride: usize, (y0, y1): (usize, usize)) {
+    let width = down.len();
+    for (d, &p) in down.iter_mut().zip(&plane[y0 * stride..][..width]) {
+        *d = u32::from(p);
+    }
+    for y in y0 + 1..y1 {
+        for (d, &p) in down.iter_mut().zip(&plane[y * stride..][..width]) {
+            *d += u32::from(p);
+        }
+    }
+    let mut total = 0;
+    sums[0] = 0;
+    for (s, &d) in sums[1..].iter_mut().zip(down.iter()) {
+        total += u64::from(d);
+        *s = total;
+    }
+}
+
 impl Planes<'_> {
     /// Output rows from `first` on into `out`, for a picture `w` × `h`.
     fn rows(&self, out: &mut [u8], first: usize, (w, h): (usize, usize)) {
         // Limited range, in 1/1024ths
         let (rv, gu, gv, bu) = if self.hd { (1836, -218, -546, 2163) } else { (1634, -401, -832, 2066) };
-        let clamp = |n: i32| ((n + 512) >> 10).clamp(0, 255) as u8;
         let rows = out.len() / (w * 3);
-        let mut put = |at: usize, (luma, u, v): (i32, i32, i32)| {
-            let l = (luma - 16) * 1192;
-            let (u, v) = (u - 128, v - 128);
-            out[at..at + 3].copy_from_slice(&[clamp(l + rv * v), clamp(l + gu * u + gv * v), clamp(l + bu * u)]);
+        let put = |px: &mut [u8], luma: i32, (dr, dg, db): (i32, i32, i32)| {
+            let l = (luma - 16) * 1192 + 512;
+            px[0] = clamp(l + dr);
+            px[1] = clamp(l + dg);
+            px[2] = clamp(l + db);
         };
+        let chroma = |u: i32, v: i32| (rv * (v - 128), gu * (u - 128) + gv * (v - 128), bu * (u - 128));
         if (w, h) == (self.sw, self.sh) {
-            // The same size: each pixel as it is, its chroma shared with three others
+            // The same size: each pixel as it is, two at a time, as they share their chroma
             for r in 0..rows {
                 let y = first + r;
                 let luma = &self.y[y * self.sw..][..w];
                 let cy = (y / 2).min(self.ch - 1) * self.cw;
-                for (x, &l) in luma.iter().enumerate() {
-                    let cx = cy + (x / 2).min(self.cw - 1);
-                    put((r * w + x) * 3, (i32::from(l), i32::from(self.u[cx]), i32::from(self.v[cx])));
+                let (us, vs) = (&self.u[cy..][..self.cw], &self.v[cy..][..self.cw]);
+                let line = &mut out[r * w * 3..][..w * 3];
+                for (i, (pair, pixels)) in luma.chunks(2).zip(line.chunks_mut(6)).enumerate() {
+                    let c = i.min(self.cw - 1);
+                    let tint = chroma(i32::from(us[c]), i32::from(vs[c]));
+                    for (&l, px) in pair.iter().zip(pixels.chunks_exact_mut(3)) {
+                        put(px, i32::from(l), tint);
+                    }
                 }
             }
             return;
         }
-        // Each output column's and row's span of source pixels
-        let spans = |out: usize, src: usize, from: usize, n: usize| -> Vec<(usize, usize)> {
-            (from..from + n)
-                .map(|i| {
-                    let start = (i * src / out).min(src - 1);
-                    (start, ((i + 1) * src).div_ceil(out).clamp(start + 1, src))
-                })
-                .collect()
-        };
+        // Each output pixel is the average of the source pixels its spans cover: the
+        // rows summed down each column, then running sums along them, so a span's sum
+        // is a subtraction, and divided by multiplying
         let (cols, ccols) = (spans(w, self.sw, 0, w), spans(w, self.cw, 0, w));
         let (lines, clines) = (spans(h, self.sh, first, rows), spans(h, self.ch, first, rows));
-        let average = |plane: &[u8], stride: usize, (x0, x1): (usize, usize), (y0, y1): (usize, usize)| -> i32 {
-            let mut sum = 0u32;
-            for y in y0..y1 {
-                sum += plane[y * stride + x0..y * stride + x1].iter().map(|&v| u32::from(v)).sum::<u32>();
-            }
-            (sum / ((x1 - x0) * (y1 - y0)) as u32) as i32
-        };
+        let (mut ys, mut us, mut vs) = (vec![0; self.sw + 1], vec![0; self.cw + 1], vec![0; self.cw + 1]);
+        let (mut down, mut cdown) = (vec![0; self.sw], vec![0; self.cw]);
+        let widest = cols.iter().chain(&ccols).map(|(a, b)| b - a).max().unwrap_or(1);
+        let (mut recip, mut crecip) = (vec![0; widest + 1], vec![0; widest + 1]);
         for r in 0..rows {
-            for x in 0..w {
-                let luma = average(self.y, self.sw, cols[x], lines[r]);
-                let u = average(self.u, self.cw, ccols[x], clines[r]);
-                let v = average(self.v, self.cw, ccols[x], clines[r]);
-                put((r * w + x) * 3, (luma, u, v));
+            running_sums(&mut ys, &mut down, self.y, self.sw, lines[r]);
+            running_sums(&mut us, &mut cdown, self.u, self.cw, clines[r]);
+            running_sums(&mut vs, &mut cdown, self.v, self.cw, clines[r]);
+            let (tall, ctall) = (lines[r].1 - lines[r].0, clines[r].1 - clines[r].0);
+            for k in 1..=widest {
+                (recip[k], crecip[k]) = (reciprocal(k * tall), reciprocal(k * ctall));
+            }
+            let line = &mut out[r * w * 3..][..w * 3];
+            for ((px, &(x0, x1)), &(c0, c1)) in line.chunks_exact_mut(3).zip(&cols).zip(&ccols) {
+                let (n, cn) = (x1 - x0, c1 - c0);
+                let luma = average(ys[x1] - ys[x0], n * tall, recip[n]);
+                let u = average(us[c1] - us[c0], cn * ctall, crecip[cn]);
+                let v = average(vs[c1] - vs[c0], cn * ctall, crecip[cn]);
+                put(px, luma, chroma(u, v));
             }
         }
     }
@@ -517,6 +612,85 @@ mod tests {
         }
         decoder.flush().into_iter().for_each(&mut take);
         assert_eq!((frames, hash), (80, 0x65ad_7e55_7595_3d57));
+    }
+
+    /// The conversion as it was: each output pixel's spans summed on their own, and
+    /// divided.
+    fn by_each_pixel(yuv: &Yuv, w: usize, h: usize) -> Vec<u8> {
+        let (sw, sh, cw, ch) =
+            (yuv.width as usize, yuv.height as usize, yuv.width as usize / 2, yuv.height as usize / 2);
+        let (cols, ccols, lines, clines) =
+            (spans(w, sw, 0, w), spans(w, cw, 0, w), spans(h, sh, 0, h), spans(h, ch, 0, h));
+        let average = |plane: &[u8], stride: usize, (x0, x1): (usize, usize), (y0, y1): (usize, usize)| {
+            let sum: u32 = (y0..y1).flat_map(|y| &plane[y * stride + x0..y * stride + x1]).map(|&v| u32::from(v)).sum();
+            (sum / ((x1 - x0) * (y1 - y0)) as u32) as i32
+        };
+        let (rv, gu, gv, bu) = if sh >= 720 { (1836, -218, -546, 2163) } else { (1634, -401, -832, 2066) };
+        let clamp = |n: i32| ((n + 512) >> 10).clamp(0, 255) as u8;
+        let mut out = Vec::new();
+        for r in 0..h {
+            for x in 0..w {
+                let (l, u, v) = if (w, h) == (sw, sh) {
+                    let c = (r / 2).min(ch - 1) * cw + (x / 2).min(cw - 1);
+                    (i32::from(yuv.y[r * sw + x]), i32::from(yuv.u[c]), i32::from(yuv.v[c]))
+                } else {
+                    let luma = average(&yuv.y, sw, cols[x], lines[r]);
+                    (luma, average(&yuv.u, cw, ccols[x], clines[r]), average(&yuv.v, cw, ccols[x], clines[r]))
+                };
+                let (l, u, v) = ((l - 16) * 1192, u - 128, v - 128);
+                out.extend([clamp(l + rv * v), clamp(l + gu * u + gv * v), clamp(l + bu * u)]);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_fast_conversion_makes_the_same_pixels() {
+        let mut seed = 1u32;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12345);
+                    (seed >> 16) as u8
+                })
+                .collect()
+        };
+        for (sw, sh) in [(64, 36), (33, 19), (512, 256), (1280, 720)] {
+            let yuv = Yuv {
+                width: sw,
+                height: sh,
+                y: noise((sw * sh) as usize),
+                u: noise((sw / 2 * (sh / 2)) as usize),
+                v: noise((sw / 2 * (sh / 2)) as usize),
+                pic_order_cnt: 0,
+            };
+            // The same size, shrinking a little and a lot, odd sizes, a column, a
+            // pixel (which divides rather than multiplies), and growing
+            for (w, h) in [(sw, sh), (sw * 6 / 7, sh * 6 / 7), (sw / 3, sh / 5), (37, 21), (1, sh), (1, 1), (sw * 2, 7)]
+            {
+                let (w, h) = (w.max(1), h.max(1));
+                assert!(to_rgb(&yuv, w, h) == by_each_pixel(&yuv, w as usize, h as usize), "{sw}x{sh} to {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_more_than_sixty_pictures_a_second_are_made() {
+        let kept = |fps: f64, seconds: f64| {
+            let mut beat = Beat::default();
+            (0..(fps * seconds) as usize).filter(|&i| beat.keep(i as f64 / fps)).count()
+        };
+        // All of them up to 60 a second, the times a little off as ticks make them
+        assert_eq!(kept(30.0, 10.0), 300);
+        assert_eq!(kept(59.94, 10.0), 599);
+        assert_eq!(kept(60.0, 10.0), 600);
+        // Above that, a steady 60 or so
+        assert_eq!(kept(120.0, 10.0), 600);
+        assert!((590..=610).contains(&kept(100.0, 10.0)), "{}", kept(100.0, 10.0));
+        assert!((590..=610).contains(&kept(144.0, 10.0)), "{}", kept(144.0, 10.0));
+        // After a gap, the beat starts again from the next picture
+        let mut beat = Beat::default();
+        assert!(beat.keep(0.0) && !beat.keep(0.005) && beat.keep(5.0) && !beat.keep(5.005) && beat.keep(5.017));
     }
 
     #[test]

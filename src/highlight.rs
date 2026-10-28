@@ -1,9 +1,10 @@
 //! Syntax highlighting with syntect, using bat's syntax definitions.
 
 use std::{
+    collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
-    sync::OnceLock,
+    sync::{Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -30,6 +31,41 @@ pub fn preload() {
 
 pub fn get() -> Option<&'static Highlighting> {
     LOADED.get()
+}
+
+/// Lines of a file a syntax is built from
+const SAMPLE: usize = 64;
+
+/// Whether `syntax` is ready to highlight with. Its patterns are built the first time
+/// they're used, which for some (TypeScript) takes a third of a second, so the first
+/// time a syntax is asked for they're built in the background, from `text`'s first lines,
+/// and until then the file shows without colors, as it does while highlighting loads.
+fn built(hl: &'static Highlighting, syntax: &'static SyntaxReference, text: &[String]) -> bool {
+    // Each syntax asked for, by name, and whether it's built yet
+    static BUILT: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let built = BUILT.get_or_init(Mutex::default);
+    let mut asked = built.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(&done) = asked.get(&syntax.name) {
+        return done;
+    }
+    asked.insert(syntax.name.clone(), false);
+    let sample: Vec<String> = text.iter().take(SAMPLE).filter(|l| l.len() <= MAX_LINE).cloned().collect();
+    let started = std::thread::Builder::new().name("syntax".into()).spawn(move || {
+        // Done even if building fails, so the file isn't left waiting: what's needed is
+        // then built as it's highlighted
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut lines = HighlightLines::new(syntax, &hl.theme);
+            for line in &sample {
+                let _ = lines.highlight_line(&format!("{line}\n"), &hl.syntaxes);
+            }
+        }));
+        built.lock().unwrap_or_else(|e| e.into_inner()).insert(syntax.name.clone(), true);
+    });
+    // With no thread, it's built as it's highlighted
+    if started.is_err() {
+        asked.insert(syntax.name.clone(), true);
+    }
+    started.is_err()
 }
 
 pub fn load() -> &'static Highlighting {
@@ -103,12 +139,15 @@ pub struct LineCache {
     checkpoints: Vec<(ParseState, HighlightState)>,
     /// Parser state at the start of line `lines.len()`
     state: Option<(ParseState, HighlightState)>,
+    /// The syntax is being built in the background, so there are no colors yet
+    building: bool,
 }
 
 impl LineCache {
     pub fn new(path: &Path, lines: &[String]) -> Self {
         let disabled = too_slow(lines);
-        Self { path: path.into(), syntax: None, disabled, lines: Vec::new(), checkpoints: Vec::new(), state: None }
+        let (lines, checkpoints) = (Vec::new(), Vec::new());
+        Self { path: path.into(), syntax: None, disabled, lines, checkpoints, state: None, building: false }
     }
 
     /// The text was replaced by `lines`, the same as before up to line `from`: what's
@@ -155,6 +194,10 @@ impl LineCache {
         let syntax =
             *self.syntax.get_or_insert_with(|| hl.syntax_for(&self.path, text.first().map_or("", String::as_str)));
         let Some(syntax) = syntax else { return true };
+        self.building = !built(hl, syntax, text);
+        if self.building {
+            return true;
+        }
         let started = Instant::now();
         let highlighter = Highlighter::new(&hl.theme);
         let state = self
@@ -186,6 +229,11 @@ impl LineCache {
 
     pub fn get(&self, line: usize) -> &[(Style, Range<usize>)] {
         self.lines.get(line).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the colors wait on the syntax being built, so it's worth looking again soon.
+    pub fn building(&self) -> bool {
+        self.building
     }
 }
 
@@ -234,7 +282,7 @@ mod tests {
         load();
         let text: Vec<String> = (0..200).map(|i| format!("let x{i} = {i};")).collect();
         let mut cache = LineCache::new(Path::new("a.rs"), &text);
-        while !cache.ensure(&text, 200) {}
+        while !cache.ensure(&text, 200) || cache.building() {}
         assert_eq!(cache.lines.len(), 200);
         // A line added at the end, as a log or an agent's notes grow
         let mut more = text.clone();
@@ -244,7 +292,7 @@ mod tests {
         // A change further up goes back to the checkpoint before it
         cache.replaced(&more, 130);
         assert_eq!(cache.lines.len(), 128);
-        while !cache.ensure(&more, 201) {}
+        while !cache.ensure(&more, 201) || cache.building() {}
         assert_eq!(cache.get(200), LineCache::new(Path::new("a.rs"), &more).colors_of(&more, 200));
         // The first line can change the syntax (#!/bin/sh), so that starts again
         cache.replaced(&more, 0);
@@ -256,11 +304,11 @@ mod tests {
         load();
         let mut text: Vec<String> = vec!["echo hi".into(); 3];
         let mut cache = LineCache::new(Path::new("script"), &text);
-        while !cache.ensure(&text, 3) {}
+        while !cache.ensure(&text, 3) || cache.building() {}
         assert!(cache.get(0).iter().all(|(s, _)| s.fg.is_none()), "no syntax yet");
         text.insert(0, "#!/bin/sh".into());
         cache.invalidate(&text, 0);
-        while !cache.ensure(&text, 4) {}
+        while !cache.ensure(&text, 4) || cache.building() {}
         assert!(cache.syntax.flatten().is_some_and(|s| s.name.contains("Bourne") || s.name.contains("Shell")));
         // A minified line pasted in turns highlighting off, until it's gone
         text.push("x".repeat(20_000));
@@ -274,7 +322,7 @@ mod tests {
 
     impl LineCache {
         fn colors_of(mut self, text: &[String], line: usize) -> Vec<(Style, Range<usize>)> {
-            while !self.ensure(text, line + 1) {}
+            while !self.ensure(text, line + 1) || self.building() {}
             self.get(line).to_vec()
         }
     }

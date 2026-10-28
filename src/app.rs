@@ -38,8 +38,9 @@ use crate::{
     picture::{self, Picture},
     table,
     text::{
-        Place, char_at_col_from, display_col, display_col_from, find_all, line_spans, printable, push_span, row_of,
-        search, slice_line, split_at_width, str_width, tail_width, wider_than, wrap_points,
+        self, Place, char_at_col_from, display_col_from, find_all, line_spans, line_wider_than, place_after_col,
+        place_before_char, place_before_col, printable, push_span, row_of, search, slice_line, split_at_width,
+        str_width, tail_width, wider_than_from, wrap_points,
     },
     tree::{NoWayUp, Sort, Tree},
     video::{self, Video, VolumeClick},
@@ -57,6 +58,11 @@ const SIDEWAYS: isize = 8;
 const MAX_RENDERED: usize = 5 << 20;
 /// Most lines whose wrapping is kept at once
 const MAX_WRAPS: usize = 4096;
+/// Lines at least this long are measured from places kept along them, not from their
+/// start, which for one megabytes long would take a while on every frame
+const LONG_LINE: usize = 16 << 10;
+/// How far apart, in bytes, the places along a long line are
+const PLACE_EVERY: usize = 4 << 10;
 
 fn dim() -> Style {
     Style::new().add_modifier(Modifier::DIM)
@@ -140,6 +146,9 @@ struct Doc {
     /// Where wrapped lines' screen rows start: moving and drawing ask for the same lines
     /// again and again, and a long line takes a while to wrap
     wraps: RefCell<Wraps>,
+    /// Places along long lines, and where a search finds its matches, for the same reason
+    places: RefCell<Places>,
+    matches: RefCell<Matches>,
 }
 
 /// Wrapped lines' row starts, for the text and width they were worked out for.
@@ -147,6 +156,20 @@ struct Doc {
 struct Wraps {
     key: (u64, usize),
     rows: HashMap<usize, Rc<Vec<Place>>>,
+}
+
+/// Places along long lines, for the text they were found in.
+#[derive(Default)]
+struct Places {
+    version: u64,
+    lines: HashMap<usize, Rc<Vec<Place>>>,
+}
+
+/// Each line's matches of a search, for the text and query they were found for.
+#[derive(Default)]
+struct Matches {
+    key: (u64, String),
+    lines: HashMap<usize, Rc<Vec<(usize, usize)>>>,
 }
 
 /// How a file shows, from its name: rendered Markdown, a table, or text.
@@ -217,6 +240,8 @@ impl Doc {
             reread: false,
             coloring: false,
             wraps: RefCell::default(),
+            places: RefCell::default(),
+            matches: RefCell::default(),
         };
         doc.raw = doc.too_big_to_render();
         doc
@@ -262,9 +287,12 @@ impl Doc {
     }
 
     fn render(&mut self, width: u16) -> &Rendered {
-        // Tables don't depend on the width, so resizing doesn't redo them
-        let width = if let Kind::Table(_) = self.kind { 0 } else { width };
-        let key = (self.buf.version, width, highlight::get().is_some(), self.wrap);
+        // Tables depend on none of the width, wrapping or colors, so changing those doesn't
+        // redo one
+        let key = match self.kind {
+            Kind::Table(_) => (self.buf.version, 0, false, false),
+            _ => (self.buf.version, width, highlight::get().is_some(), self.wrap),
+        };
         if self.rendered.as_ref().is_none_or(|(k, _)| *k != key) {
             // Laid out again (a new width, or new text), the same source line stays at the top
             if self.fmt_sync.is_none() && self.rendered.is_some() {
@@ -304,6 +332,33 @@ impl Doc {
             *wraps = Wraps { key, rows: HashMap::new() };
         }
         wraps.rows.entry(line).or_insert_with(|| Rc::new(wrap_points(&self.buf.lines[line], width))).clone()
+    }
+
+    /// Places along `line` to measure it from: its start, and others along it if it's long.
+    fn places(&self, line: usize) -> Rc<Vec<Place>> {
+        let text = &self.buf.lines[line];
+        if text.len() < LONG_LINE {
+            return Rc::new(vec![Place::default()]);
+        }
+        let mut places = self.places.borrow_mut();
+        if places.version != self.buf.version || places.lines.len() >= MAX_WRAPS {
+            *places = Places { version: self.buf.version, lines: HashMap::new() };
+        }
+        places.lines.entry(line).or_insert_with(|| Rc::new(text::places(text, PLACE_EVERY))).clone()
+    }
+
+    /// The screen column where char `col` of `line` starts.
+    fn display_col(&self, line: usize, col: usize) -> usize {
+        display_col_from(&self.buf.lines[line], place_before_char(&self.places(line), col), col)
+    }
+
+    /// Where `query` is found on `line`.
+    fn matches(&self, line: usize, query: &str) -> Rc<Vec<(usize, usize)>> {
+        let mut matches = self.matches.borrow_mut();
+        if matches.key.0 != self.buf.version || matches.key.1 != query || matches.lines.len() >= MAX_WRAPS {
+            *matches = Matches { key: (self.buf.version, query.to_string()), lines: HashMap::new() };
+        }
+        matches.lines.entry(line).or_insert_with(|| Rc::new(find_all(&self.buf.lines[line], query))).clone()
     }
 
     /// Scrolls so char `col` of `line` is a third of the way down the source view.
@@ -370,7 +425,7 @@ impl Doc {
     fn scroll(&mut self, delta: isize, height: usize, width: usize) {
         if self.formatted() {
             let pinned = self.pinned();
-            let len = self.rendered.as_ref().map_or(0, |(_, r)| r.lines.len());
+            let len = self.rendered.as_ref().map_or(0, |(_, r)| r.len());
             let max = len.saturating_sub(height.saturating_sub(pinned)).max(pinned);
             self.fmt_top = self.fmt_top.max(pinned).saturating_add_signed(delta).clamp(pinned, max);
         } else if self.wrap {
@@ -418,7 +473,7 @@ impl Doc {
             } else if height > 0 && cursor.line >= self.top + height {
                 self.top = cursor.line + 1 - height;
             }
-            let col = display_col(&self.buf.lines[cursor.line], cursor.col);
+            let col = self.display_col(cursor.line, cursor.col);
             if col < self.left {
                 self.left = col;
             } else if width > 0 && col >= self.left + width {
@@ -450,7 +505,10 @@ impl Doc {
         let starts = self.rows(line, width);
         let start = starts[row.min(starts.len() - 1)];
         let first = if self.wrap { start.col } else { self.left };
-        let mut col = char_at_col_from(text, start, first + x.saturating_sub(area.x + gutter) as usize);
+        let target = first + x.saturating_sub(area.x + gutter) as usize;
+        // Not wrapping, a long line is read from the place nearest the column
+        let from = if self.wrap { start } else { place_before_col(&self.places(line), target) };
+        let mut col = char_at_col_from(text, from, target);
         // Past the end of a wrapped row is its last character, not the next row
         if let Some(next) = starts.get(row + 1) {
             col = col.min(next.char - 1);
@@ -992,10 +1050,12 @@ impl App {
         matches!(&self.shown, Shown::Doc(doc) if doc.coloring)
     }
 
-    /// How soon there's next something to draw that no key brings: a video's next picture.
+    /// How soon there's next something to draw that no key brings: a video's next picture,
+    /// or colors once their syntax is built.
     pub fn due(&self) -> Option<Duration> {
         match &self.shown {
             Shown::Video(shown) => shown.video.next_due(),
+            Shown::Doc(doc) if doc.colors.building() => Some(Duration::from_millis(20)),
             _ => None,
         }
     }
@@ -1276,8 +1336,13 @@ impl App {
             self.shown = Shown::Image(new);
             self.say("Reloaded: the image changed on disk");
         }
-        // Not while a row is held down: the press, and a drag from it, go by its place in the rows
-        if self.last_refresh.elapsed() >= TREE_REFRESH && !matches!(self.drag, Drag::Tree { .. }) {
+        // Not while a row is held down: the press, and a drag from it, go by its place in the
+        // rows. Nor while filtering, as the matches come from a walk read once (until r), so
+        // finding them again would change nothing.
+        if self.last_refresh.elapsed() >= TREE_REFRESH
+            && !matches!(self.drag, Drag::Tree { .. })
+            && !self.tree.filtering()
+        {
             self.tree.rebuild();
             self.last_refresh = Instant::now();
         }
@@ -1588,7 +1653,7 @@ impl App {
             doc.last_match = Some(Pos::new(line, col));
             let line = line.min(doc.buf.lines.len() - 1);
             doc.jump_to(line, col, page, width);
-            let at = display_col(doc.buf.lines.get(line).map_or("", String::as_str), col);
+            let at = doc.display_col(line, col);
             doc.left = if doc.wrap || at < width { 0 } else { at.saturating_sub(width / 3) };
         }
     }
@@ -2563,7 +2628,7 @@ impl App {
         let Some(doc) = self.doc() else { return };
         let count: usize = if doc.formatted() {
             let r = doc.rendered.as_ref().map(|(_, r)| r);
-            r.map_or(0, |r| (0..r.lines.len()).map(|i| find_all(&r.text(i), &query).len()).sum())
+            r.map_or(0, |r| r.texts().iter().map(|text| find_all(text, &query).len()).sum())
         } else {
             doc.buf.lines.iter().map(|l| find_all(l, &query).len()).sum()
         };
@@ -2596,9 +2661,8 @@ impl App {
             }
         };
         let found = if formatted {
-            let r = doc.rendered.as_ref().map(|(_, r)| r);
-            let lines: Vec<String> = r.map_or(Vec::new(), |r| (0..r.lines.len()).map(|i| r.text(i)).collect());
-            search(&lines, &query, (from.line.max(if last.is_none() { top } else { 0 }), from.col), forward, inclusive)
+            let lines = doc.rendered.as_ref().map_or(&[][..], |(_, r)| r.texts());
+            search(lines, &query, (from.line.max(if last.is_none() { top } else { 0 }), from.col), forward, inclusive)
         } else {
             search(&doc.buf.lines, &query, (from.line, from.col), forward, inclusive)
         };
@@ -2613,7 +2677,7 @@ impl App {
                 doc.fmt_top = line.saturating_sub(body / 3).max(pinned);
             }
             // Tables also scroll sideways to it
-            let text = doc.rendered.as_ref().map(|(_, r)| r.text(line)).unwrap_or_default();
+            let text = doc.rendered.as_ref().and_then(|(_, r)| r.texts().get(line)).cloned().unwrap_or_default();
             let col = str_width(&text.chars().take(start).collect::<String>());
             let room = fmt_width.saturating_sub(gutter);
             if col >= gutter && (col < gutter + doc.fmt_left || col >= gutter + doc.fmt_left + room) {
@@ -2626,7 +2690,7 @@ impl App {
             doc.follow_cursor(page, width);
         } else {
             doc.show(line, start, page, width);
-            let col = display_col(&doc.buf.lines[line], start);
+            let col = doc.display_col(line, start);
             if !doc.wrap && (col < doc.left || col >= doc.left + width) {
                 doc.left = col.saturating_sub(width / 3);
             }
@@ -3791,13 +3855,10 @@ impl App {
         let Shown::Doc(doc) = &self.shown else { return String::new() };
         if self.editing() {
             let c = doc.buf.cursor;
-            return format!("Ln {}, Col {}", c.line + 1, display_col(&doc.buf.lines[c.line], c.col) + 1);
+            return format!("Ln {}, Col {}", c.line + 1, doc.display_col(c.line, c.col) + 1);
         }
         let (top, total) = if doc.formatted() {
-            (
-                doc.fmt_top - doc.pinned().min(doc.fmt_top),
-                doc.rendered.as_ref().map_or(0, |(_, r)| r.lines.len() - r.pinned),
-            )
+            (doc.fmt_top - doc.pinned().min(doc.fmt_top), doc.rendered.as_ref().map_or(0, |(_, r)| r.len() - r.pinned))
         } else {
             (doc.top, doc.buf.lines.len())
         };
@@ -3815,16 +3876,16 @@ fn draw_formatted(f: &mut Frame, doc: &mut Doc, area: Rect, search: Option<&str>
     let Some((_, rendered)) = &doc.rendered else { return };
     let pinned = rendered.pinned.min(height);
     let body = height - pinned;
-    let max_top = rendered.lines.len().saturating_sub(body).max(rendered.pinned);
+    let max_top = rendered.len().saturating_sub(body).max(rendered.pinned);
     doc.fmt_top = doc.fmt_top.clamp(rendered.pinned, max_top);
     doc.fmt_left = doc.fmt_left.min(rendered.width.saturating_sub(text.width as usize));
     let (top, left, gutter) = (doc.fmt_top, doc.fmt_left, rendered.gutter);
-    let shown = || rendered.lines[..pinned].iter().chain(rendered.lines.iter().skip(top).take(body));
+    let shown = || (0..pinned).chain(top..(top + body).min(rendered.len())).map(|i| rendered.line(i));
     // More to the right only if a line on screen goes on past the edge
-    doc.more = (left > 0, shown().any(|line| line.width() > left + text.width as usize));
+    doc.more = (left > 0, shown().any(|line| line_wider_than(&line, left + text.width as usize)));
     let lines: Vec<Line> = shown()
         .map(|line| {
-            let line = slice_line(line, gutter, left);
+            let line = slice_line(&line, gutter, left, text.width as usize);
             match search {
                 Some(q) => markdown::mark_matches(&line, q, match_style()),
                 None => line,
@@ -3847,7 +3908,10 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     doc.top = doc.top.min(total - 1);
     if !doc.wrap {
         doc.top_row = 0;
-        // No scrolling past the end of the longest line (tabs count at their widest)
+    }
+    // No scrolling past the end of the longest line (tabs count at their widest), which
+    // takes measuring all of them, so only once scrolled
+    if !doc.wrap && doc.left > 0 {
         let version = doc.buf.version;
         let widest = match doc.widest {
             Some((v, widest)) if v == version => widest,
@@ -3881,28 +3945,34 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     doc.more = if doc.wrap {
         (false, false)
     } else {
-        let cut_off = rows.iter().any(|&(i, ..)| wider_than(&doc.buf.lines[i], doc.left + width));
+        let cut_off = rows.iter().any(|&(i, ..)| {
+            let right = doc.left + width;
+            wider_than_from(&doc.buf.lines[i], place_before_col(&doc.places(i), right), right)
+        });
         (doc.left > 0, cut_off)
     };
 
     let selection = doc.buf.selection();
     let current = doc.last_match;
     let mut lines = Vec::with_capacity(height);
-    // A line's matches, found once for all the rows it wraps into
-    let mut found: Option<(usize, Vec<(usize, usize)>)> = None;
     for &(i, start, next) in &rows {
         let text = &doc.buf.lines[i];
+        // Not wrapping, a long line is read from the place nearest the view, and its
+        // matches looked at up to the place past it
+        let (from, to) = if doc.wrap {
+            (start, next.map_or(usize::MAX, |n| n.char))
+        } else {
+            let places = doc.places(i);
+            let to = place_after_col(&places, doc.left + width).map_or(usize::MAX, |p| p.char);
+            (place_before_col(&places, doc.left), to)
+        };
         let number = if start.char > 0 { " ".repeat(digits + 2) } else { format!("{:>digits$}  ", i + 1) };
         let number_style = if doc.editing && i == doc.buf.cursor.line { Style::new().fg(Color::Yellow) } else { dim() };
         let mut marks = Vec::new();
         if let Some(q) = search {
-            if found.as_ref().is_none_or(|(line, _)| *line != i) {
-                found = Some((i, find_all(text, q)));
-            }
-            let hits = found.as_ref().map_or(&[][..], |(_, hits)| hits.as_slice());
+            let hits = doc.matches(i, q);
             // Only the ones on this row: a long line can have thousands
-            let (from, to) = if doc.wrap { (start.char, next.map_or(usize::MAX, |n| n.char)) } else { (0, usize::MAX) };
-            let first = hits.partition_point(|&(_, e)| e <= from);
+            let first = hits.partition_point(|&(_, e)| e <= from.char);
             for &(s, e) in hits[first..].iter().take_while(|&&(s, _)| s < to) {
                 let style = if current == Some(Pos::new(i, s)) {
                     match_style().add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
@@ -3919,11 +3989,8 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
         }
         // A wrapped row shows just its own characters, read from where it starts; the last
         // row of a line may also show the selection running on past its end
-        let (from, left, room) = if doc.wrap {
-            (start, start.col, next.map_or(width, |n| n.col - start.col))
-        } else {
-            (Place::default(), doc.left, width)
-        };
+        let (left, room) =
+            if doc.wrap { (start.col, next.map_or(width, |n| n.col - start.col)) } else { (doc.left, width) };
         let mut spans = vec![Span::styled(number, number_style)];
         spans.extend(line_spans(text, doc.colors.get(i), from, left, room, &marks));
         lines.push(Line::from(spans));
@@ -3937,7 +4004,7 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
             .iter()
             .position(|&(i, start, next)| i == c.line && c.col >= start.char && next.is_none_or(|n| c.col < n.char));
         if let Some(y) = on_row {
-            let start = if doc.wrap { rows[y].1 } else { Place::default() };
+            let start = if doc.wrap { rows[y].1 } else { place_before_char(&doc.places(c.line), c.col) };
             let col = display_col_from(text, start, c.col);
             let left = if doc.wrap { start.col } else { doc.left };
             // At the end of a wrapped row that fills the width, it sits on the last cell

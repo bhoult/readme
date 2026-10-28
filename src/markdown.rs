@@ -1,6 +1,8 @@
 //! Markdown rendered for reading: styled, wrapped to the pane, and each line tagged
 //! with the source line it came from, so switching to the raw text keeps the place.
 
+use std::{borrow::Cow, cell::OnceCell};
+
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -8,12 +10,16 @@ use ratatui::{
 };
 
 use crate::{
-    highlight,
+    highlight, table,
     text::{find_all, printable, push_span, split_at_width, str_width},
 };
 
+#[derive(Default)]
 pub struct Rendered {
+    /// The lines, laid out, unless they're a table's rows
     pub lines: Vec<Line<'static>>,
+    /// A table's rows, laid out only as they're shown
+    pub table: Option<Box<table::Rows>>,
     /// The source line each rendered line came from
     pub src: Vec<usize>,
     /// Lines at the top that stay on screen while the rest scrolls (a table header)
@@ -22,16 +28,45 @@ pub struct Rendered {
     pub gutter: usize,
     /// The widest line, when lines can be wider than the screen
     pub width: usize,
+    /// Each line's text, worked out when a search first needs it
+    texts: OnceCell<Vec<String>>,
 }
 
 impl Rendered {
+    /// Just `line`, a note in place of what can't be shown.
+    pub fn note(line: Line<'static>) -> Self {
+        Self { lines: vec![line], src: vec![0], ..Self::default() }
+    }
+
+    /// A table's `rows`, each line from source line `src`.
+    pub fn table(rows: table::Rows, src: Vec<usize>, pinned: usize, gutter: usize, width: usize) -> Self {
+        Self { table: Some(Box::new(rows)), src, pinned, gutter, width, ..Self::default() }
+    }
+
     /// The first rendered line from source line `line` on.
     pub fn line_for_src(&self, line: usize) -> usize {
         self.src.iter().position(|&s| s >= line).unwrap_or(self.src.len().saturating_sub(1))
     }
 
+    pub fn len(&self) -> usize {
+        self.table.as_ref().map_or(self.lines.len(), |t| t.len())
+    }
+
+    /// Line `i`, laid out.
+    pub fn line(&self, i: usize) -> Cow<'_, Line<'static>> {
+        match &self.table {
+            Some(table) => Cow::Owned(table.line(i)),
+            None => Cow::Borrowed(&self.lines[i]),
+        }
+    }
+
     pub fn text(&self, i: usize) -> String {
-        self.lines[i].spans.iter().map(|s| s.content.as_ref()).collect()
+        self.line(i).spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// Every line's text, for searching: worked out once.
+    pub fn texts(&self) -> &[String] {
+        self.texts.get_or_init(|| (0..self.len()).map(|i| self.text(i)).collect())
     }
 }
 
@@ -104,7 +139,7 @@ pub fn render(src: &str, width: u16, wrap_code: bool) -> Rendered {
     let mut r = Renderer {
         width: (width as usize).max(20),
         line_starts,
-        out: Rendered { lines: Vec::new(), src: Vec::new(), pinned: 0, gutter: 0, width: 0 },
+        out: Rendered::default(),
         blank: Vec::new(),
         inline: Vec::new(),
         inline_src: Vec::new(),

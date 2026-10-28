@@ -19,7 +19,7 @@ use ignore::{WalkBuilder, WalkState};
 use crate::{
     archive::{self, Entry},
     cores,
-    text::find_all,
+    text::finds,
 };
 
 /// Dependency and build folders, left out of the filter and the search unless hidden
@@ -212,8 +212,10 @@ impl Tree {
         }
         self.selected = self.selected.min(self.rows.len().saturating_sub(1));
         // Only what's on view stays marked, so nothing hidden gets moved or deleted
-        let shown: HashSet<&PathBuf> = self.rows.iter().filter(|r| !r.up).map(|r| &r.path).collect();
-        self.marks.retain(|p| shown.contains(p));
+        if !self.marks.is_empty() {
+            let shown: HashSet<&PathBuf> = self.rows.iter().filter(|r| !r.up).map(|r| &r.path).collect();
+            self.marks.retain(|p| shown.contains(p));
+        }
     }
 
     /// The selected row, unless it's "..".
@@ -347,7 +349,7 @@ impl Tree {
         let mut keep: HashSet<&Path> = HashSet::new();
         for (path, _) in everything.iter() {
             let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
-            if words.iter().all(|w| !find_all(&rel, w).is_empty()) {
+            if words.iter().all(|w| finds(&rel, w)) {
                 for dir in path.ancestors() {
                     if dir == root || !keep.insert(dir) {
                         break;

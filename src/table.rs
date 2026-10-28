@@ -53,7 +53,7 @@ pub fn render(src: &str, delimiter: u8) -> Rendered {
     let cut = rows.len() > MAX_ROWS;
     rows.truncate(MAX_ROWS);
     if rows.is_empty() {
-        return Rendered { lines: vec![Line::styled("(empty)", dim())], src: vec![0], pinned: 0, gutter: 0, width: 0 };
+        return Rendered::note(Line::styled("(empty)", dim()));
     }
 
     let cols = rows.iter().map(|(_, cells)| cells.len()).max().unwrap_or(0);
@@ -80,38 +80,88 @@ pub fn render(src: &str, delimiter: u8) -> Rendered {
     if rows.len().saturating_mul(row_bytes) > MAX_TABLE_BYTES {
         let size = format!("{} rows by {cols} columns", rows.len());
         let note = format!("(too big to lay out as a table, {size}; m shows the text)");
-        return Rendered { lines: vec![Line::styled(note, dim())], src: vec![0], pinned: 0, gutter: 0, width: 0 };
+        return Rendered::note(Line::styled(note, dim()));
     }
-    let mut out = Rendered { lines: Vec::new(), src: Vec::new(), pinned: 0, gutter, width };
+    let rule = rows.len() > 1;
+    let mut table = Rows { widths, numeric, digits, rule, cut, ..Rows::default() };
+    let mut src = Vec::with_capacity(rows.len() + 2);
     for (r, (line, cells)) in rows.iter().enumerate() {
+        for cell in cells {
+            table.cells.push_str(cell);
+            table.ends.push(table.cells.len());
+        }
+        table.starts.push(table.ends.len());
+        src.push(*line);
+        // The rule under the header goes with it
+        if r == 0 && rule {
+            src.push(*line);
+        }
+    }
+    if cut {
+        src.push(rows.last().map_or(0, |r| r.0));
+    }
+    let pinned = if rule { 2 } else { 0 };
+    Rendered::table(table, src, pinned, gutter, width)
+}
+
+/// A table's rows, kept as their cells and laid out only as they're shown: laid out all
+/// at once, every cell is text of its own padded to its column's width, which for a big
+/// file takes dozens of times its size.
+#[derive(Default)]
+pub struct Rows {
+    /// Every row's cells, one after another, where each cell ends, and where in `ends`
+    /// each row's cells end
+    cells: String,
+    ends: Vec<usize>,
+    starts: Vec<usize>,
+    widths: Vec<usize>,
+    /// Which columns are numbers, lined up on the right
+    numeric: Vec<bool>,
+    /// The width of the row numbers
+    digits: usize,
+    /// A rule under the header, and a note at the end that rows were left out
+    rule: bool,
+    cut: bool,
+}
+
+impl Rows {
+    pub fn len(&self) -> usize {
+        self.starts.len() + usize::from(self.rule) + usize::from(self.cut)
+    }
+
+    /// Cell `c` of row `r`, or nothing for a row with fewer cells.
+    fn cell(&self, r: usize, c: usize) -> &str {
+        let first = r.checked_sub(1).map_or(0, |before| self.starts[before]);
+        if first + c >= self.starts[r] {
+            return "";
+        }
+        let start = (first + c).checked_sub(1).map_or(0, |before| self.ends[before]);
+        &self.cells[start..self.ends[first + c]]
+    }
+
+    /// Line `i`: the header row, the rule under it, the other rows, and the note.
+    pub fn line(&self, i: usize) -> Line<'static> {
+        if self.rule && i == 1 {
+            let rule: Vec<String> = self.widths.iter().map(|w| "─".repeat(*w)).collect();
+            let gutter = ratatui::text::Span::styled(" ".repeat(self.digits + 1), dim());
+            return Line::from(vec![gutter, ratatui::text::Span::styled(rule.join("─┼─"), dim())]);
+        }
+        let r = if self.rule && i > 1 { i - 1 } else { i };
+        if r >= self.starts.len() {
+            return Line::styled(format!("  … the first {MAX_ROWS} rows; m shows all of the text"), dim());
+        }
         let mut spans = Vec::new();
-        let number = if r == 0 { String::new() } else { r.to_string() };
+        let (number, digits) = (if r == 0 { String::new() } else { r.to_string() }, self.digits);
         push_span(&mut spans, &format!("{number:>digits$} "), dim());
-        for (c, &width) in widths.iter().enumerate() {
+        for (c, &width) in self.widths.iter().enumerate() {
             if c > 0 {
                 push_span(&mut spans, " │ ", dim());
             }
             let style = if r == 0 { Style::new().add_modifier(Modifier::BOLD) } else { Style::new() };
-            let cell = cells.get(c).map_or("", String::as_str);
-            push_span(&mut spans, &fit(cell, width, numeric[c] && r > 0), style);
+            push_span(&mut spans, &fit(self.cell(r, c), width, self.numeric[c] && r > 0), style);
         }
-        out.lines.push(Line::from(spans));
-        out.src.push(*line);
-        if r == 0 && rows.len() > 1 {
-            let rule: Vec<String> = widths.iter().map(|w| "─".repeat(*w)).collect();
-            out.lines.push(Line::from(vec![
-                ratatui::text::Span::styled(" ".repeat(gutter), dim()),
-                ratatui::text::Span::styled(rule.join("─┼─"), dim()),
-            ]));
-            out.src.push(*line);
-            out.pinned = 2;
-        }
+        Line::from(spans)
     }
-    if cut {
-        out.lines.push(Line::styled(format!("  … the first {MAX_ROWS} rows; m shows all of the text"), dim()));
-        out.src.push(rows.last().map_or(0, |r| r.0));
-    }
-    out
 }
 
 /// A cell cut or padded to exactly `width` columns.
@@ -128,7 +178,7 @@ mod tests {
 
     fn plain(src: &str, delimiter: u8) -> (Vec<String>, Rendered) {
         let r = render(src, delimiter);
-        ((0..r.lines.len()).map(|i| r.text(i)).collect(), r)
+        ((0..r.len()).map(|i| r.text(i)).collect(), r)
     }
 
     #[test]

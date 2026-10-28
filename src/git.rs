@@ -9,7 +9,7 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc,
     },
@@ -31,6 +31,11 @@ const MAX_BRANCHES: usize = 500;
 const MAX_LISTED: usize = 200;
 /// How long a fetch has before it's stopped
 const FETCH_FOR: Duration = Duration::from_secs(60);
+/// Most branches looked into at once: each is three git processes, which a repository
+/// with hundreds of branches would otherwise run on every core at once
+const SURVEY_THREADS: usize = 4;
+/// Most branches' work kept from one look to the next
+const KEPT_WORK: usize = 5000;
 
 pub struct Commit {
     pub hash: String,
@@ -445,6 +450,31 @@ pub fn branch_work(repo: &Path, base: &str, tip: &str, scope: Option<&Path>) -> 
     Ok(Work { commits, owner, split, changes, error: None })
 }
 
+/// What the branch at `tip` did, as [`branch_work`] finds it, or as it found it before:
+/// it depends only on the two commits and the scope, so it's looked into again only once
+/// the branch or the base has moved. What couldn't be looked into is tried again.
+fn kept_work(repo: &Path, base: &str, tip: &str, scope: Option<&Path>) -> Work {
+    type Key = (PathBuf, String, String, Option<PathBuf>);
+    static KEPT: OnceLock<Mutex<HashMap<Key, Work>>> = OnceLock::new();
+    let kept = KEPT.get_or_init(Mutex::default);
+    let key = (repo.to_path_buf(), base.to_string(), tip.to_string(), scope.map(Path::to_path_buf));
+    if let Some(work) = kept.lock().ok().and_then(|kept| kept.get(&key).cloned()) {
+        return work;
+    }
+    match branch_work(repo, base, tip, scope) {
+        Ok(work) => {
+            if let Ok(mut kept) = kept.lock() {
+                if kept.len() >= KEPT_WORK {
+                    kept.clear();
+                }
+                kept.insert(key, work.clone());
+            }
+            work
+        }
+        Err(e) => Work { error: Some(format!("{e:#}")), ..Work::default() },
+    }
+}
+
 /// Where `tip` split off from `base`: the newest commit both have, or none if they have
 /// no history in common (a gh-pages branch, say).
 fn merge_base(repo: &Path, base: &str, tip: &str) -> Result<Option<String>> {
@@ -610,14 +640,13 @@ impl Survey {
             let next = AtomicUsize::new(0);
             let (tips, next, repo, scope, base, halt) = (&tips, &next, &repo, &scope, &base, &halt);
             thread::scope(|s| {
-                for _ in 0..cores().min(tips.len()) {
+                for _ in 0..cores().min(SURVEY_THREADS).min(tips.len()) {
                     let sender = sender.clone();
                     s.spawn(move || {
                         while !halt.load(Ordering::Relaxed) {
                             let j = next.fetch_add(1, Ordering::Relaxed);
                             let Some(tip) = tips.get(j) else { break };
-                            let work = branch_work(repo, base, tip, scope.as_deref())
-                                .unwrap_or_else(|e| Work { error: Some(format!("{e:#}")), ..Work::default() });
+                            let work = kept_work(repo, base, tip, scope.as_deref());
                             if sender.send((j, work)).is_err() {
                                 break;
                             }
