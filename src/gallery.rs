@@ -1,5 +1,5 @@
-//! A folder's images as a grid of thumbnails, decoded in the background as they come
-//! into view.
+//! A folder's images and videos as a grid of thumbnails, decoded in the background as
+//! they come into view. A video's is its picture a second in, with a badge.
 
 use std::{
     fs,
@@ -13,7 +13,7 @@ use std::{
     thread,
 };
 
-use image::DynamicImage;
+use image::{DynamicImage, RgbImage};
 use ratatui::{
     Frame,
     layout::Rect,
@@ -27,7 +27,7 @@ use ratatui_image::{
     protocol::StatefulProtocol,
 };
 
-use crate::{picture, text::str_width};
+use crate::{external, picture, text::str_width, video};
 
 /// Columns between thumbnails
 const GAP: u16 = 2;
@@ -48,12 +48,14 @@ const BUDGET: u64 = 256 << 20;
 const WORKERS: usize = 6;
 /// Thumbnails further than this many screens from the view are let go
 const KEEP_SCREENS: usize = 3;
+/// A video's thumbnail is its picture this many seconds in
+const STILL_AT: f64 = 1.0;
 pub const WIDTHS: (u32, u32) = (50, 400);
 /// The decoding threads' name: a panic in one fails just its thumbnail
 pub const WORKER: &str = "thumbnails";
 
-/// The images directly in `dir`, by name. Hidden ones are left out, as the tree leaves
-/// them out: macOS's `._IMG_0001.JPG` beside every photo on a shared drive, say.
+/// The images and videos directly in `dir`, by name. Hidden ones are left out, as the
+/// tree leaves them out: macOS's `._IMG_0001.JPG` beside every photo on a shared drive, say.
 pub fn images_in(dir: &Path) -> Vec<PathBuf> {
     let hidden = |p: &Path| p.file_name().is_some_and(|n| n.to_string_lossy().starts_with('.'));
     let mut images: Vec<PathBuf> = fs::read_dir(dir)
@@ -61,7 +63,7 @@ pub fn images_in(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| picture::is_image(p) && !hidden(p))
+        .filter(|p| (picture::is_image(p) || external::is_video(p)) && !hidden(p))
         .collect();
     images.retain(|p| p.is_file());
     images.sort_by_cached_key(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase()));
@@ -119,7 +121,9 @@ enum Decoded {
 
 pub struct Gallery {
     pub dir: PathBuf,
+    /// The images and videos, and how many are videos
     pub images: Vec<PathBuf>,
+    pub videos: usize,
     thumbs: Vec<Thumb>,
     /// Each image's height over its width, once known; kept when a thumbnail is let go
     aspects: Vec<Option<f32>>,
@@ -178,9 +182,11 @@ impl Gallery {
         }
         let thumbs = images.iter().map(|_| Thumb::Waiting).collect();
         let aspects = vec![None; images.len()];
+        let videos = images.iter().filter(|p| external::is_video(p)).count();
         Self {
             dir,
             images,
+            videos,
             thumbs,
             aspects,
             selected: 0,
@@ -315,6 +321,9 @@ impl Gallery {
                         let image = StatefulImage::default().resize(Resize::Scale(Some(FilterType::Triangle)));
                         f.render_stateful_widget(image, picture.intersection(area), protocol.as_mut());
                     }
+                    Thumb::Failed if external::is_video(&self.images[i]) => {
+                        note(f, picture.intersection(area), "▶ no preview")
+                    }
                     Thumb::Failed => note(f, picture.intersection(area), "can't read"),
                     Thumb::Ready(_) => {}
                     _ => note(f, picture.intersection(area), "…"),
@@ -355,6 +364,9 @@ impl Gallery {
 }
 
 fn decode(path: &Path, budget: &Budget) -> Option<DynamicImage> {
+    if external::is_video(path) {
+        return still(path, budget);
+    }
     if fs::metadata(path).ok()?.len() > MAX_BYTES {
         return None;
     }
@@ -371,6 +383,64 @@ fn decode(path: &Path, budget: &Budget) -> Option<DynamicImage> {
     limits.max_alloc = Some(LARGEST);
     let image = picture::decode_upright(reader, limits).ok()?;
     Some(image.thumbnail(DECODED.0, DECODED.1))
+}
+
+/// A video's thumbnail: its picture STILL_AT seconds in, badged as a video. None if
+/// it isn't one readme plays.
+fn still(path: &Path, budget: &Budget) -> Option<DynamicImage> {
+    // The decoder keeps up to 16 pictures to go by, at a byte and a half a pixel
+    let (width, height) = video::picture_size(path)?;
+    let need = u64::from(width) * u64::from(height) * 24;
+    if need > LARGEST {
+        return None;
+    }
+    let _held = budget.take(need.max(1));
+    let mut still = video::still(path, STILL_AT, DECODED)?;
+    badge(&mut still);
+    Some(DynamicImage::ImageRgb8(still))
+}
+
+/// Marks a picture as a video's: a play sign on a dark patch in its bottom left corner,
+/// drawn into the picture itself, so it shows however the picture is drawn.
+fn badge(picture: &mut RgbImage) {
+    let (w, h) = (picture.width() as f32, picture.height() as f32);
+    // About a quarter of the picture's height, but never too small to make out
+    let tall = (w.min(h) * 0.24).max(10.0).min(h);
+    let (wide, margin) = (tall * 1.4, (w.min(h) * 0.05).max(1.0));
+    let (left, top) = (margin, h - margin - tall);
+    let round = tall * 0.25;
+    // The sign: a triangle pointing right, a little right of the middle so it looks
+    // centered
+    let (sign_h, sign_w) = (tall * 0.5, tall * 0.44);
+    let (cx, cy) = (left + wide / 2.0 + tall * 0.03, top + tall / 2.0);
+    let (x0, x1, y0, y1) = (cx - sign_w / 2.0, cx + sign_w / 2.0, cy - sign_h / 2.0, cy + sign_h / 2.0);
+    let in_patch = |x: f32, y: f32| {
+        let (dx, dy) =
+            ((left + round - x).max(x - (left + wide - round)), (top + round - y).max(y - (top + tall - round)));
+        x >= left && x < left + wide && y >= top && y < top + tall && (dx <= 0.0 || dy <= 0.0 || dx.hypot(dy) <= round)
+    };
+    // Right of the left edge, and inside the two slanted edges
+    let in_sign = |x: f32, y: f32| x >= x0 && (y - cy).abs() <= (x1 - x) / (x1 - x0) * (y1 - y0) / 2.0;
+    for py in top.floor().max(0.0) as u32..((top + tall).ceil() as u32).min(picture.height()) {
+        for px in left.floor() as u32..((left + wide).ceil() as u32).min(picture.width()) {
+            // How much of the pixel each covers, from 4 × 4 points in it
+            let (mut patch, mut sign) = (0.0, 0.0);
+            for k in 0..16 {
+                let (x, y) = (px as f32 + (k % 4) as f32 / 4.0 + 0.125, py as f32 + (k / 4) as f32 / 4.0 + 0.125);
+                if in_patch(x, y) {
+                    patch += 1.0 / 16.0;
+                    if in_sign(x, y) {
+                        sign += 1.0 / 16.0;
+                    }
+                }
+            }
+            let pixel = picture.get_pixel_mut(px, py);
+            for c in &mut pixel.0 {
+                let dark = f32::from(*c) * (1.0 - 0.6 * patch);
+                *c = (dark * (1.0 - sign) + 255.0 * sign).round() as u8;
+            }
+        }
+    }
 }
 
 fn note(f: &mut Frame, area: Rect, text: &str) {
@@ -393,4 +463,33 @@ fn fit(name: &str, width: usize) -> String {
         out.push(c);
     }
     out + "…"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn videos_show_among_the_images_a_second_in_and_badged() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["b.png", "a.mp4", "notes.txt", ".hidden.mov"] {
+            fs::write(dir.path().join(name), b"").unwrap();
+        }
+        let names: Vec<String> =
+            images_in(dir.path()).iter().map(|p| p.file_name().unwrap().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, ["a.mp4", "b.png"]);
+        // testdata's clip a second in is blue, with a white square up top
+        let clip = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
+        let Some(DynamicImage::ImageRgb8(picture)) = still(&clip, &DECODING) else { panic!("no still") };
+        assert_eq!(picture.dimensions(), (72, 40));
+        let blue = |p: &image::Rgb<u8>| p.0[2] > 200 && p.0[0] < 60;
+        assert!(blue(picture.get_pixel(60, 30)) && picture.get_pixel(60, 14).0.iter().all(|c| *c > 200));
+        // and the badge in the bottom left: a white sign on a darker patch
+        assert!(picture.get_pixel(8, 33).0.iter().all(|c| *c > 200), "{:?}", picture.get_pixel(8, 33));
+        let patch = picture.get_pixel(3, 36).0;
+        assert!(patch[2] < 120 && patch[2] > 40, "{patch:?}");
+        // Nothing for a video readme can't play
+        let other = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/other-codec.mp4");
+        assert!(still(&other, &DECODING).is_none());
+    }
 }

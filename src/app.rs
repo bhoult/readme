@@ -975,6 +975,7 @@ impl App {
         if let Some(file) = file {
             app.tree.reveal(&file);
             app.open(&file);
+            app.then(&file, Then::Play);
             if !target.is_dir() {
                 app.focus = Focus::Content;
             }
@@ -2286,6 +2287,8 @@ impl App {
         }
         if !self.dirty() && !self.showing(&path) {
             self.open(&path);
+            // A video plays as soon as it's chosen
+            self.then(&path, Then::Play);
         }
     }
 
@@ -2315,13 +2318,18 @@ impl App {
         self.gallery_stash = Some(gallery);
         self.tree.reveal(&path);
         self.open(&path);
+        self.then(&path, Then::Play);
         self.focus = Focus::Content;
     }
 
-    /// From an image back to the thumbnails it was opened from.
+    /// From an image or a video back to the thumbnails it was opened from.
     fn back_to_gallery(&mut self) -> bool {
-        let Shown::Image(image) = &self.shown else { return false };
-        let Some(dir) = image.path.parent().map(Path::to_path_buf) else { return false };
+        let path = match &self.shown {
+            Shown::Image(image) => &image.path,
+            Shown::Video(video) => &video.path,
+            _ => return false,
+        };
+        let Some(dir) = path.parent().map(Path::to_path_buf) else { return false };
         let Some(gallery) = self.gallery_stash.take_if(|g| g.dir == dir) else { return false };
         self.tree.reveal(&dir);
         self.shown = Shown::Gallery(gallery);
@@ -2375,7 +2383,12 @@ impl App {
                 KeyCode::Char('-' | '_') => self.change_volume(-10),
                 KeyCode::Char('H') => self.toggle_history(),
                 KeyCode::Char('B') => self.toggle_branches(),
-                KeyCode::Esc => self.focus = Focus::Tree,
+                KeyCode::Esc | KeyCode::Backspace => {
+                    // Back to the thumbnails it came from, or else to the tree
+                    if !self.back_to_gallery() && key.code == KeyCode::Esc {
+                        self.focus = Focus::Tree;
+                    }
+                }
                 KeyCode::Char('q') => self.request_quit(),
                 _ => {}
             }
@@ -3693,9 +3706,12 @@ impl App {
             Shown::Gallery(gallery) => {
                 let rel = relative(&gallery.dir, &root);
                 let title = if rel.is_empty() { format!(" {}", tilde(&gallery.dir)) } else { format!(" {rel}/") };
-                let count = gallery.images.len();
-                let plural = if count == 1 { "" } else { "s" };
-                header(f, area, &title, &format!("{count} image{plural} · {} px ", gallery.width_px), focused);
+                let (videos, images) = (gallery.videos, gallery.images.len() - gallery.videos);
+                let count =
+                    |n: usize, what: &str| (n > 0).then(|| format!("{n} {what}{}", if n == 1 { "" } else { "s" }));
+                let counts: Vec<String> =
+                    [count(images, "image"), count(videos, "video")].into_iter().flatten().collect();
+                header(f, area, &title, &format!("{} · {} px ", counts.join(" · "), gallery.width_px), focused);
                 let grid =
                     Rect::new(body.x + 1, body.y + 1, body.width.saturating_sub(2), body.height.saturating_sub(1));
                 gallery.draw(f, grid, &self.picker, focused);
@@ -4700,15 +4716,16 @@ mod tests {
     }
 
     #[test]
-    fn space_plays_the_video_the_selection_has_just_moved_to() {
+    fn space_goes_to_the_video_the_selection_has_just_moved_to() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "")]);
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
         fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
-        // ↓ and Space come in together, before the video's been shown
+        // ↓ and Space come in together, before the video's been shown: it's shown, which
+        // plays it, and then Space pauses it
         h.app.handle(press(KeyCode::Down));
         h.app.handle(press(KeyCode::Char(' ')));
         h.draw();
-        assert!(h.screen().contains("▶ 0:00"), "{}", h.screen());
+        assert!(h.screen().contains("‖ 0:00"), "{}", h.screen());
     }
 
     #[test]
@@ -4894,6 +4911,33 @@ mod tests {
     }
 
     #[test]
+    fn a_folder_shows_its_videos_among_its_images_and_plays_one_opened() {
+        let mut h = Harness::new(&[("notes.txt", "notes\n")]);
+        write_png(&h.root.join("pics/a.png"), 12, 8);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
+        fs::write(h.root.join("pics/clip.mp4"), fs::read(data).unwrap()).unwrap();
+        h.app.tree.refresh();
+        h.draw();
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Up);
+        assert!(h.screen().contains("1 image · 1 video"), "{}", h.screen());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while h.screen().contains('…') && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+            h.draw();
+        }
+        assert!(!h.screen().contains('…') && !h.screen().contains("no preview"), "{}", h.screen());
+        // Opened, the video plays; Esc goes back to the thumbnails
+        let (x, y) = h.find("clip.mp4");
+        h.click(x, y);
+        assert!(h.screen().contains("pics/clip.mp4"), "{}", h.screen());
+        h.draw_until(|h| h.screen().contains("▶ 0:0"));
+        h.key(KeyCode::Esc);
+        assert!(h.screen().contains("1 image · 1 video"), "{}", h.screen());
+        assert_eq!(h.app.position(), "2/2");
+    }
+
+    #[test]
     fn a_folder_of_images_shows_thumbnails() {
         let mut h = Harness::new(&[("notes.txt", "notes\n")]);
         for name in ["c.png", "a.png", "b.jpg"] {
@@ -4948,12 +4992,24 @@ mod tests {
         assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
     }
 
-    /// The tree with a.txt and testdata's `name` as clip.mp4, which is selected.
+    /// The tree with a.txt and testdata's `name` as clip.mp4, which is selected, and so
+    /// playing.
     fn showing_video(name: &str) -> Harness {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "")]);
         let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
         fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
         h.key(KeyCode::Down);
+        h
+    }
+
+    /// The same, but paused at its start, by a Space that came in with the arrow.
+    fn paused_video(name: &str) -> Harness {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "")]);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+        fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
+        h.app.handle(press(KeyCode::Down));
+        h.app.handle(press(KeyCode::Char(' ')));
+        h.draw();
         h
     }
 
@@ -4965,8 +5021,8 @@ mod tests {
     const BLUE: (u8, u8, u8) = (32, 62, 223);
 
     #[test]
-    fn a_video_plays_in_the_pane() {
-        let mut h = showing_video("clip.mp4");
+    fn a_video_plays_in_the_pane_once_chosen() {
+        let mut h = paused_video("clip.mp4");
         assert!(h.screen().contains("72×40 H.264, stereo"), "{}", h.screen());
         // Its first picture, paused at the start: red, with a white square
         h.draw_until(|h| !h.blocks().is_empty());
@@ -4974,10 +5030,11 @@ mod tests {
         let blocks = h.blocks();
         assert!(blocks.iter().filter(|c| near(**c, RED)).count() > blocks.len() / 2);
         assert!(blocks.iter().any(|c| near(*c, (255, 255, 255))));
-        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
-        // Space plays it, from the tree, through to its last picture, blue, and stops there
-        h.key(KeyCode::Char(' '));
-        assert!(h.screen().contains("▶ 0:00 / 0:01"), "{}", h.screen());
+        // Chosen in the tree, a video plays, here and not in the video player, through to
+        // its last picture, blue, and stops there
+        let mut h = showing_video("clip.mp4");
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains("▶ 0:0"), "{}", h.screen());
         assert!(external::OPENED.with(|o| o.borrow().is_empty()));
         h.draw_until(|h| h.screen().contains("‖"));
         assert!(h.screen().contains("‖ 0:01 / 0:01"), "{}", h.screen());
@@ -4994,7 +5051,6 @@ mod tests {
     fn enter_on_a_video_opens_the_video_player_and_pauses_it_here() {
         let mut h = showing_video("clip.mp4");
         h.draw_until(|h| !h.blocks().is_empty());
-        h.key(KeyCode::Char(' '));
         assert!(h.screen().contains("▶ 0:0"), "{}", h.screen());
         h.key(KeyCode::Enter);
         assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
@@ -5076,13 +5132,13 @@ mod tests {
         assert!(h.row(19).contains("⏎ video player"), "{}", h.screen());
         // On the folder above, the video stays, and Enter opens the folder
         h.key(KeyCode::Up);
-        assert!(h.screen().contains("‖ 0:00"), "{}", h.screen());
+        assert!(h.screen().contains(" / 0:01"), "{}", h.screen());
         assert!(h.row(19).contains("⏎ open") && !h.row(19).contains("video player"), "{}", h.screen());
     }
 
     #[test]
     fn clicks_beside_the_volume_steps_and_on_muted_go_to_the_sound() {
-        let mut h = showing_video("clip.mp4");
+        let mut h = paused_video("clip.mp4");
         h.key(KeyCode::Tab);
         h.draw_until(|h| !h.blocks().is_empty());
         h.key(KeyCode::Char('-'));
@@ -5108,7 +5164,7 @@ mod tests {
 
     #[test]
     fn a_videos_sound_shows_as_a_spectrum_under_its_bar() {
-        let mut h = showing_video("clip.mp4");
+        let mut h = paused_video("clip.mp4");
         h.key(KeyCode::Tab);
         h.draw_until(|h| !h.blocks().is_empty());
         // Half way through, its tone shows in bars over the four rows under the bar,
@@ -5132,7 +5188,7 @@ mod tests {
 
     #[test]
     fn a_video_goes_where_the_keys_and_its_bar_say() {
-        let mut h = showing_video("clip.mp4");
+        let mut h = paused_video("clip.mp4");
         h.key(KeyCode::Tab);
         h.draw_until(|h| !h.blocks().is_empty());
         // Five seconds on is past its end: the last picture, still paused

@@ -106,8 +106,8 @@ Keys
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
-  Videos       Space play/pause (in the tree too) · ←→ 5 s · ↑↓ 1 min
-               Home start · m sound · +/- volume · Esc back to the tree
+  Videos       play once chosen · Space pause/play (in the tree too) · ←→ 5 s
+               ↑↓ 1 min · Home start · m sound · +/- volume · Esc back
                Enter or o the video player, pausing it here
   History      H on a file or folder · ↑↓ commits · Enter its files
                d diff or file · a all files · ← back, or a wider history
@@ -132,10 +132,11 @@ Mouse
 
 Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
 archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, a
-folder with images in it shows them as thumbnails (+/- to resize, Enter or a
-click to open one, Esc to go back), MP4 and MOV videos with H.264 play in the
-pane with their sound, and Enter on an HTML file or a video opens it in the
-browser or the video player; a click never does.
+folder with images or videos in it shows them as thumbnails, a video's a
+second in with a play badge (+/- to resize, Enter or a click to open one, Esc
+to go back), MP4 and MOV videos with H.264 play in the pane with their sound,
+and Enter on an HTML file or a video opens it in the browser or the video
+player; a click never does.
 
 Environment
   README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)

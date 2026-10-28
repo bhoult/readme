@@ -33,7 +33,7 @@ on Linux.
 - [**Editing**](#editing) with selection, undo, the system clipboard, and each line's own line ending kept
 - [**CSV and TSV**](#csv-and-tsv-tables) as aligned tables with the header kept on screen
 - [**Images**](#images) at full resolution in terminals that can show them, with zoom, and colored half-blocks anywhere else
-- [**Thumbnails**](#thumbnails) of a folder of images, in a grid
+- [**Thumbnails**](#thumbnails) of a folder's images and videos, in a grid
 - [**Videos**](#videos) play in the pane, with their sound, a volume control and a moving spectrum: MP4 and MOV with H.264, decoded in pure Rust
 - [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
 - [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
@@ -132,19 +132,20 @@ which works in any terminal with true color:
 
 ## Thumbnails
 
-Select a folder with images in it and the right pane shows them as a grid. They load in
-the background, on every core but one, as they come into view. They start 100 pixels
-wide; `+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` opens one.
-`Esc` goes back to the grid.
+Select a folder with images or videos in it and the right pane shows them as a grid. A
+video shows as its picture a second in, with a play badge in the corner. They load in
+the background, on up to six cores, as they come into view. They start 100 pixels wide;
+`+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` opens one, and
+plays a video. `Esc` goes back to the grid.
 
 ![A folder of nine images shown as 300-pixel thumbnails](docs/screenshots/gallery.png)
 
 ## Videos
 
 MP4 and MOV videos with H.264 pictures play in the right pane: most screen recordings,
-videos made with ffmpeg, and older phones' videos. Select one and its first
-picture shows; `Space` plays and pauses it, in the tree as well as in the pane, and so
-does a click on the picture. `Enter` opens it in your video player instead, pausing it
+videos made with ffmpeg, and older phones' videos. Select one and it plays; `Space`
+pauses and plays it, in the tree as well as in the pane, and so does a click on the
+picture. `Enter` opens it in your video player instead, pausing it
 here. Videos start with their sound off; `m` turns it on. Under the picture is the time,
 a bar to click to go anywhere in it, and the volume: click `muted` to turn the sound on,
 click a step to set it, or turn the wheel. The volume stays as you set it for the next
@@ -316,7 +317,7 @@ date too.
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
-| Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
+| Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image or a video) back to the thumbnails |
 | Videos | `Space` play/pause · `Enter` the video player · `←→` 5 s · `↑↓` 1 min · `Home` start · `m` sound · `+` `-` volume · `Esc` back to the tree |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
 | Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches (fetching the remote's) · `←` back, or wider · `H` history · `Esc` leave |
@@ -374,13 +375,13 @@ palette. Set `README_THEME` to use another of bat's themes, for example `Nord`,
 
 ## Built to stay quick
 
-- Searching, filtering and thumbnails use every CPU core.
+- Searching and filtering use every CPU core, and thumbnails up to six.
 - Videos decode on a thread of their own, a few pictures ahead, each made at the size
   it's shown. Pictures nothing else needs are skipped when seeking or running late.
 - Syntax colors are worked out only as far as you've looked, a slice per frame, and kept
   across reloads down to the first line that changed.
 - Memory stays bounded: files over 50 MB aren't opened, Markdown over 5 MB shows as text,
-  thumbnails decode within a shared 1 GB budget, and git output is capped.
+  thumbnails decode within a shared 256 MB budget, and git output is capped.
 - Nothing waits forever: a stuck clipboard program, a terminal that never answers, and a
   huge archive each get a time limit.
 

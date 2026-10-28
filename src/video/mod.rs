@@ -57,6 +57,19 @@ pub enum VolumeClick {
     Set(u8),
 }
 
+/// A video's picture `at` seconds in (its last, if it's shorter), as big as fits in
+/// `room`, for a thumbnail. None if it isn't a video readme plays.
+pub fn still(path: &Path, at: f64, room: (u32, u32)) -> Option<image::RgbImage> {
+    let frame = frames::still(path, at, room)?;
+    image::RgbImage::from_raw(frame.width, frame.height, frame.rgb)
+}
+
+/// The size of a video's pictures, if it's one readme plays.
+pub fn picture_size(path: &Path) -> Option<(u32, u32)> {
+    let track = mp4::open(path).ok()?.video?;
+    matches!(track.codec, Codec::H264(_)).then_some((track.width, track.height))
+}
+
 /// Pixels a Kitty picture starts out with at most, before it's seen how fast the
 /// terminal takes them, and the range it's kept in: every picture goes through the
 /// terminal (and herdr or tmux) as text, a megapixel being 4 MB of it

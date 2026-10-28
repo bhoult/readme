@@ -10,7 +10,7 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
-        mpsc::{Receiver, SyncSender, TryRecvError, sync_channel},
+        mpsc::{Receiver, TryRecvError, sync_channel},
     },
 };
 
@@ -94,7 +94,8 @@ impl Frames {
         let path = path.to_path_buf();
         let stopped = stop.clone();
         let spawned = std::thread::Builder::new().name(WORKER.into()).spawn(move || {
-            let result = decode(&path, &movie, from, &size, &late, &tx, &stopped);
+            let mut send = |frame| tx.send(Decoded::Frame(frame)).is_ok();
+            let result = decode(&path, &movie, from, &size, &late, &mut send, &stopped);
             let _ = tx.send(match result {
                 Ok(()) => Decoded::End,
                 Err(why) => Decoded::Failed(why),
@@ -123,6 +124,26 @@ impl Drop for Frames {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
     }
+}
+
+/// The picture on screen `at` seconds into the video at `path`, or its last if it's
+/// shorter, made as big as fits in `room` keeping its shape: decoded on this thread, for
+/// a thumbnail.
+pub fn still(path: &Path, at: f64, room: (u32, u32)) -> Option<Frame> {
+    let movie = super::mp4::open(path).ok()?;
+    let track = movie.video.as_ref()?;
+    let (w, h) = (f64::from(track.width.max(1)), f64::from(track.height.max(1)));
+    let k = (f64::from(room.0) / w).min(f64::from(room.1) / h).min(1.0);
+    let size = Size::default();
+    size.set(((w * k).round() as u32).max(1), ((h * k).round() as u32).max(1));
+    // The first picture handed over is the one on screen at `at`, and that's all
+    let mut first = None;
+    let mut take = |frame| {
+        first = Some(frame);
+        false
+    };
+    decode(path, &movie, at, &size, &Late::default(), &mut take, &AtomicBool::new(false)).ok()?;
+    first
 }
 
 /// A decoded picture waiting its turn to be shown, in YUV until it's sent.
@@ -157,7 +178,7 @@ fn decode(
     from: f64,
     size: &Size,
     late: &Late,
-    tx: &SyncSender<Decoded>,
+    out: &mut dyn FnMut(Frame) -> bool,
     stop: &AtomicBool,
 ) -> Result<(), String> {
     let Some(track) = &movie.video else { return Err("there's no video track".into()) };
@@ -174,7 +195,7 @@ fn decode(
     }
 
     let target = track.ticks(from);
-    let mut sender = Sender { track, tx, size, target, before: None, sent_any: false, beat: Beat::default() };
+    let mut sender = Sender { track, out, size, target, before: None, sent_any: false, beat: Beat::default() };
     // Decoded in decoding order, so each picture's time is that of the oldest sample fed
     // in that hasn't given one yet
     let mut times: VecDeque<i64> = VecDeque::new();
@@ -260,7 +281,8 @@ fn is_slice(kind: NalUnitType) -> bool {
 /// target time on.
 struct Sender<'a> {
     track: &'a Track,
-    tx: &'a SyncSender<Decoded>,
+    /// Takes each picture, and says whether to go on
+    out: &'a mut dyn FnMut(Frame) -> bool,
     size: &'a Size,
     target: i64,
     /// The latest picture shown before the target, held back until it's known
@@ -331,7 +353,7 @@ impl Sender<'_> {
             if width == 0 || height == 0 { (waiting.yuv.width, waiting.yuv.height) } else { (width, height) };
         let rgb = to_rgb(&waiting.yuv, width, height);
         self.sent_any = true;
-        self.tx.send(Decoded::Frame(Frame { at, width, height, rgb })).is_ok()
+        (self.out)(Frame { at, width, height, rgb })
     }
 }
 
@@ -672,6 +694,21 @@ mod tests {
                 assert!(to_rgb(&yuv, w, h) == by_each_pixel(&yuv, w as usize, h as usize), "{sw}x{sh} to {w}x{h}");
             }
         }
+    }
+
+    #[test]
+    fn a_still_is_the_picture_on_screen_then() {
+        // A second in, the eleventh picture: blue, the white square 50 pixels on
+        let frame = still(&clip(), 1.0, (72, 40)).unwrap();
+        assert_eq!((frame.width, frame.height, (frame.at * 10.0).round()), (72, 40, 10.0));
+        assert!(pixel(&frame, 60, 14).iter().all(|c| *c > 200), "{:?}", pixel(&frame, 60, 14));
+        assert!(near(pixel(&frame, 60, 30), [32, 62, 223]), "{:?}", pixel(&frame, 60, 30));
+        // Smaller, keeping its shape; and past its end, its last picture
+        let frame = still(&clip(), 5.0, (36, 36)).unwrap();
+        assert_eq!((frame.width, frame.height, (frame.at * 10.0).round()), (36, 20, 11.0));
+        // Not one readme plays
+        let other = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/other-codec.mp4");
+        assert!(still(&other, 1.0, (72, 40)).is_none());
     }
 
     #[test]
