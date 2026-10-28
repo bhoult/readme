@@ -10,7 +10,7 @@ their edits land, read what they wrote, look back through the history, and fix a
 yourself, without leaving the terminal. herdr isn't required, though: readme runs in any
 terminal, on its own or inside tmux, zellij or screen.
 
-![readme showing a project's README rendered, next to the directory tree](docs/screenshots/markdown.png)
+![A 45-second tour of readme: Markdown, code, the tree's filter, thumbnails, a video playing with its spectrum, a picture, a CSV table, a zip archive, git history and branches, finding text, editing, and the help](docs/demo.webp)
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Rust 1.90+](https://img.shields.io/badge/rust-1.90%2B-orange.svg)
@@ -65,10 +65,11 @@ the path, so `src ar` finds `src/archive.rs` and `src/markdown.rs` but not
 ## Markdown
 
 Markdown shows rendered: headings, lists, task lists, tables, block quotes, links with
-their targets, and fenced code with syntax highlighting (the screenshot at the top). `m`
-switches to the raw text and back, keeping your place, even inside a long paragraph or a
-table. Wide tables and long code lines keep their shape and scroll sideways rather than
-being squeezed.
+their targets, and fenced code with syntax highlighting. `m` switches to the raw text and
+back, keeping your place, even inside a long paragraph or a table. Wide tables and long
+code lines keep their shape and scroll sideways rather than being squeezed.
+
+![readme showing a project's README rendered, next to the directory tree](docs/screenshots/markdown.png)
 
 ## Source code
 
