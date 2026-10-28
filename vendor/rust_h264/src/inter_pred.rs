@@ -5,9 +5,6 @@
 
 use crate::dpb::DecodedPicture;
 
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
-
 /// Fetch a luma sample from the reference picture with boundary clipping.
 /// Out-of-bounds coordinates are clamped to the picture edge (spec 8.4.2.2.1).
 #[inline]
@@ -33,18 +30,18 @@ fn ref_chroma(plane: &[u8], width: usize, height: usize, x: i32, y: i32) -> i32 
 }
 
 #[inline]
-fn clip_u8(v: i32) -> u8 {
+pub(crate) fn clip_u8(v: i32) -> u8 {
     v.clamp(0, 255) as u8
 }
 
 #[inline]
-fn avg(a: u8, b: u8) -> u8 {
+pub(crate) fn avg(a: u8, b: u8) -> u8 {
     ((a as u16 + b as u16 + 1) >> 1) as u8
 }
 
 /// 6-tap FIR filter coefficient application on 6 consecutive samples.
 #[inline(always)]
-fn fir6(s: &[u8], i: usize) -> i32 {
+pub(crate) fn fir6(s: &[u8], i: usize) -> i32 {
     s[i] as i32 - 5 * s[i + 1] as i32 + 20 * s[i + 2] as i32 + 20 * s[i + 3] as i32
         - 5 * s[i + 4] as i32
         + s[i + 5] as i32
@@ -52,7 +49,7 @@ fn fir6(s: &[u8], i: usize) -> i32 {
 
 /// 6-tap FIR on i32 intermediates (for hv second pass).
 #[inline(always)]
-fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
+pub(crate) fn fir6_i32(s0: i32, s1: i32, s2: i32, s3: i32, s4: i32, s5: i32) -> i32 {
     s0 - 5 * s1 + 20 * s2 + 20 * s3 - 5 * s4 + s5
 }
 
@@ -104,229 +101,6 @@ fn luma_interp(pic: &DecodedPicture, x: i32, y: i32, frac_x: i32, frac_y: i32) -
     }
 }
 
-/// NEON 6-tap horizontal half-pel filter for a row of `w` pixels.
-/// `src` must have `w + 5` accessible bytes. Processes 8 pixels at a time,
-/// with scalar tail for remaining pixels.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn neon_row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
-    let mut i = 0;
-    while i + 8 <= w {
-        unsafe {
-            let p = src.as_ptr().add(i);
-            let s0 = vld1_u8(p);
-            let s1 = vld1_u8(p.add(1));
-            let s2 = vld1_u8(p.add(2));
-            let s3 = vld1_u8(p.add(3));
-            let s4 = vld1_u8(p.add(4));
-            let s5 = vld1_u8(p.add(5));
-            let sum_pos1 = vaddl_u8(s0, s5);
-            let sum_20 = vaddl_u8(s2, s3);
-            let sum_neg5 = vaddl_u8(s1, s4);
-            let mut acc = vreinterpretq_s16_u16(sum_pos1);
-            acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(sum_20), 20);
-            acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(sum_neg5), 5);
-            acc = vaddq_s16(acc, vdupq_n_s16(16));
-            let clamped = vqmovun_s16(vshrq_n_s16(acc, 5));
-            vst1_u8(out.as_mut_ptr().add(i), clamped);
-        }
-        i += 8;
-    }
-    // Scalar tail
-    while i < w {
-        out[i] = clip_u8((fir6(src, i) + 16) >> 5);
-        i += 1;
-    }
-}
-
-/// Row-based horizontal half-pel filter for in-bounds blocks.
-/// Reads `w` output pixels from row at `src` (which must have `w + 5` accessible bytes).
-#[inline(always)]
-fn row_half_pel_h(src: &[u8], out: &mut [u8], w: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        neon_row_half_pel_h(src, out, w);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        for i in 0..w {
-            out[i] = clip_u8((fir6(src, i) + 16) >> 5);
-        }
-    }
-}
-
-/// NEON 6-tap vertical half-pel filter for a row of `w` pixels.
-/// `rows` contains 6 row slices (y-2..y+3), each at least `w` bytes.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn neon_row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    let mut i = 0;
-    while i + 8 <= w {
-        unsafe {
-            let s0 = vld1_u8(rows[0].as_ptr().add(i));
-            let s1 = vld1_u8(rows[1].as_ptr().add(i));
-            let s2 = vld1_u8(rows[2].as_ptr().add(i));
-            let s3 = vld1_u8(rows[3].as_ptr().add(i));
-            let s4 = vld1_u8(rows[4].as_ptr().add(i));
-            let s5 = vld1_u8(rows[5].as_ptr().add(i));
-            let sum_pos1 = vaddl_u8(s0, s5);
-            let sum_20 = vaddl_u8(s2, s3);
-            let sum_neg5 = vaddl_u8(s1, s4);
-            let mut acc = vreinterpretq_s16_u16(sum_pos1);
-            acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(sum_20), 20);
-            acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(sum_neg5), 5);
-            acc = vaddq_s16(acc, vdupq_n_s16(16));
-            let clamped = vqmovun_s16(vshrq_n_s16(acc, 5));
-            vst1_u8(out.as_mut_ptr().add(i), clamped);
-        }
-        i += 8;
-    }
-    // Scalar tail
-    while i < w {
-        let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
-            + 20 * rows[2][i] as i32
-            + 20 * rows[3][i] as i32
-            - 5 * rows[4][i] as i32
-            + rows[5][i] as i32;
-        out[i] = clip_u8((val + 16) >> 5);
-        i += 1;
-    }
-}
-
-/// NEON: compute vertical FIR for 8 pixels, return as clipped u8x8.
-#[cfg(target_arch = "aarch64")]
-#[inline(always)]
-unsafe fn neon_vfir6_8(rows: &[&[u8]; 6], i: usize) -> uint8x8_t {
-    let s0 = vld1_u8(rows[0].as_ptr().add(i));
-    let s1 = vld1_u8(rows[1].as_ptr().add(i));
-    let s2 = vld1_u8(rows[2].as_ptr().add(i));
-    let s3 = vld1_u8(rows[3].as_ptr().add(i));
-    let s4 = vld1_u8(rows[4].as_ptr().add(i));
-    let s5 = vld1_u8(rows[5].as_ptr().add(i));
-    let sum_pos1 = vaddl_u8(s0, s5);
-    let sum_20 = vaddl_u8(s2, s3);
-    let sum_neg5 = vaddl_u8(s1, s4);
-    let mut acc = vreinterpretq_s16_u16(sum_pos1);
-    acc = vmlaq_n_s16(acc, vreinterpretq_s16_u16(sum_20), 20);
-    acc = vmlsq_n_s16(acc, vreinterpretq_s16_u16(sum_neg5), 5);
-    acc = vaddq_s16(acc, vdupq_n_s16(16));
-    vqmovun_s16(vshrq_n_s16(acc, 5))
-}
-
-/// NEON: avg(a, half_v) for 8 pixels — vertical FIR then average with integer row.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn neon_row_avg_int_v(int_row: &[u8], rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    let mut i = 0;
-    while i + 8 <= w {
-        unsafe {
-            let int_val = vld1_u8(int_row.as_ptr().add(i));
-            let hp = neon_vfir6_8(&rows, i);
-            let result = vrhadd_u8(int_val, hp);
-            vst1_u8(out.as_mut_ptr().add(i), result);
-        }
-        i += 8;
-    }
-    while i < w {
-        let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
-            + 20 * rows[2][i] as i32
-            + 20 * rows[3][i] as i32
-            - 5 * rows[4][i] as i32
-            + rows[5][i] as i32;
-        let hp = clip_u8((val + 16) >> 5);
-        out[i] = avg(int_row[i], hp);
-        i += 1;
-    }
-}
-
-/// NEON: avg(half_h, half_v) for 8 pixels — horizontal and vertical FIR then average.
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-fn neon_row_avg_h_v(src_h: &[u8], rows_v: [&[u8]; 6], out: &mut [u8], w: usize) {
-    let mut i = 0;
-    while i + 8 <= w {
-        unsafe {
-            // Horizontal FIR
-            let p = src_h.as_ptr().add(i);
-            let h0 = vld1_u8(p);
-            let h1 = vld1_u8(p.add(1));
-            let h2 = vld1_u8(p.add(2));
-            let h3 = vld1_u8(p.add(3));
-            let h4 = vld1_u8(p.add(4));
-            let h5 = vld1_u8(p.add(5));
-            let hsum_pos1 = vaddl_u8(h0, h5);
-            let hsum_20 = vaddl_u8(h2, h3);
-            let hsum_neg5 = vaddl_u8(h1, h4);
-            let mut hacc = vreinterpretq_s16_u16(hsum_pos1);
-            hacc = vmlaq_n_s16(hacc, vreinterpretq_s16_u16(hsum_20), 20);
-            hacc = vmlsq_n_s16(hacc, vreinterpretq_s16_u16(hsum_neg5), 5);
-            hacc = vaddq_s16(hacc, vdupq_n_s16(16));
-            let h_val = vqmovun_s16(vshrq_n_s16(hacc, 5));
-
-            // Vertical FIR
-            let v_val = neon_vfir6_8(&rows_v, i);
-
-            let result = vrhadd_u8(h_val, v_val);
-            vst1_u8(out.as_mut_ptr().add(i), result);
-        }
-        i += 8;
-    }
-    while i < w {
-        let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-        let v_val = clip_u8(
-            (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                + 20 * rows_v[2][i] as i32
-                + 20 * rows_v[3][i] as i32
-                - 5 * rows_v[4][i] as i32
-                + rows_v[5][i] as i32
-                + 16)
-                >> 5,
-        );
-        out[i] = avg(h_val, v_val);
-        i += 1;
-    }
-}
-
-/// Row-based vertical half-pel filter for in-bounds blocks.
-/// `rows` contains 6 row slices (y-2..y+3), each at least `w` bytes.
-#[inline(always)]
-fn row_half_pel_v(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    #[cfg(target_arch = "aarch64")]
-    {
-        neon_row_half_pel_v(rows, out, w);
-    }
-    #[cfg(not(target_arch = "aarch64"))]
-    {
-        for i in 0..w {
-            let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
-                + 20 * rows[2][i] as i32
-                + 20 * rows[3][i] as i32
-                - 5 * rows[4][i] as i32
-                + rows[5][i] as i32;
-            out[i] = clip_u8((val + 16) >> 5);
-        }
-    }
-}
-
-/// Row-based diagonal half-pel (hv) for in-bounds blocks.
-/// `rows` contains 6 row slices (y-2..y+3), each with `w + 5` accessible bytes.
-#[allow(clippy::needless_range_loop)]
-#[inline(always)]
-fn row_half_pel_hv(rows: [&[u8]; 6], out: &mut [u8], w: usize) {
-    // First pass: horizontal filter on each of 6 rows → i32 intermediates
-    // We need w intermediate values per row
-    for i in 0..w {
-        let h0 = fir6(rows[0], i);
-        let h1 = fir6(rows[1], i);
-        let h2 = fir6(rows[2], i);
-        let h3 = fir6(rows[3], i);
-        let h4 = fir6(rows[4], i);
-        let h5 = fir6(rows[5], i);
-        let val = fir6_i32(h0, h1, h2, h3, h4, h5);
-        out[i] = clip_u8((val + 512) >> 10);
-    }
-}
-
 /// Check if a block with the given filter margins is fully within bounds.
 /// For half-pel filters, margin is 3 (needs x-2..x+w+2, y-2..y+h+2).
 /// For full-pel, margin_left/top=0, margin_right/bottom=0.
@@ -367,6 +141,9 @@ pub fn luma_mc_stride(
     ref_stride: usize,
     ref_y_offset: usize,
 ) {
+    #[cfg(feature = "profile")]
+    let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MotionComp);
+
     // Guard against malformed block sizes that would overrun the output buffer
     if block_w == 0 || block_h == 0 || block_w * block_h > output.len() {
         return;
@@ -464,6 +241,7 @@ pub fn luma_mc_stride(
             ref_idx_l1: vec![],
             mb_width: 0,
             is_intra: false,
+            structure: crate::dpb::PictureStructure::Frame,
         };
         for row in 0..block_h {
             for col in 0..block_w {
@@ -537,21 +315,21 @@ fn luma_mc_inner(
             // Half-pel horizontal
             for r in 0..h {
                 let src = row(r as isize, -2, w + 5);
-                row_half_pel_h(src, &mut output[r * w..], w);
+                crate::simd::row_half_pel_h(src, &mut output[r * w..], w);
             }
         }
         (0, 2) => {
             // Half-pel vertical
             for r in 0..h {
                 let rows = vrows(0, r as isize, w);
-                row_half_pel_v(rows, &mut output[r * w..], w);
+                crate::simd::row_half_pel_v(rows, &mut output[r * w..], w);
             }
         }
         (2, 2) => {
             // Half-pel diagonal
             for r in 0..h {
                 let rows = vrows(-2, r as isize, w + 5);
-                row_half_pel_hv(rows, &mut output[r * w..], w);
+                crate::simd::row_half_pel_hv(rows, &mut output[r * w..], w);
             }
         }
         (1, 0) => {
@@ -559,10 +337,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize, 0, w);
                 let src_h = row(r as isize, -2, w + 5);
-                for i in 0..w {
-                    let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(int_row[i], hp);
-                }
+                crate::simd::row_avg_int_h(int_row, src_h, &mut output[r * w..], w);
             }
         }
         (3, 0) => {
@@ -570,10 +345,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize, 1, w);
                 let src_h = row(r as isize, -2, w + 5);
-                for i in 0..w {
-                    let hp = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(hp, int_row[i]);
-                }
+                crate::simd::row_avg_h_int(src_h, int_row, &mut output[r * w..], w);
             }
         }
         (0, 1) => {
@@ -581,20 +353,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize, 0, w);
                 let rows = vrows(0, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_int_v(int_row, rows, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
-                        + 20 * rows[2][i] as i32
-                        + 20 * rows[3][i] as i32
-                        - 5 * rows[4][i] as i32
-                        + rows[5][i] as i32;
-                    let hp = clip_u8((val + 16) >> 5);
-                    output[r * w + i] = avg(int_row[i], hp);
-                }
+                crate::simd::row_avg_int_v(int_row, rows, &mut output[r * w..], w);
             }
         }
         (0, 3) => {
@@ -602,20 +361,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let int_row = row(r as isize + 1, 0, w);
                 let rows = vrows(0, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_int_v(int_row, rows, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let val = rows[0][i] as i32 - 5 * rows[1][i] as i32
-                        + 20 * rows[2][i] as i32
-                        + 20 * rows[3][i] as i32
-                        - 5 * rows[4][i] as i32
-                        + rows[5][i] as i32;
-                    let hp = clip_u8((val + 16) >> 5);
-                    output[r * w + i] = avg(hp, int_row[i]);
-                }
+                crate::simd::row_avg_int_v(int_row, rows, &mut output[r * w..], w);
             }
         }
         (2, 1) => {
@@ -623,17 +369,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize, -2, w + 5);
                 let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    let h0 = fir6(rows_hv[0], i);
-                    let h1 = fir6(rows_hv[1], i);
-                    let h2 = fir6(rows_hv[2], i);
-                    let h3 = fir6(rows_hv[3], i);
-                    let h4 = fir6(rows_hv[4], i);
-                    let h5 = fir6(rows_hv[5], i);
-                    let hv_val = clip_u8((fir6_i32(h0, h1, h2, h3, h4, h5) + 512) >> 10);
-                    output[r * w + i] = avg(h_val, hv_val);
-                }
+                crate::simd::row_avg_h_hv(src_h, rows_hv, &mut output[r * w..], w);
             }
         }
         (2, 3) => {
@@ -641,21 +377,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize + 1, -2, w + 5);
                 let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(hv_val, h_val);
-                }
+                crate::simd::row_avg_h_hv(src_h, rows_hv, &mut output[r * w..], w);
             }
         }
         (1, 2) => {
@@ -663,29 +385,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let rows_v = vrows(0, r as isize, w);
                 let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    output[r * w + i] = avg(v_val, hv_val);
-                }
+                crate::simd::row_avg_v_hv(rows_v, rows_hv, &mut output[r * w..], w);
             }
         }
         (3, 2) => {
@@ -693,29 +393,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let rows_v = vrows(1, r as isize, w);
                 let rows_hv = vrows(-2, r as isize, w + 5);
-                for i in 0..w {
-                    let hv_val = clip_u8(
-                        (fir6_i32(
-                            fir6(rows_hv[0], i),
-                            fir6(rows_hv[1], i),
-                            fir6(rows_hv[2], i),
-                            fir6(rows_hv[3], i),
-                            fir6(rows_hv[4], i),
-                            fir6(rows_hv[5], i),
-                        ) + 512)
-                            >> 10,
-                    );
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    output[r * w + i] = avg(hv_val, v_val);
-                }
+                crate::simd::row_avg_v_hv(rows_v, rows_hv, &mut output[r * w..], w);
             }
         }
         (1, 1) => {
@@ -723,24 +401,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize, -2, w + 5);
                 let rows_v = vrows(0, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    output[r * w + i] = avg(h_val, v_val);
-                }
+                crate::simd::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
             }
         }
         (3, 1) => {
@@ -748,24 +409,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize, -2, w + 5);
                 let rows_v = vrows(1, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    output[r * w + i] = avg(h_val, v_val);
-                }
+                crate::simd::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
             }
         }
         (1, 3) => {
@@ -773,24 +417,7 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize + 1, -2, w + 5);
                 let rows_v = vrows(0, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(v_val, h_val);
-                }
+                crate::simd::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
             }
         }
         (3, 3) => {
@@ -798,87 +425,10 @@ fn luma_mc_inner(
             for r in 0..h {
                 let src_h = row(r as isize + 1, -2, w + 5);
                 let rows_v = vrows(1, r as isize, w);
-                #[cfg(target_arch = "aarch64")]
-                {
-                    neon_row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
-                }
-                #[cfg(not(target_arch = "aarch64"))]
-                for i in 0..w {
-                    let v_val = clip_u8(
-                        (rows_v[0][i] as i32 - 5 * rows_v[1][i] as i32
-                            + 20 * rows_v[2][i] as i32
-                            + 20 * rows_v[3][i] as i32
-                            - 5 * rows_v[4][i] as i32
-                            + rows_v[5][i] as i32
-                            + 16)
-                            >> 5,
-                    );
-                    let h_val = clip_u8((fir6(src_h, i) + 16) >> 5);
-                    output[r * w + i] = avg(v_val, h_val);
-                }
+                crate::simd::row_avg_h_v(src_h, rows_v, &mut output[r * w..], w);
             }
         }
         _ => unreachable!(),
-    }
-}
-
-/// NEON chroma bilinear interpolation: process the entire block at once.
-/// `ref_plane` indexed at `top_off` for top-left sample. Each row has stride
-/// `ref_width` and at least `block_w + 1` accessible bytes from the top-left.
-/// The block must occupy `block_h + 1` rows (top + bottom for each output row).
-#[cfg(target_arch = "aarch64")]
-#[inline(never)]
-#[allow(clippy::too_many_arguments)]
-fn neon_chroma_bilinear_block(
-    ref_plane: &[u8],
-    top_off: usize,
-    ref_width: usize,
-    block_w: usize,
-    block_h: usize,
-    output: &mut [u8],
-    c00: u8,
-    c01: u8,
-    c10: u8,
-    c11: u8,
-) {
-    unsafe {
-        // Hoist coefficient duplication outside the row loop
-        let v00 = vdup_n_u8(c00);
-        let v01 = vdup_n_u8(c01);
-        let v10 = vdup_n_u8(c10);
-        let v11 = vdup_n_u8(c11);
-
-        for r in 0..block_h {
-            let top_p = ref_plane.as_ptr().add(top_off + r * ref_width);
-            let bot_p = top_p.add(ref_width);
-            let out_p = output.as_mut_ptr().add(r * block_w);
-
-            let mut i = 0;
-            while i + 8 <= block_w {
-                let a = vld1_u8(top_p.add(i));
-                let b = vld1_u8(top_p.add(i + 1));
-                let c = vld1_u8(bot_p.add(i));
-                let d = vld1_u8(bot_p.add(i + 1));
-
-                let mut acc = vmull_u8(a, v00);
-                acc = vmlal_u8(acc, b, v01);
-                acc = vmlal_u8(acc, c, v10);
-                acc = vmlal_u8(acc, d, v11);
-                let res = vrshrn_n_u16(acc, 6);
-                vst1_u8(out_p.add(i), res);
-                i += 8;
-            }
-            // Scalar tail
-            while i < block_w {
-                let a = *top_p.add(i) as u32;
-                let b = *top_p.add(i + 1) as u32;
-                let c = *bot_p.add(i) as u32;
-                let d = *bot_p.add(i + 1) as u32;
-                let val = c00 as u32 * a + c01 as u32 * b + c10 as u32 * c + c11 as u32 * d;
-                *out_p.add(i) = ((val + 32) >> 6) as u8;
-                i += 1;
-            }
-        }
     }
 }
 
@@ -903,16 +453,18 @@ pub fn chroma_mc(
     block_h: usize,
     output: &mut [u8],
 ) {
+    #[cfg(feature = "profile")]
+    let _profile_timer = crate::profile::PhaseTimer::start(crate::profile::Phase::MotionComp);
+
     // Guard against malformed block sizes that would overrun the output buffer
     if block_w == 0 || block_h == 0 || block_w * block_h > output.len() {
         return;
     }
     // For field-coded MBAFF, the effective height is derived from the available
     // plane data, which may be smaller than the frame chroma height.
-    let ref_height = if ref_width > 0 {
-        ref_height.min(ref_plane.len() / ref_width)
-    } else {
-        ref_height
+    let ref_height = match ref_plane.len().checked_div(ref_width) {
+        Some(rows) => ref_height.min(rows),
+        None => ref_height,
     };
     let frac_x = dx.rem_euclid(8);
     let frac_y = dy.rem_euclid(8);
@@ -978,24 +530,9 @@ pub fn chroma_mc(
             return; // ref plane too small, skip MC
         }
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            neon_chroma_bilinear_block(
-                ref_plane, top_off, ref_width, block_w, block_h, output, c00, c01, c10, c11,
-            );
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        for row in 0..block_h {
-            let row_top = top_off + row * ref_width;
-            let row_bot = row_top + ref_width;
-            for i in 0..block_w {
-                let val = c00 as i32 * ref_plane[row_top + i] as i32
-                    + c01 as i32 * ref_plane[row_top + i + 1] as i32
-                    + c10 as i32 * ref_plane[row_bot + i] as i32
-                    + c11 as i32 * ref_plane[row_bot + i + 1] as i32;
-                output[row * block_w + i] = ((val + 32) >> 6) as u8;
-            }
-        }
+        crate::simd::chroma_bilinear_block(
+            ref_plane, top_off, ref_width, block_w, block_h, output, c00, c01, c10, c11,
+        );
         return;
     }
 
@@ -1021,27 +558,14 @@ pub fn chroma_mc(
 /// Bi-prediction averaging (spec 8.4.2.3.2).
 /// `output[i] = (pred_l0[i] + pred_l1[i] + 1) >> 1` for each pixel.
 pub fn bi_pred_avg(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8]) {
-    for (o, (&a, &b)) in output.iter_mut().zip(pred_l0.iter().zip(pred_l1.iter())) {
-        *o = ((a as u16 + b as u16 + 1) >> 1) as u8;
-    }
+    crate::simd::bi_pred_avg(pred_l0, pred_l1, output);
 }
 
 /// Apply explicit weighted prediction to uni-directional MC output (spec 8.4.2.3.1).
 /// `output[i] = clip((pred[i] * weight + (1 << (log2_denom - 1))) >> log2_denom + offset)`
 /// When log2_denom == 0, the rounding term is 0.
 pub fn weighted_uni(pred: &mut [u8], log2_denom: u32, weight: i32, offset: i32) {
-    if log2_denom == 0 {
-        for p in pred.iter_mut() {
-            *p = ((*p as i32 * weight + offset).clamp(0, 255)) as u8;
-        }
-    } else {
-        let round = 1i32 << (log2_denom - 1);
-        for p in pred.iter_mut() {
-            *p = ((*p as i32 * weight + round) >> log2_denom)
-                .wrapping_add(offset)
-                .clamp(0, 255) as u8;
-        }
-    }
+    crate::simd::weighted_uni(pred, log2_denom, weight, offset);
 }
 
 /// Apply explicit weighted bi-prediction (spec 8.4.2.3.2).
@@ -1057,29 +581,20 @@ pub fn weighted_bi(
     w1: i32,
     o1: i32,
 ) {
-    let round = 1i32 << log2_denom;
-    let offset = (o0 + o1 + 1) >> 1;
-    let shift = log2_denom + 1;
-    for (o, (&a, &b)) in output.iter_mut().zip(pred_l0.iter().zip(pred_l1.iter())) {
-        *o = ((a as i32 * w0 + b as i32 * w1 + round) >> shift)
-            .wrapping_add(offset)
-            .clamp(0, 255) as u8;
-    }
+    crate::simd::weighted_bi(pred_l0, pred_l1, output, log2_denom, w0, o0, w1, o1);
 }
 
 /// Apply implicit weighted bi-prediction for B-slices (spec 8.4.2.3.2).
 /// Uses POC-distance-derived weights with fixed log2_denom=5.
 pub fn weighted_bi_implicit(pred_l0: &[u8], pred_l1: &[u8], output: &mut [u8], w0: i32, w1: i32) {
-    let round = 1i32 << 5; // 1 << log2_denom where log2_denom=5
-    for (o, (&a, &b)) in output.iter_mut().zip(pred_l0.iter().zip(pred_l1.iter())) {
-        *o = ((a as i32 * w0 + b as i32 * w1 + round) >> 6).clamp(0, 255) as u8;
-    }
+    crate::simd::weighted_bi_implicit(pred_l0, pred_l1, output, w0, w1);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
+    use alloc::rc::Rc;
+    use alloc::vec::Vec;
 
     fn make_ref_pic(width: u32, height: u32, y_data: Vec<u8>) -> Rc<DecodedPicture> {
         let uv_size = (width / 2 * height / 2) as usize;
@@ -1098,6 +613,7 @@ mod tests {
             ref_idx_l1: vec![],
             mb_width: width / 16,
             is_intra: false,
+            structure: crate::dpb::PictureStructure::Frame,
         })
     }
 
@@ -1140,12 +656,8 @@ mod tests {
         // 16x1 reference: known values for 6-tap filter
         let mut y = vec![128u8; 16];
         // Set a step edge: left half = 0, right half = 255
-        for c in 0..8 {
-            y[c] = 0;
-        }
-        for c in 8..16 {
-            y[c] = 255;
-        }
+        y[..8].fill(0);
+        y[8..].fill(255);
         let pic = make_ref_pic(16, 1, y);
 
         // Half-pel horizontal at x=7 (the edge): MV dx=2 (half-pel), dy=0
@@ -1161,9 +673,7 @@ mod tests {
     fn test_half_pel_vertical() {
         // 1x16 reference with step edge at row 8
         let mut y = vec![0u8; 16];
-        for r in 8..16 {
-            y[r] = 255;
-        }
+        y[8..].fill(255);
         let pic = make_ref_pic(1, 16, y);
 
         let mut out = [0u8; 1];

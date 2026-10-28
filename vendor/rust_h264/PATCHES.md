@@ -1,10 +1,12 @@
-# Changes from rust_h264 0.4.0
+# Changes from rust_h264
 
-This is rust_h264 0.4.0 as published on crates.io, with five fixes. Without
-them, ordinary MP4s from x264 and NVENC decoded with errors that grew until the
-next keyframe. The fixes were checked against ffmpeg on real recordings and are
-offered upstream in https://github.com/roticv/rust_h264/pull/2. readme can go back
-to the crates.io release once they're in one.
+This is rust_h264's trunk at 07b5d1b, which is newer than the 0.4.0 release on
+crates.io, with five fixes. Trunk adds SIMD for motion compensation on x86, so it
+decodes 22–31% faster than 0.4.0 did here, with the same output. Without the fixes,
+ordinary MP4s from x264 and NVENC decoded with errors that grew until the next
+keyframe. The fixes were checked against ffmpeg on real recordings and are offered
+upstream in https://github.com/roticv/rust_h264/pull/2, whose branch this is, at
+13dd5d0. readme can go back to a crates.io release once one has them.
 
 1. **Deblocking stride** (`deblock.rs`). The filter stepped through rows at the
    cropped width (`frame.width`), but the frame is still at its coded width
@@ -48,3 +50,17 @@ them doesn't), but fix 5 doesn't change that clip, so a unit test in `dpb.rs`
 covers it instead. The one exception: in one x264 film the color planes still
 differ slightly in most frames, 60 dB at worst, which is far below what can be
 seen. Its luma matches exactly.
+
+## Speed-up
+
+This isn't part of the pull request. It changes no output: every plane of every
+frame is the same for upstream's test streams and fuzz inputs, four recordings, and
+`pyramid.mp4`.
+
+- **Fewer copies per picture** (`decoder.rs`). Each picture's planes were copied
+  into the DPB, and a cropped frame was zeroed and copied again for the caller. The
+  DPB now takes the planes. A reference picture's frame is one copy, cropped as it's
+  copied (`crop_to_display`); any other picture's planes, which the DPB drops at
+  once, become the frame, cropped where they are. The per-macroblock buffers the DPB
+  doesn't keep (`SpareBuffers`) are refilled for the next picture (`refill`) rather
+  than allocated again. Decoding is 0.6–4% faster.

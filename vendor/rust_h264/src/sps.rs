@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::bitstream::BitstreamReader;
 
 /// H.264 Table 7-2: Default 4x4 scaling list for Intra (in scan order).
@@ -72,6 +74,14 @@ pub struct Sps {
     pub frame_crop_bottom_offset: u32,
 
     pub vui_parameters_present_flag: bool,
+    /// VUI colour interpretation, with H.264's unspecified defaults retained.
+    pub video_full_range_flag: bool,
+    pub colour_primaries: u8,
+    pub transfer_characteristics: u8,
+    pub matrix_coefficients: u8,
+    pub chroma_sample_loc_type_top_field: u32,
+    /// Maximum reorder depth from VUI bitstream restrictions, when signalled.
+    pub max_num_reorder_frames: Option<u32>,
 
     /// VUI timing info: numerator of clock tick. Set when
     /// `vui_parameters_present_flag` and `timing_info_present_flag` are both
@@ -287,6 +297,12 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
     let mut num_units_in_tick: Option<u32> = None;
     let mut time_scale: Option<u32> = None;
     let mut fixed_frame_rate_flag = false;
+    let mut video_full_range_flag = false;
+    let mut colour_primaries = 2;
+    let mut transfer_characteristics = 2;
+    let mut matrix_coefficients = 2;
+    let mut chroma_sample_loc_type_top_field = 0;
+    let mut max_num_reorder_frames = None;
     if vui_parameters_present_flag {
         // Parse just enough of the VUI to extract timing info (spec E.1.1).
         // We read the early optional sub-flags so we can reach
@@ -307,17 +323,17 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
         let video_signal_type_present_flag = r.read_bit()? != 0;
         if video_signal_type_present_flag {
             r.skip_bits(3); // video_format
-            r.skip_bits(1); // video_full_range_flag
+            video_full_range_flag = r.read_bit()? != 0;
             let colour_description_present_flag = r.read_bit()? != 0;
             if colour_description_present_flag {
-                r.skip_bits(8); // colour_primaries
-                r.skip_bits(8); // transfer_characteristics
-                r.skip_bits(8); // matrix_coefficients
+                colour_primaries = r.read_bits(8)? as u8;
+                transfer_characteristics = r.read_bits(8)? as u8;
+                matrix_coefficients = r.read_bits(8)? as u8;
             }
         }
         let chroma_loc_info_present_flag = r.read_bit()? != 0;
         if chroma_loc_info_present_flag {
-            let _ = r.read_ue()?; // chroma_sample_loc_type_top_field
+            chroma_sample_loc_type_top_field = r.read_ue()?;
             let _ = r.read_ue()?; // chroma_sample_loc_type_bottom_field
         }
         let timing_info_present_flag = r.read_bit()? != 0;
@@ -332,8 +348,10 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
             time_scale = Some((hi << 16) | lo);
             fixed_frame_rate_flag = r.read_bit()? != 0;
         }
-        // The remaining VUI fields (HRD, bitstream_restriction, etc.) are
-        // not used by this decoder, so we stop parsing here.
+        // The remaining VUI fields (HRD, bitstream_restriction) are not
+        // needed for decoding, so a malformed or truncated tail must not
+        // reject an otherwise valid SPS. Parse them best-effort.
+        max_num_reorder_frames = parse_vui_tail(&mut r);
     }
 
     Ok(Sps {
@@ -375,6 +393,12 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps, &'static str> {
         frame_crop_top_offset,
         frame_crop_bottom_offset,
         vui_parameters_present_flag,
+        video_full_range_flag,
+        colour_primaries,
+        transfer_characteristics,
+        matrix_coefficients,
+        chroma_sample_loc_type_top_field,
+        max_num_reorder_frames,
         num_units_in_tick,
         time_scale,
         fixed_frame_rate_flag,
@@ -404,6 +428,52 @@ pub fn parse_scaling_list<const N: usize>(
         last_scale = val;
     }
     Ok(scaling_list)
+}
+
+/// Best-effort parse of the VUI fields after timing_info (spec E.1.1):
+/// HRD parameters, pic_struct_present_flag and bitstream_restriction.
+/// Returns `max_num_reorder_frames` when signalled; any parse failure
+/// yields `None` rather than an error.
+fn parse_vui_tail(r: &mut BitstreamReader) -> Option<u32> {
+    let nal_hrd = r.read_bit().ok()? != 0;
+    if nal_hrd {
+        skip_hrd_parameters(r).ok()?;
+    }
+    let vcl_hrd = r.read_bit().ok()? != 0;
+    if vcl_hrd {
+        skip_hrd_parameters(r).ok()?;
+    }
+    if nal_hrd || vcl_hrd {
+        r.skip_bits(1); // low_delay_hrd_flag
+    }
+    r.skip_bits(1); // pic_struct_present_flag
+    if r.read_bit().ok()? == 0 {
+        return None; // bitstream_restriction_flag
+    }
+    r.skip_bits(1); // motion_vectors_over_pic_boundaries_flag
+    r.read_ue().ok()?; // max_bytes_per_pic_denom
+    r.read_ue().ok()?; // max_bits_per_mb_denom
+    r.read_ue().ok()?; // log2_max_mv_length_horizontal
+    r.read_ue().ok()?; // log2_max_mv_length_vertical
+    let max_num_reorder_frames = r.read_ue().ok()?;
+    r.read_ue().ok()?; // max_dec_frame_buffering
+    Some(max_num_reorder_frames)
+}
+
+// H.264 E.1.2; cpb_cnt_minus1 is bounded by the syntax specification.
+fn skip_hrd_parameters(r: &mut BitstreamReader) -> Result<(), &'static str> {
+    let cpb_count = r.read_ue()?;
+    if cpb_count > 31 {
+        return Err("invalid HRD CPB count");
+    }
+    r.skip_bits(8);
+    for _ in 0..=cpb_count {
+        r.read_ue()?;
+        r.read_ue()?;
+        r.skip_bits(1);
+    }
+    r.skip_bits(20);
+    Ok(())
 }
 
 #[cfg(test)]
@@ -514,6 +584,12 @@ mod tests {
             frame_crop_top_offset: 0,
             frame_crop_bottom_offset: 0,
             vui_parameters_present_flag: false,
+            video_full_range_flag: false,
+            colour_primaries: 2,
+            transfer_characteristics: 2,
+            matrix_coefficients: 2,
+            chroma_sample_loc_type_top_field: 0,
+            max_num_reorder_frames: None,
             num_units_in_tick: None,
             time_scale: None,
             fixed_frame_rate_flag: false,

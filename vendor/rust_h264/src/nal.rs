@@ -10,7 +10,10 @@
 //! Both produce [`NalUnit`] values that can be fed directly to
 //! [`Decoder::decode_nal`](crate::decoder::Decoder::decode_nal).
 
-use std::borrow::Cow;
+use alloc::borrow::Cow;
+use alloc::vec::Vec;
+
+use crate::error::DecodeError;
 
 /// H.264 NAL unit type identifier (spec Table 7-1).
 ///
@@ -481,4 +484,68 @@ mod tests {
         let data = [0x01, 0x42];
         assert!(parse_avcc_config(&data).is_err());
     }
+}
+
+/// Validated stream dimensions and colour metadata from an SPS NAL unit.
+/// This is independent of any operating system or presentation backend.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpsInfo {
+    pub width: u32,
+    pub height: u32,
+    pub coded_width: u32,
+    pub coded_height: u32,
+    pub profile: u8,
+    pub chroma_format: u32,
+    pub bit_depth_luma: u32,
+    pub bit_depth_chroma: u32,
+    pub reference_frames: u32,
+    pub progressive: bool,
+    pub full_range: bool,
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    pub chroma_location: u32,
+    pub max_reorder_frames: Option<u32>,
+}
+
+/// Parse the decoder's SPS metadata without decoding or allocating pictures.
+pub fn parse_sps_info(nal: &NalUnit<'_>) -> Result<SpsInfo, DecodeError> {
+    if nal.nal_unit_type != NalUnitType::Sps {
+        return Err(DecodeError::InvalidSyntax("not an SPS NAL unit"));
+    }
+    let sps = crate::sps::parse_sps(&nal.rbsp)?;
+    let coded_width = sps
+        .pic_width_in_mbs_minus1
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(16))
+        .ok_or(DecodeError::InvalidSyntax("SPS width overflow"))?;
+    let coded_height = sps
+        .pic_height_in_map_units_minus1
+        .checked_add(1)
+        .and_then(|v| v.checked_mul(16 * if sps.frame_mbs_only_flag { 1 } else { 2 }))
+        .ok_or(DecodeError::InvalidSyntax("SPS height overflow"))?;
+    Ok(SpsInfo {
+        width: sps.width(),
+        height: sps.height(),
+        coded_width,
+        coded_height,
+        profile: sps.profile_idc,
+        chroma_format: sps.chroma_format_idc,
+        bit_depth_luma: sps
+            .bit_depth_luma_minus8
+            .checked_add(8)
+            .ok_or(DecodeError::InvalidSyntax("SPS depth overflow"))?,
+        bit_depth_chroma: sps
+            .bit_depth_chroma_minus8
+            .checked_add(8)
+            .ok_or(DecodeError::InvalidSyntax("SPS depth overflow"))?,
+        reference_frames: sps.max_num_ref_frames,
+        progressive: sps.frame_mbs_only_flag,
+        full_range: sps.video_full_range_flag,
+        primaries: sps.colour_primaries,
+        transfer: sps.transfer_characteristics,
+        matrix: sps.matrix_coefficients,
+        chroma_location: sps.chroma_sample_loc_type_top_field,
+        max_reorder_frames: sps.max_num_reorder_frames,
+    })
 }

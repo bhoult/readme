@@ -487,7 +487,8 @@ impl CabacReader<'_> {
         cat: usize,
         max_coeff: usize,
         field_coded: bool,
-    ) -> (Vec<(usize, i32)>, u8) {
+    ) -> (ResidualCoeffs, u8) {
+        debug_assert!(max_coeff <= MAX_RESIDUAL_COEFFS);
         let sig_base = if field_coded {
             SIGNIFICANT_COEFF_FLAG_FIELD_OFFSET[cat]
         } else {
@@ -501,8 +502,10 @@ impl CabacReader<'_> {
         let abs_base = COEFF_ABS_LEVEL_M1_OFFSET[cat];
         let is_8x8 = cat == 5;
 
-        // Phase 1: Decode significance map
-        let mut sig_positions: Vec<usize> = Vec::new();
+        // Phase 1: Decode significance map. Positions are bounded by
+        // max_coeff (<= 64), so they live on the stack.
+        let mut sig_positions = [0u8; MAX_RESIDUAL_COEFFS];
+        let mut sig_count = 0usize;
         let mut found_last = false;
 
         for pos in 0..max_coeff - 1 {
@@ -514,7 +517,8 @@ impl CabacReader<'_> {
             };
             let sig = self.get_cabac(&mut state[sig_ctx]);
             if sig != 0 {
-                sig_positions.push(pos);
+                sig_positions[sig_count] = pos as u8;
+                sig_count += 1;
                 let last_ctx = if is_8x8 {
                     last_base + LAST_COEFF_FLAG_OFFSET_8X8[pos] as usize
                 } else {
@@ -528,20 +532,23 @@ impl CabacReader<'_> {
             }
         }
         if !found_last {
-            sig_positions.push(max_coeff - 1);
+            sig_positions[sig_count] = (max_coeff - 1) as u8;
+            sig_count += 1;
         }
 
-        if sig_positions.is_empty() {
-            return (vec![], 0);
-        }
+        let coeff_count = sig_count as u8;
 
-        let coeff_count = sig_positions.len() as u8;
-
-        // Phase 2: Decode coefficient levels (in reverse order — high frequency first)
-        let mut coeffs = Vec::with_capacity(sig_positions.len());
+        // Phase 2: Decode coefficient levels in reverse order (high frequency
+        // first), writing each straight into its scan-order slot so no
+        // reversal pass is needed.
+        let mut coeffs = ResidualCoeffs {
+            buf: [(0, 0); MAX_RESIDUAL_COEFFS],
+            len: sig_count,
+        };
         let mut node_ctx = 0usize;
 
-        for &pos in sig_positions.iter().rev() {
+        for i in (0..sig_count).rev() {
+            let pos = sig_positions[i] as usize;
             // Decode |level| - 1
             let level1_ctx = abs_base + COEFF_ABS_LEVEL1_CTX[node_ctx] as usize;
 
@@ -578,13 +585,58 @@ impl CabacReader<'_> {
 
             // Sign via bypass
             let level = self.get_cabac_bypass_sign(-(abs_level));
-            coeffs.push((pos, level));
+            coeffs.buf[i] = (pos, level);
         }
 
-        // Reverse to put in scan order (low freq first)
-        coeffs.reverse();
-
         (coeffs, coeff_count)
+    }
+}
+
+/// Upper bound on coefficients in one residual block (8x8 luma).
+pub const MAX_RESIDUAL_COEFFS: usize = 64;
+
+/// Non-zero coefficients of one residual block as `(scan_pos, level)` in
+/// scan order. Fixed-capacity so decoding a block never touches the heap.
+#[derive(Clone, Copy)]
+pub struct ResidualCoeffs {
+    buf: [(usize, i32); MAX_RESIDUAL_COEFFS],
+    len: usize,
+}
+
+impl ResidualCoeffs {
+    #[inline]
+    pub fn as_slice(&self) -> &[(usize, i32)] {
+        &self.buf[..self.len]
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<'a> IntoIterator for &'a ResidualCoeffs {
+    type Item = &'a (usize, i32);
+    type IntoIter = core::slice::Iter<'a, (usize, i32)>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.as_slice().iter()
+    }
+}
+
+impl IntoIterator for ResidualCoeffs {
+    type Item = (usize, i32);
+    type IntoIter = core::iter::Take<core::array::IntoIter<(usize, i32), MAX_RESIDUAL_COEFFS>>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.buf.into_iter().take(self.len)
     }
 }
 
@@ -995,7 +1047,7 @@ mod tests {
     #[test]
     fn test_mlps_state_transitions() {
         // LPS transition from state 0 should go to state 2
-        assert_eq!(MLPS_STATE[128 + 0], 2);
+        assert_eq!(MLPS_STATE[128], 2);
         // MPS transition from state 126 should go to state 126
         assert_eq!(MLPS_STATE[128 + 126], 126);
         assert_eq!(MLPS_STATE[128 + 127], 127);

@@ -65,7 +65,7 @@ pub fn inverse_hadamard_2x2(dc: &mut [i32; 4]) {
 /// Horizontal pass (rows) first, then vertical pass (columns), per spec 8.5.12.1.
 pub fn inverse_dct_4x4(block: &mut [i32; 16]) {
     // Use wrapping arithmetic — malformed coefficients can cause overflow
-    use std::num::Wrapping as W;
+    use core::num::Wrapping as W;
 
     block[0] = block[0].wrapping_add(32);
 
@@ -190,6 +190,56 @@ pub fn chroma_qp(qp_y: i32, chroma_qp_index_offset: i32) -> i32 {
     QPC_TABLE[qpi as usize]
 }
 
+/// 4x4 field zigzag scan order (spec Table 8-13): used for field pictures and
+/// field-coded MBs in MBAFF. Maps linear index to (row, col).
+pub const ZIGZAG_4X4_FIELD: [(usize, usize); 16] = [
+    (0, 0),
+    (1, 0),
+    (0, 1),
+    (2, 0),
+    (3, 0),
+    (1, 1),
+    (2, 1),
+    (3, 1),
+    (0, 2),
+    (1, 2),
+    (2, 2),
+    (3, 2),
+    (0, 3),
+    (1, 3),
+    (2, 3),
+    (3, 3),
+];
+
+/// 8x8 field zigzag scan for CAVLC (spec Table 8-13, rearranged for CAVLC 4-quad decode).
+/// Like ZIGZAG_8X8_CAVLC but using field scan order. Each group of 16 corresponds to
+/// one 4x4 sub-block (TL, TR, BL, BR), with coefficients ordered by field scan position.
+#[rustfmt::skip]
+pub const ZIGZAG_8X8_CAVLC_FIELD: [usize; 64] = [
+     0,  8,  1,  2, 16,  9, 24, 17,
+    10,  3, 11, 25, 18, 26, 19, 27,
+     4, 12,  5,  6, 13, 20, 28, 21,
+    14,  7, 15, 22, 29, 30, 23, 31,
+    32, 40, 33, 34, 41, 48, 56, 49,
+    42, 35, 43, 50, 57, 58, 51, 59,
+    36, 44, 37, 38, 45, 52, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
+];
+
+/// 8x8 field zigzag scan for CABAC (spec Table 8-13, field coding).
+/// Value = row*8+col.
+#[rustfmt::skip]
+pub const ZIGZAG_8X8_CABAC_FIELD: [usize; 64] = [
+     0,  8,  1,  2, 16,  9, 24, 17,
+    10,  3,  4, 11, 25, 18, 32, 40,
+    33, 26, 19, 12,  5,  6, 13, 20,
+    27, 34, 41, 48, 56, 49, 42, 35,
+    28, 21, 14,  7, 15, 22, 29, 36,
+    43, 50, 57, 58, 51, 44, 37, 30,
+    23, 31, 38, 45, 52, 59, 60, 53,
+    46, 39, 47, 54, 61, 62, 55, 63,
+];
+
 /// 8x8 zigzag scan for CAVLC (spec Table 8-12, rearranged for CAVLC 4-quad decode).
 /// Structured as 4 groups of 16: each group is one 4x4 sub-block's scan positions
 /// within the full 8x8 block. Value = row * 8 + col.
@@ -258,7 +308,7 @@ pub fn dequant_8x8(block: &mut [i32; 64], qp: i32, scale: &[u8; 64]) {
 /// Row pass first (within each row), then column pass with >> 6 normalization.
 pub fn inverse_dct_8x8(block: &mut [i32; 64]) {
     // Use wrapping arithmetic throughout — malformed coefficients can cause overflow
-    use std::num::Wrapping as W;
+    use core::num::Wrapping as W;
 
     block[0] = block[0].wrapping_add(32);
 
@@ -321,7 +371,7 @@ fn idct8_butterfly(
     x6: i32,
     x7: i32,
 ) -> (i32, i32, i32, i32, i32, i32, i32, i32) {
-    use std::num::Wrapping as W;
+    use core::num::Wrapping as W;
     let a0 = (W(x0) + W(x4)).0;
     let a2 = (W(x0) - W(x4)).0;
     let a4 = (W(x2 >> 1) - W(x6)).0;

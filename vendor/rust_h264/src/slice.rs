@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use crate::bitstream::BitstreamReader;
 use crate::nal::NalUnitType;
 use crate::pps::Pps;

@@ -3,12 +3,15 @@
 //! Contains MV prediction (median, directional), spatial/temporal direct mode,
 //! MV neighbor lookups, skip MV derivation, and weighted prediction context.
 
-use std::rc::Rc;
+use alloc::rc::Rc;
+use alloc::vec::Vec;
 
 use crate::dpb::DecodedPicture;
 use crate::inter_pred;
 use crate::residual::OFFSET_TO_BLOCK;
 use crate::slice::PredWeightTable;
+
+pub(crate) type DirectMvResult = ([i16; 2], [i16; 2], i8, i8, bool, bool);
 
 /// MBAFF context for neighbor derivation. Passed to MV prediction functions.
 #[derive(Clone, Copy)]
@@ -328,18 +331,40 @@ pub(crate) fn derive_spatial_direct_blk(
     cur_slice_id: u16,
     direct_8x8_inference_flag: bool,
     mctx: MbaffCtx,
-) -> ([i16; 2], [i16; 2], i8, i8, bool, bool) {
+) -> DirectMvResult {
+    let base = derive_spatial_direct_base(
+        [
+            (mv_store_l0, ref_idx_store_l0),
+            (mv_store_l1, ref_idx_store_l1),
+        ],
+        mb_idx,
+        mb_width,
+        mb_slice_id,
+        cur_slice_id,
+        mctx,
+    );
+    apply_spatial_direct_col_zero(base, col_pic, mb_idx, col_blk, direct_8x8_inference_flag)
+}
+
+/// Derive the neighbor-based spatial direct result before colocated zero-MV refinement.
+///
+/// The spatial neighbor set is addressed at the macroblock origin in this decoder's
+/// direct-mode path, so it is invariant for all 8x8 representatives within the MB.
+pub(crate) fn derive_spatial_direct_base(
+    stores: [(&[[i16; 2]], &[i8]); 2],
+    mb_idx: usize,
+    mb_width: usize,
+    mb_slice_id: &[u16],
+    cur_slice_id: u16,
+    mctx: MbaffCtx,
+) -> DirectMvResult {
     let mut ref_idx = [-1i8; 2];
     let mut mv = [[0i16; 2]; 2];
     let mut pred_flag = [false; 2];
 
     // For each list, find min-positive ref_idx from neighbors and derive MV
     for list in 0..2 {
-        let (mv_s, ref_s) = if list == 0 {
-            (mv_store_l0, ref_idx_store_l0)
-        } else {
-            (mv_store_l1, ref_idx_store_l1)
-        };
+        let (mv_s, ref_s) = stores[list];
 
         let a = get_mv_neighbor_left_mbaff(
             mv_s,
@@ -460,6 +485,29 @@ pub(crate) fn derive_spatial_direct_blk(
         mv = [[0, 0], [0, 0]];
     }
 
+    (
+        mv[0],
+        mv[1],
+        ref_idx[0],
+        ref_idx[1],
+        pred_flag[0],
+        pred_flag[1],
+    )
+}
+
+/// Apply spatial direct colocated zero-MV refinement to an already-derived base result.
+///
+/// Only the colocated block lookup depends on `col_blk`; the spatial median/ref result
+/// is unchanged across 8x8 representatives within the same macroblock.
+pub(crate) fn apply_spatial_direct_col_zero(
+    base: DirectMvResult,
+    col_pic: Option<&DecodedPicture>,
+    mb_idx: usize,
+    col_blk: usize,
+    direct_8x8_inference_flag: bool,
+) -> DirectMvResult {
+    let (mut mv_l0, mut mv_l1, ref_idx_l0, ref_idx_l1, pred_l0, pred_l1) = base;
+
     // Co-located zero-MV refinement (spec 8.4.1.2.2):
     // Derive mvCol/refIdxCol from the co-located partition in ColPic (= RefPicList1[0]):
     //   - If co-located PredFlagL0 = 1: use L0 MV/ref
@@ -504,24 +552,17 @@ pub(crate) fn derive_spatial_direct_blk(
             };
 
             if col_zero {
-                if ref_idx[0] == 0 {
-                    mv[0] = [0, 0];
+                if ref_idx_l0 == 0 {
+                    mv_l0 = [0, 0];
                 }
-                if ref_idx[1] == 0 {
-                    mv[1] = [0, 0];
+                if ref_idx_l1 == 0 {
+                    mv_l1 = [0, 0];
                 }
             }
         }
     }
 
-    (
-        mv[0],
-        mv[1],
-        ref_idx[0],
-        ref_idx[1],
-        pred_flag[0],
-        pred_flag[1],
-    )
+    (mv_l0, mv_l1, ref_idx_l0, ref_idx_l1, pred_l0, pred_l1)
 }
 
 /// Derive temporal direct mode MVs for a specific 4x4 block within an MB.

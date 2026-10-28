@@ -41,6 +41,37 @@ for frame in decoder.flush() {
 }
 ```
 
+If your demuxer has per-picture metadata such as PTS timestamps, use the
+generic metadata API so that timestamps follow frames through H.264 B-frame
+reordering:
+
+```rust
+use rust_h264::decoder::OrderedDecoder;
+
+let mut decoder = OrderedDecoder::<u64>::new(); // metadata is a PTS timestamp
+
+for access_unit in samples {
+    let pts = access_unit.pts;
+    for nal in access_unit.nals {
+        for (frame, frame_pts) in decoder.decode_nal_with_meta(&nal, pts).unwrap() {
+            // `frame` is in display order and `frame_pts` belongs to this frame.
+        }
+    }
+}
+for (frame, frame_pts) in decoder.flush_with_meta() {
+    // handle final frames with their PTS values
+}
+```
+
+`Decoder::decode_nal` has a one-picture pipeline delay: a slice that starts a
+new picture finalizes and returns the previous picture. `OrderedDecoder` stores
+the metadata for the picture currently being built and pairs it with that
+delayed frame when finalization occurs, avoiding the common off-by-one PTS bug.
+Metadata passed for non-slice NALs (SPS/PPS/SEI/etc.) is ignored, and
+continuation slices keep the metadata attached by the first slice of the same
+picture. Existing `decode_nal`/`flush` callers are unchanged; `OrderedDecoder`
+defaults to `OrderedDecoder<()>` and still returns `Vec<Frame>`.
+
 ### Low-level `Decoder` (decode order)
 
 If you need raw decode order — for example, to drive a custom reorder buffer

@@ -1,14 +1,14 @@
 //! Error type returned by the decoder.
 
-use std::fmt;
+use core::fmt;
 
 /// Errors produced by the H.264 decoder.
 ///
 /// Returned by [`Decoder::decode_nal`](crate::decoder::Decoder::decode_nal)
 /// when a NAL unit cannot be parsed or uses an unsupported feature.
 ///
-/// Implements [`std::error::Error`] and [`Display`](fmt::Display) for
-/// integration with standard error handling patterns.
+/// Implements [`core::fmt::Display`] for all builds, and
+/// [`std::error::Error`] when the `std` feature is enabled.
 #[derive(Debug)]
 pub enum DecodeError {
     /// The bitstream ended in the middle of a syntax element. Usually
@@ -33,6 +33,7 @@ impl fmt::Display for DecodeError {
     }
 }
 
+#[cfg(feature = "std")]
 impl std::error::Error for DecodeError {}
 
 /// Allow `?` to convert `&'static str` errors from internal parsing functions

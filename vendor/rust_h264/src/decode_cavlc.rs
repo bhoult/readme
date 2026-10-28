@@ -1,5 +1,7 @@
 //! CAVLC macroblock decode for non-skip MBs.
 
+use alloc::vec::Vec;
+
 use crate::bitstream::BitstreamReader;
 use crate::cavlc::parse_residual_block_cavlc;
 use crate::deblock::{MbInfo, MbType};
@@ -12,7 +14,7 @@ use crate::residual::{
     chroma_qp, dequant_4x4_full, dequant_8x8, dequant_chroma_dc, dequant_luma_dc_i16x16,
     inverse_dct_4x4, inverse_dct_8x8, inverse_hadamard_2x2, inverse_hadamard_4x4,
     BLOCK_INDEX_TO_OFFSET, CBP_INTER_TABLE, CBP_INTRA_TABLE, OFFSET_TO_BLOCK, ZIGZAG_4X4,
-    ZIGZAG_8X8_CAVLC,
+    ZIGZAG_4X4_FIELD, ZIGZAG_8X8_CAVLC, ZIGZAG_8X8_CAVLC_FIELD,
 };
 use crate::slice_context::{SliceContext, SliceParams};
 
@@ -28,6 +30,19 @@ impl SliceContext<'_> {
         mb_y: usize,
         sp: &SliceParams,
     ) -> Result<(), DecodeError> {
+        // Select field or frame coefficient scan tables
+        let field_scan = self.is_field_scan(mb_idx);
+        let zigzag_4x4 = if field_scan {
+            &ZIGZAG_4X4_FIELD
+        } else {
+            &ZIGZAG_4X4
+        };
+        let zigzag_8x8_cavlc = if field_scan {
+            &ZIGZAG_8X8_CAVLC_FIELD
+        } else {
+            &ZIGZAG_8X8_CAVLC
+        };
+
         let raw_mb_type = reader.read_ue()?;
         // For P slices, mb_type >= 5 means intra (subtract 5)
         // For B slices, mb_type >= 23 means intra (subtract 23)
@@ -808,7 +823,7 @@ impl SliceContext<'_> {
                         let scan_base = i4x4 * 16;
                         for k in 0..16 {
                             if quad_coeffs[k] != 0 {
-                                block_8x8[ZIGZAG_8X8_CAVLC[scan_base + k]] = quad_coeffs[k];
+                                block_8x8[zigzag_8x8_cavlc[scan_base + k]] = quad_coeffs[k];
                             }
                         }
                     }
@@ -842,7 +857,7 @@ impl SliceContext<'_> {
 
                         let mut raster = [0i32; 16];
                         for i in 0..16 {
-                            let (r, c) = ZIGZAG_4X4[i];
+                            let (r, c) = zigzag_4x4[i];
                             raster[r * 4 + c] = block_coeffs[i];
                         }
                         // Use inter scaling list (index 3) for luma
@@ -1102,7 +1117,7 @@ impl SliceContext<'_> {
                     block_raster[0] = plane_dc[blk];
                     if cbp_chroma >= 2 {
                         for scan_idx in 0..15 {
-                            let (r, c) = ZIGZAG_4X4[scan_idx + 1];
+                            let (r, c) = zigzag_4x4[scan_idx + 1];
                             block_raster[r * 4 + c] = plane_ac[blk][scan_idx];
                         }
                         dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);
@@ -1163,6 +1178,16 @@ impl SliceContext<'_> {
                         };
                         let mut c_l0 = vec![0u8; cw * ch];
                         let mut c_l1 = vec![0u8; cw * ch];
+                        let cmv_y_off_l0 = crate::slice_context::chroma_field_mv_offset_impl(
+                            self.field_pic_flag,
+                            self.bottom_field_flag,
+                            ref_l0,
+                        );
+                        let cmv_y_off_l1 = crate::slice_context::chroma_field_mv_offset_impl(
+                            self.field_pic_flag,
+                            self.bottom_field_flag,
+                            ref_l1,
+                        );
                         inter_pred::chroma_mc(
                             cr_l0,
                             c_ref_stride_l0,
@@ -1170,7 +1195,7 @@ impl SliceContext<'_> {
                             (chroma_mb_x + cx_off) as i32,
                             (mc_cy_l0 + cy_off) as i32,
                             sub_part.mv_l0[0] as i32,
-                            sub_part.mv_l0[1] as i32,
+                            sub_part.mv_l0[1] as i32 + cmv_y_off_l0,
                             cw,
                             ch,
                             &mut c_l0,
@@ -1182,7 +1207,7 @@ impl SliceContext<'_> {
                             (chroma_mb_x + cx_off) as i32,
                             (mc_cy_l1 + cy_off) as i32,
                             sub_part.mv_l1[0] as i32,
-                            sub_part.mv_l1[1] as i32,
+                            sub_part.mv_l1[1] as i32 + cmv_y_off_l1,
                             cw,
                             ch,
                             &mut c_l1,
@@ -1211,6 +1236,11 @@ impl SliceContext<'_> {
                         } else {
                             &ref_pic.v[c_ref_off..]
                         };
+                        let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(
+                            self.field_pic_flag,
+                            self.bottom_field_flag,
+                            ref_pic,
+                        );
                         inter_pred::chroma_mc(
                             cr,
                             c_ref_stride,
@@ -1218,7 +1248,7 @@ impl SliceContext<'_> {
                             (chroma_mb_x + cx_off) as i32,
                             (mc_cy + cy_off) as i32,
                             mv[0] as i32,
-                            mv[1] as i32,
+                            mv[1] as i32 + cmv_y_off,
                             cw,
                             ch,
                             &mut part_pred,
@@ -1273,6 +1303,7 @@ impl SliceContext<'_> {
             // Collect all sub-partition info: (x_off, y_off, self.width, self.height, ref_idx)
             // For non-P_8x8: 1-2 partitions as before
             // For P_8x8: up to 16 sub-partitions across 4 sub-MBs
+            #[derive(Clone, Copy, Default)]
             struct SubPart {
                 x: usize,
                 y: usize,
@@ -1281,7 +1312,8 @@ impl SliceContext<'_> {
                 ref_idx: i8,
                 mv: [i16; 2],
             }
-            let mut sub_parts: Vec<SubPart> = Vec::new();
+            let mut sub_parts = [SubPart::default(); 16];
+            let mut sub_part_count = 0usize;
 
             if is_p8x8 {
                 // 8x8 sub-MB origins within the macroblock
@@ -1300,23 +1332,26 @@ impl SliceContext<'_> {
                     }
                 }
                 // P_8x8ref0 (mb_type=4): all ref_idx = 0 (already initialized)
-
                 // Parse MVD for each sub-partition and store MVs
                 for smb in 0..4 {
                     let (sy, sx) = sub_mb_origins[smb];
                     let ref_idx = sub_ref[smb];
 
-                    // Sub-partition layout within this 8x8
-                    let sub_parts_layout: Vec<(usize, usize, usize, usize)> =
-                        match sub_mb_types[smb] {
-                            0 => vec![(0, 0, 8, 8)],                                           // 8x8
-                            1 => vec![(0, 0, 8, 4), (0, 4, 8, 4)], // 8x4
-                            2 => vec![(0, 0, 4, 8), (4, 0, 4, 8)], // 4x8
-                            3 => vec![(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)], // 4x4
-                            _ => return Err(DecodeError::from("invalid sub_mb_type")),
-                        };
+                    let sub_parts_layout = match sub_mb_types[smb] {
+                        0 => [(0, 0, 8, 8), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)],
+                        1 => [(0, 0, 8, 4), (0, 4, 8, 4), (0, 0, 0, 0), (0, 0, 0, 0)],
+                        2 => [(0, 0, 4, 8), (4, 0, 4, 8), (0, 0, 0, 0), (0, 0, 0, 0)],
+                        3 => [(0, 0, 4, 4), (4, 0, 4, 4), (0, 4, 4, 4), (4, 4, 4, 4)],
+                        _ => return Err(DecodeError::from("invalid sub_mb_type")),
+                    };
+                    let layout_count = match sub_mb_types[smb] {
+                        0 => 1,
+                        1 | 2 => 2,
+                        3 => 4,
+                        _ => unreachable!(),
+                    };
 
-                    for &(dx, dy, spw, sph) in &sub_parts_layout {
+                    for &(dx, dy, spw, sph) in sub_parts_layout.iter().take(layout_count) {
                         let px = sx + dx;
                         let py = sy + dy;
                         let mvd_x = reader.read_se()? as i16;
@@ -1350,14 +1385,15 @@ impl SliceContext<'_> {
                             }
                         }
 
-                        sub_parts.push(SubPart {
+                        sub_parts[sub_part_count] = SubPart {
                             x: px,
                             y: py,
                             w: spw,
                             h: sph,
                             ref_idx,
                             mv,
-                        });
+                        };
+                        sub_part_count += 1;
                     }
                 }
             } else {
@@ -1415,14 +1451,15 @@ impl SliceContext<'_> {
                         }
                     }
 
-                    sub_parts.push(SubPart {
+                    sub_parts[sub_part_count] = SubPart {
                         x: px_off,
                         y: py_off,
                         w: part_w,
                         h: part_h,
                         ref_idx: part_ref[p],
                         mv,
-                    });
+                    };
+                    sub_part_count += 1;
                 }
             }
 
@@ -1489,7 +1526,7 @@ impl SliceContext<'_> {
                         let scan_base = i4x4 * 16;
                         for k in 0..16 {
                             if quad_coeffs[k] != 0 {
-                                block_8x8[ZIGZAG_8X8_CAVLC[scan_base + k]] = quad_coeffs[k];
+                                block_8x8[zigzag_8x8_cavlc[scan_base + k]] = quad_coeffs[k];
                             }
                         }
                     }
@@ -1525,7 +1562,7 @@ impl SliceContext<'_> {
 
                         let mut raster = [0i32; 16];
                         for i in 0..16 {
-                            let (r, c) = ZIGZAG_4X4[i];
+                            let (r, c) = zigzag_4x4[i];
                             raster[r * 4 + c] = block_coeffs[i];
                         }
                         dequant_4x4_full(&mut raster, qp_y, &sp.scaling_list_4x4[3]);
@@ -1542,7 +1579,7 @@ impl SliceContext<'_> {
             } // close if use_8x8_dct else
 
             // Motion compensate and add residual for each sub-partition
-            for sub_part in &sub_parts {
+            for sub_part in sub_parts.iter().take(sub_part_count) {
                 let fri = self.frame_ref_idx(mb_idx, sub_part.ref_idx);
                 let ref_pic = sp
                     .ref_pic_list
@@ -1584,7 +1621,7 @@ impl SliceContext<'_> {
                 }
             }
 
-            // Chroma
+            // Chroma (P-slice inter)
             let mut chroma_dc_cb = [0i32; 4];
             let mut chroma_dc_cr = [0i32; 4];
             if cbp_chroma >= 1 {
@@ -1632,20 +1669,18 @@ impl SliceContext<'_> {
 
             // Precompute mc_params per sub_part before entering the plane loop
             // (avoids borrow conflict with &mut self.frame inside the loop).
-            let p_sub_mc: Vec<(i32, usize, usize, usize, usize, usize)> = sub_parts
-                .iter()
-                .map(|sp_part| {
-                    let fri = self.frame_ref_idx(mb_idx, sp_part.ref_idx);
-                    let ref_pic = sp
-                        .ref_pic_list
-                        .get(fri as usize)
-                        .or_else(|| sp.ref_pic_list.last());
-                    let w = ref_pic
-                        .map(|r| r.width as usize)
-                        .unwrap_or(self.width as usize);
-                    self.mc_params(mb_idx, mb_y, w, sp_part.ref_idx)
-                })
-                .collect();
+            let mut p_sub_mc = [(0i32, 0usize, 0usize, 0usize, 0usize, 0usize); 16];
+            for (sp_i, sp_part) in sub_parts.iter().take(sub_part_count).enumerate() {
+                let fri = self.frame_ref_idx(mb_idx, sp_part.ref_idx);
+                let ref_pic = sp
+                    .ref_pic_list
+                    .get(fri as usize)
+                    .or_else(|| sp.ref_pic_list.last());
+                let w = ref_pic
+                    .map(|r| r.width as usize)
+                    .unwrap_or(self.width as usize);
+                p_sub_mc[sp_i] = self.mc_params(mb_idx, mb_y, w, sp_part.ref_idx);
+            }
 
             // Chroma MC + residual for each chroma plane
             // Each partition gets its own chroma MC with its own MV
@@ -1678,7 +1713,7 @@ impl SliceContext<'_> {
                         block_raster[0] = plane_dc[blk];
                         if cbp_chroma >= 2 {
                             for scan_idx in 0..15 {
-                                let (r, c) = ZIGZAG_4X4[scan_idx + 1];
+                                let (r, c) = zigzag_4x4[scan_idx + 1];
                                 block_raster[r * 4 + c] = plane_ac[blk][scan_idx];
                             }
                             dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);
@@ -1694,7 +1729,7 @@ impl SliceContext<'_> {
 
                     // MC each sub-partition's chroma region
                     let mut chroma_pred = [0u8; 64];
-                    for (sp_i, sub_part) in sub_parts.iter().enumerate() {
+                    for (sp_i, sub_part) in sub_parts.iter().take(sub_part_count).enumerate() {
                         // Chroma coordinates are half of luma
                         let cx_off = sub_part.x / 2;
                         let cy_off = sub_part.y / 2;
@@ -1725,6 +1760,11 @@ impl SliceContext<'_> {
                             &part_ref_pic.v[c_ref_off..]
                         };
                         let mut part_pred = [0u8; 64];
+                        let cmv_y_off = crate::slice_context::chroma_field_mv_offset_impl(
+                            self.field_pic_flag,
+                            self.bottom_field_flag,
+                            part_ref_pic,
+                        );
                         inter_pred::chroma_mc(
                             chroma_ref,
                             c_ref_stride,
@@ -1732,7 +1772,7 @@ impl SliceContext<'_> {
                             (chroma_mb_x + cx_off) as i32,
                             (mc_cy + cy_off) as i32,
                             sub_part.mv[0] as i32,
-                            sub_part.mv[1] as i32,
+                            sub_part.mv[1] as i32 + cmv_y_off,
                             cw,
                             ch,
                             &mut part_pred,
@@ -1914,7 +1954,7 @@ impl SliceContext<'_> {
                         let scan_base = i4x4 * 16;
                         for k in 0..16 {
                             if quad_coeffs[k] != 0 {
-                                block_8x8[ZIGZAG_8X8_CAVLC[scan_base + k]] = quad_coeffs[k];
+                                block_8x8[zigzag_8x8_cavlc[scan_base + k]] = quad_coeffs[k];
                             }
                         }
                     }
@@ -1969,7 +2009,7 @@ impl SliceContext<'_> {
                         // Unzigzag: convert from zigzag scan order to raster order
                         let mut raster = [0i32; 16];
                         for i in 0..16 {
-                            let (r, c) = ZIGZAG_4X4[i];
+                            let (r, c) = zigzag_4x4[i];
                             raster[r * 4 + c] = block_coeffs[i];
                         }
                         block_coeffs = raster;
@@ -2045,7 +2085,7 @@ impl SliceContext<'_> {
             // Unzigzag DC, Hadamard, dequant
             let mut luma_dc_raster = [0i32; 16];
             for i in 0..16 {
-                let (r, c) = ZIGZAG_4X4[i];
+                let (r, c) = zigzag_4x4[i];
                 luma_dc_raster[r * 4 + c] = luma_dc[i];
             }
             inverse_hadamard_4x4(&mut luma_dc_raster);
@@ -2063,7 +2103,7 @@ impl SliceContext<'_> {
 
                 if cbp_luma != 0 {
                     for scan_idx in 0..15 {
-                        let (r, c) = ZIGZAG_4X4[scan_idx + 1];
+                        let (r, c) = zigzag_4x4[scan_idx + 1];
                         block_raster[r * 4 + c] = luma_ac_scan[blk][scan_idx];
                     }
                     dequant_4x4_ac_raster(&mut block_raster, qp_y, &sp.scaling_list_4x4[0]);
@@ -2221,7 +2261,7 @@ impl SliceContext<'_> {
 
                 if cbp_chroma >= 2 {
                     for scan_idx in 0..15 {
-                        let (r, c) = ZIGZAG_4X4[scan_idx + 1];
+                        let (r, c) = zigzag_4x4[scan_idx + 1];
                         block_raster[r * 4 + c] = plane_ac_scan[blk][scan_idx];
                     }
                     dequant_4x4_ac_raster(&mut block_raster, qp_c, chroma_scale);

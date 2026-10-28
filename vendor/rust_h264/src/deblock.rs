@@ -166,7 +166,8 @@ fn filter_frame_inner(
     second_chroma_qp_index_offset: i32,
     mbaff: bool,
 ) {
-    // The frame is still at its coded size here, cropped only on output
+    // The frame is still at its coded size here (cropping happens on output),
+    // so a row is mb_width MBs long whatever frame.width says
     let stride_y = mb_width * 16;
     let stride_c = mb_width * 8;
 
@@ -255,7 +256,7 @@ fn filter_frame_inner(
             let beta = BETA_TABLE[index_b];
 
             // Chroma QP (computed once per edge, used for chroma segments).
-            // Cb and Cr each take their own QP offset
+            // Cb and Cr each take their own QP offset.
             let chroma_params = |offset: i32| {
                 let qp_c_avg = (chroma_qp(qp_p, offset) + chroma_qp(qp_q, offset) + 1) >> 1;
                 let c_index_a = (qp_c_avg + filter_offset_a).clamp(0, 51) as usize;
@@ -315,7 +316,9 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for (plane, (c_index_a, c_alpha, c_beta)) in [(&mut frame.u, cb), (&mut frame.v, cr)] {
+                    for (plane, (c_index_a, c_alpha, c_beta)) in
+                        [(&mut frame.u, cb), (&mut frame.v, cr)]
+                    {
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {
@@ -453,7 +456,9 @@ fn filter_frame_inner(
                         seg_bs[cseg * 2 + 1],
                         seg_bs[cseg * 2 + 1],
                     ];
-                    for (plane, (c_index_a, c_alpha, c_beta)) in [(&mut frame.u, cb), (&mut frame.v, cr)] {
+                    for (plane, (c_index_a, c_alpha, c_beta)) in
+                        [(&mut frame.u, cb), (&mut frame.v, cr)]
+                    {
                         for i in 0..4 {
                             let pbs = c_bs[i];
                             if pbs == 0 {
@@ -1008,6 +1013,133 @@ mod tests {
             assert!(plane[row * stride + 3] > 100, "p0 should increase");
             assert!(plane[row * stride + 4] < 200, "q0 should decrease");
         }
+    }
+
+    /// Two macroblocks side by side, coded 32 columns wide, with a step at x = 16,
+    /// that say they're `width` wide once cropped.
+    fn two_mb_frame(width: u32) -> Frame {
+        let mut y = vec![0u8; 32 * 16];
+        for row in 0..16 {
+            for col in 0..32 {
+                y[row * 32 + col] = if col < 16 { 100 } else { 120 };
+            }
+        }
+        Frame {
+            width,
+            height: 16,
+            y,
+            u: vec![128; 16 * 8],
+            v: vec![128; 16 * 8],
+            pic_order_cnt: 0,
+        }
+    }
+
+    #[test]
+    fn test_cropped_frame_is_filtered_at_its_coded_width() {
+        // Cropping happens on output: until then the planes are laid out at the
+        // coded width, so a frame cropped to 22 columns must be filtered exactly
+        // like the uncropped one.
+        let mb = MbInfo {
+            mb_type: MbType::Intra,
+            qp_y: 40,
+            ..Default::default()
+        };
+        let mbs = [mb.clone(), mb];
+        let mut whole = two_mb_frame(32);
+        let mut cropped = two_mb_frame(22);
+        filter_frame_params(&mut whole, &mbs, 2, 0, 0, 0, 0);
+        filter_frame_params(&mut cropped, &mbs, 2, 0, 0, 0, 0);
+        assert_ne!(
+            whole.y,
+            two_mb_frame(32).y,
+            "the edge between the MBs is filtered"
+        );
+        assert_eq!(cropped.y, whole.y);
+    }
+
+    /// Two intra MBs side by side whose luma and both chroma planes step up
+    /// across the edge between them.
+    fn two_mb_steps() -> Frame {
+        let mut frame = two_mb_frame(32);
+        for row in 0..8 {
+            for col in 0..16 {
+                let level = if col < 8 { 100 } else { 120 };
+                frame.u[row * 16 + col] = level;
+                frame.v[row * 16 + col] = level;
+            }
+        }
+        frame
+    }
+
+    fn intra(qp_y: i32) -> MbInfo {
+        MbInfo {
+            mb_type: MbType::Intra,
+            qp_y,
+            ..Default::default()
+        }
+    }
+
+    fn deblock(slice_ids: [u16; 2], slices: &[SliceDeblock], cb: i32, cr: i32) -> Frame {
+        let mut frame = two_mb_steps();
+        filter_frame_mbaff(
+            &mut frame,
+            &[intra(40), intra(40)],
+            2,
+            &slice_ids,
+            slices,
+            cb,
+            cr,
+            false,
+        );
+        frame
+    }
+
+    const FILTER: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 0,
+        slice_alpha_c0_offset_div2: 0,
+        slice_beta_offset_div2: 0,
+    };
+    const OFF: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 1,
+        ..FILTER
+    };
+    const NOT_ACROSS_SLICES: SliceDeblock = SliceDeblock {
+        disable_deblocking_filter_idc: 2,
+        ..FILTER
+    };
+
+    #[test]
+    fn test_idc_2_leaves_edges_between_slices_alone() {
+        let unfiltered = two_mb_steps();
+        // In one slice the edge between the two MBs is filtered
+        let one_slice = deblock([0, 0], &[NOT_ACROSS_SLICES], 0, 0);
+        assert_ne!(one_slice.y, unfiltered.y);
+        // In two slices it's left alone (spec 8.7: filterLeftMbEdgeFlag)
+        let two_slices = deblock([0, 1], &[NOT_ACROSS_SLICES, NOT_ACROSS_SLICES], 0, 0);
+        assert_eq!(two_slices.y, unfiltered.y);
+        assert_eq!(two_slices.u, unfiltered.u);
+    }
+
+    #[test]
+    fn test_each_mb_filters_as_its_own_slice_says() {
+        let unfiltered = two_mb_steps();
+        // The edge between the MBs belongs to the right-hand one, so its
+        // slice decides: filtered when that slice says so...
+        let filtered = deblock([0, 1], &[OFF, FILTER], 0, 0);
+        assert_ne!(filtered.y, unfiltered.y);
+        // ...and not when it says not to, whatever the first slice says
+        let left_alone = deblock([0, 1], &[FILTER, OFF], 0, 0);
+        assert_eq!(left_alone.y, unfiltered.y);
+    }
+
+    #[test]
+    fn test_cr_uses_the_second_chroma_qp_offset() {
+        // At QP 40 an offset of -12 lowers Cr's QP enough that its 20-level
+        // step is above alpha and isn't filtered, while Cb's is
+        let unfiltered = two_mb_steps();
+        let frame = deblock([0, 0], &[FILTER], 0, -12);
+        assert_ne!(frame.u, unfiltered.u);
+        assert_eq!(frame.v, unfiltered.v);
     }
 
     #[test]

@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 /// SEI message (H.264 spec section 7.3.2.3).
 #[derive(Debug)]
 pub struct SeiMessage {
@@ -86,6 +88,7 @@ fn parse_user_data_unregistered(data: &[u8]) -> Result<SeiPayload, &'static str>
 mod tests {
     use super::*;
     use crate::nal::{parse_annex_b, NalUnitType};
+    use alloc::string::String;
 
     #[test]
     fn test_parse_sei_single_frame() {

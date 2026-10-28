@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 /// Bitstream reader for parsing H.264 NAL unit RBSP data.
 /// Reads bits left-to-right (MSB first).
 ///

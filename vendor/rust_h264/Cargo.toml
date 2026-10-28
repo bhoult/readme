@@ -1,5 +1,7 @@
-# rust_h264 0.4.0 from crates.io (https://github.com/roticv/rust_h264), with the
-# fixes listed in PATCHES.md. Its tests need upstream's testdata/, not copied here.
+# rust_h264's trunk (https://github.com/roticv/rust_h264) at 07b5d1b, with the fixes
+# listed in PATCHES.md: the branch of https://github.com/roticv/rust_h264/pull/2, at
+# 13dd5d0. Its tests need upstream's testdata/, not copied here, and its examples and
+# their dependencies are left out.
 [package]
 name = "rust_h264"
 version = "0.4.0"
@@ -13,4 +15,14 @@ publish = false
 path = "src/lib.rs"
 
 [features]
+default = ["std"]
+# Standard library support; without it, no_std with alloc
+std = []
+# Motion compensation through core::simd, which needs nightly
+portable-simd = []
+# Internal modules made public, for upstream's examples
 dev-internals = []
+
+[lints.rust]
+# Upstream's profiling, which needs pprof, isn't a feature here
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("profile"))'] }
