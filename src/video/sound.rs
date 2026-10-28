@@ -8,7 +8,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
 };
 
@@ -54,6 +54,11 @@ impl Aac {
         buf.copy_to_vec_interleaved(&mut samples);
         out.extend(samples.iter().map(|s| (s.clamp(-1.0, 1.0) * 32767.0) as i16));
     }
+
+    /// Forgets the sound before, for a packet that doesn't follow on from the last one.
+    pub fn reset(&mut self) {
+        self.decoder.reset();
+    }
 }
 
 /// Sound playing from some point in a video.
@@ -66,9 +71,10 @@ pub struct Sound {
 }
 
 impl Sound {
-    /// Starts playing the sound of the video at `path` from `from` seconds. None when
-    /// there's no sound this plays, or no ALSA.
-    pub fn start(path: &Path, movie: Arc<Movie>, from: f64) -> Option<Self> {
+    /// Starts playing the sound of the video at `path` from `from` seconds, at the
+    /// `volume` (in percent) set at each moment. None when there's no sound this plays,
+    /// or no ALSA.
+    pub fn start(path: &Path, movie: Arc<Movie>, from: f64, volume: Arc<AtomicU8>) -> Option<Self> {
         let track = movie.audio.as_ref()?;
         Aac::new(track)?;
         if cfg!(test) || alsa::get().is_none() {
@@ -82,7 +88,7 @@ impl Sound {
             .name(WORKER.into())
             .spawn(move || {
                 if let Some(track) = &movie.audio {
-                    play(&path, track, from, &stopped, &playing);
+                    play(&path, track, from, &stopped, &playing, &volume);
                 }
                 finished.store(true, Ordering::Relaxed);
             })
@@ -136,7 +142,25 @@ fn skip_frames(track: &Track, first: usize, from: f64, rate: u32) -> usize {
     ((from - start).max(0.0) * f64::from(rate)).round() as usize
 }
 
-fn play(path: &Path, track: &Track, from: f64, stop: &AtomicBool, heard: &AtomicU64) {
+/// How much a volume of `percent` scales the sound by: its square, so the steps up
+/// sound about even.
+fn gain(percent: u8) -> f32 {
+    let level = f32::from(percent.min(100)) / 100.0;
+    level * level
+}
+
+/// `samples` turned down to a volume of `percent`.
+fn turn_down(samples: &mut [i16], percent: u8) {
+    if percent >= 100 {
+        return;
+    }
+    let gain = gain(percent);
+    for s in samples {
+        *s = (f32::from(*s) * gain).round() as i16;
+    }
+}
+
+fn play(path: &Path, track: &Track, from: f64, stop: &AtomicBool, heard: &AtomicU64, volume: &AtomicU8) {
     let Some(alsa) = alsa::get() else { return };
     let Some(mut aac) = Aac::new(track) else { return };
     let Ok(mut file) = File::open(path) else { return };
@@ -165,6 +189,8 @@ fn play(path: &Path, track: &Track, from: f64, stop: &AtomicBool, heard: &Atomic
         aac.decode(&buf, &mut out);
         let dropped = skip.min(out.len());
         skip -= dropped;
+        // At the volume set now: a change is heard once what ALSA holds has played
+        turn_down(&mut out[dropped..], volume.load(Ordering::Relaxed));
         let mut rest = &out[dropped..];
         while !rest.is_empty() {
             if stop.load(Ordering::Relaxed) {
@@ -370,5 +396,17 @@ mod tests {
         let (half, _, _) = decode_from(&path, track, 0.6);
         let ratio = half.len() as f64 / all.len() as f64;
         assert!((0.45..0.55).contains(&ratio), "{ratio}");
+    }
+
+    #[test]
+    fn the_volume_turns_the_sound_down() {
+        assert_eq!((gain(100), gain(50), gain(0)), (1.0, 0.25, 0.0));
+        let mut samples = [1000, -1000, 32767];
+        turn_down(&mut samples, 100);
+        assert_eq!(samples, [1000, -1000, 32767]);
+        turn_down(&mut samples, 50);
+        assert_eq!(samples, [250, -250, 8192]);
+        turn_down(&mut samples, 0);
+        assert_eq!(samples, [0, 0, 0]);
     }
 }

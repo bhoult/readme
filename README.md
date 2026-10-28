@@ -34,7 +34,7 @@ on Linux.
 - [**CSV and TSV**](#csv-and-tsv-tables) as aligned tables with the header kept on screen
 - [**Images**](#images) at full resolution in terminals that can show them, with zoom, and colored half-blocks anywhere else
 - [**Thumbnails**](#thumbnails) of a folder of images, in a grid
-- [**Videos**](#videos) play in the pane, with their sound: MP4 and MOV with H.264, decoded in pure Rust
+- [**Videos**](#videos) play in the pane, with their sound, a volume control and a moving spectrum: MP4 and MOV with H.264, decoded in pure Rust
 - [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
 - [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
 - [**Git branches**](#git-branches): whose each one is, when it last changed, and what it changed, file by file
@@ -52,6 +52,9 @@ the header says how many there are. A folder that a repository above it ignores 
 whole, such as one in a home folder kept in git with `*` in its `.gitignore`, still shows
 what's in it. Git repositories show a ⎇. The tree reads the disk again every couple of
 seconds, so new files appear on their own.
+
+`s` sorts what's in each folder by name, biggest first, oldest first or newest first, with
+folders always first; the header says how, when it isn't by name.
 
 Press `/` and type to filter the whole tree by name. Every word has to match somewhere in
 the path, so `src ar` finds `src/archive.rs` and `src/markdown.rs` but not
@@ -72,7 +75,9 @@ being squeezed.
 Highlighting covers every language bat knows, in the terminal's own colors, so it suits
 light and dark themes alike. Line numbers, `/` search with `n` and `N`, and `w` for word
 wrap. Without wrap, `←` and `→` scroll sideways, and the title says `more →` when a line
-on screen runs past the edge.
+on screen runs past the edge. The header over a file gives its number of lines, its size
+and when it last changed, on a band of color that sets it apart from the text: blue while
+the file has the focus, gray otherwise.
 
 Big files open straight away: colors are worked out a slice at a time, as far down as
 you look.
@@ -109,7 +114,8 @@ put.
 
 PNG, JPEG, GIF, WebP, BMP, TIFF, TGA, QOI, ICO, PNM and HDR images show at full
 resolution in terminals with a graphics protocol: Kitty, Ghostty, WezTerm, Konsole,
-iTerm2, and Sixel terminals. The header gives the image's size and format.
+iTerm2, and Sixel terminals. The header gives the image's size and format, and when it
+last changed.
 
 ![A 2400×1600 Mandelbrot set image shown at full resolution](docs/screenshots/viewer.png)
 
@@ -137,18 +143,24 @@ wide; `+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` op
 
 MP4 and MOV videos with H.264 pictures play in the right pane: most screen recordings,
 videos made with ffmpeg, and older phones' videos. Select one and its first
-picture shows; `Space` or `Enter` (or a click on it, or `Enter` in the tree) plays and
-pauses it. Videos start with their sound off; `m` turns it on. Under the picture is the
-time, and a bar to click to go anywhere in it.
+picture shows; `Space` plays and pauses it, in the tree as well as in the pane, and so
+does a click on the picture. `Enter` opens it in your video player instead, pausing it
+here. Videos start with their sound off; `m` turns it on. Under the picture is the time,
+a bar to click to go anywhere in it, and the volume: click `muted` to turn the sound on,
+click a step to set it, or turn the wheel. The volume stays as you set it for the next
+video. Under the bar, the sound's spectrum moves as it plays, sound on or off: a bar for
+each band of pitches, the low ones on the left, leaping up as loud as they are and
+falling back.
 
 | Keys | |
 |---|---|
-| `Space` `Enter` | play or pause |
+| `Space` | play or pause, in the tree too |
 | `←` `→` | 5 seconds back or on |
 | `↑` `↓` | a minute on or back |
 | `Home` | back to the start |
 | `m` | sound on or off (it starts off) |
-| `o` | open it in your video player instead |
+| `+` `-` | louder or quieter, a tenth at a time |
+| `Enter` `o` | open it in your video player, pausing it here |
 | `Esc` | back to the tree, still playing |
 
 Pictures are drawn in real pixels where images are, and in half-blocks anywhere else.
@@ -229,7 +241,7 @@ Case doesn't matter unless the search has a capital letter in it.
 
 ## Managing files
 
-Mark files with `Space` or `Ctrl`+click (`Shift`+`↑`/`↓` or `Shift`+click for a range).
+Mark files with `m` or `Ctrl`+click (`Shift`+`↑`/`↓` or `Shift`+click for a range).
 Then drag them onto a folder to move them there, or press `Delete` to send them to the
 trash. `F2` renames. Each of these asks before it does anything, nothing gets
 overwritten, and an open file follows its new name.
@@ -246,8 +258,8 @@ contents come in, or save, and it asks before writing over the other changes.
 
 ## Web pages
 
-Clicking an HTML file, or pressing `Enter` on it, opens it in your browser. A video
-readme can't play opens in your video player the same way.
+Pressing `Enter` on an HTML file opens it in your browser, and on a video, in your video
+player. Only `Enter` opens other programs: clicking a file shows it here.
 
 ## Make it yours
 
@@ -297,15 +309,15 @@ date too.
 | Where | Keys |
 |---|---|
 | Anywhere | `?` help (`F1` while typing) · `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
-| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
-| Files | `Space` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
+| Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `s` sort · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
+| Files | `m` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
 | Find in files | `↑↓` matches · `Enter` go to it · `n` `N` within the file · `F` search again · `Esc` back to the tree |
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
-| Videos | `Space` `Enter` play/pause · `←→` 5 s · `↑↓` 1 min · `Home` start · `m` sound · `o` the video player · `Esc` back to the tree |
+| Videos | `Space` play/pause · `Enter` the video player · `←→` 5 s · `↑↓` 1 min · `Home` start · `m` sound · `+` `-` volume · `Esc` back to the tree |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
 | Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches (fetching the remote's) · `←` back, or wider · `H` history · `Esc` leave |
 
@@ -317,7 +329,8 @@ quits, asking first if there are unsaved changes.
 ### Mouse
 
 - Click a directory or an archive to fold or unfold it; click a file to open it (a video
-  plays, and an HTML file opens in the browser too); double-click a file to move into it.
+  plays); double-click a file to move into it. Clicks never open other programs: `Enter`
+  does that.
 - The wheel scrolls whichever pane it's over; `Shift`+wheel scrolls sideways.
 - Drag across text to select and copy it. While editing, a click moves the cursor and a
   double-click selects a word; while viewing, a double-click starts editing there.
@@ -328,7 +341,8 @@ quits, asking first if there are unsaved changes.
   move them there.
 - On an image, the wheel zooms toward the pointer, dragging moves it, and a double-click
   fits it again. Over thumbnails, `Ctrl`+wheel resizes them.
-- On a video, a click plays or pauses it, and a click on the bar under it goes there.
+- On a video, a click plays or pauses it, and a click on the bar under it goes there. A click on the volume control turns the sound on or off, or sets the
+  volume, and the wheel turns it up or down.
 - Drag the divider between the panes to resize the tree.
 
 ### Clipboard

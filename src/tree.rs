@@ -11,7 +11,7 @@ use std::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     },
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use ignore::{WalkBuilder, WalkState};
@@ -31,6 +31,64 @@ type Listing = (Option<SystemTime>, Rc<Vec<Entry>>);
 
 /// Most entries the filter looks through
 const FILTER_LIMIT: usize = 100_000;
+
+/// The order of what's in a folder, folders always first.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Sort {
+    /// By name, whatever the case
+    #[default]
+    Name,
+    /// Biggest first; folders by name
+    Size,
+    /// Oldest first
+    Oldest,
+    /// Newest first
+    Newest,
+}
+
+impl Sort {
+    pub fn next(self) -> Self {
+        match self {
+            Sort::Name => Sort::Size,
+            Sort::Size => Sort::Oldest,
+            Sort::Oldest => Sort::Newest,
+            Sort::Newest => Sort::Name,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Sort::Name => "by name",
+            Sort::Size => "biggest first",
+            Sort::Oldest => "oldest first",
+            Sort::Newest => "newest first",
+        }
+    }
+}
+
+/// Where an entry goes in a folder: folders first, then by `rank`, its place in the
+/// sort's order, and by name among equals.
+fn order(path: &Path, is_dir: bool, rank: i128) -> (bool, i128, String) {
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    (!is_dir, rank, name)
+}
+
+/// An entry's place in `sort`'s order, by its size or when it changed: the same for all
+/// of them by name, and for folders by size.
+fn rank(path: &Path, is_dir: bool, sort: Sort) -> i128 {
+    let meta = || fs::metadata(path).or_else(|_| fs::symlink_metadata(path)).ok();
+    let modified = || {
+        let time = meta().and_then(|m| m.modified().ok());
+        time.and_then(|t| t.duration_since(UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos() as i128)
+    };
+    match sort {
+        Sort::Name => 0,
+        Sort::Size if is_dir => 0,
+        Sort::Size => -i128::from(meta().map_or(0, |m| m.len())),
+        Sort::Oldest => modified(),
+        Sort::Newest => -modified(),
+    }
+}
 
 /// Why the root couldn't move up a folder.
 pub enum NoWayUp {
@@ -75,12 +133,18 @@ pub struct Tree {
     pub scroll_to_selected: bool,
     /// What's typed in the filter box, while it's open
     pub filter: Option<String>,
+    /// The order of what's in each folder
+    pub sort: Sort,
     /// Rows marked for moving or deleting, and where a range of them starts
     pub marks: HashSet<PathBuf>,
     pub anchor: Option<PathBuf>,
     expanded: HashSet<PathBuf>,
     /// Everything under the root, read once for the filter
     everything: Option<Vec<(PathBuf, bool)>>,
+    /// The places in the order sorted by of what the filter has shown from `everything`,
+    /// and that order: read once each, like `everything`, as the filter sorts its matches
+    /// again at every key typed
+    ranks: (Sort, HashMap<PathBuf, i128>),
     /// Most entries the filter looks through
     pub filter_limit: usize,
     /// What's in each archive that's been opened
@@ -101,10 +165,12 @@ impl Tree {
             counted: None,
             scroll_to_selected: false,
             filter: None,
+            sort: Sort::Name,
             marks: HashSet::new(),
             anchor: None,
             expanded: HashSet::new(),
             everything: None,
+            ranks: (Sort::Name, HashMap::new()),
             filter_limit: FILTER_LIMIT,
             archives: RefCell::default(),
         };
@@ -218,7 +284,7 @@ impl Tree {
 
     fn list_into(&self, dir: &Path, depth: usize, rows: &mut Vec<Row>) {
         let top = (!self.rules_above).then_some(self.root.as_path());
-        for (path, is_dir) in list_dir(dir, self.show_hidden, top) {
+        for (path, is_dir) in list_dir(dir, self.show_hidden, top, self.sort) {
             let name =
                 path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
             let archive = !is_dir && archive::is_archive(&path);
@@ -269,7 +335,13 @@ impl Tree {
     /// Every file under the root whose path holds all the words of `query`, with the
     /// directories leading to them.
     fn filtered_into(&mut self, query: &str, rows: &mut Vec<Row>) {
-        let (root, all, above, limit) = (&self.root, self.show_hidden, self.rules_above, self.filter_limit);
+        let (root, all, above, limit, sort) =
+            (&self.root, self.show_hidden, self.rules_above, self.filter_limit, self.sort);
+        // Read again, or sorted another way, the places are worked out again
+        if self.everything.is_none() || self.ranks.0 != sort {
+            self.ranks = (sort, HashMap::new());
+        }
+        let ranks = &mut self.ranks.1;
         let everything = self.everything.get_or_insert_with(|| walk_all(root, all, above, limit));
         let words: Vec<&str> = query.split_whitespace().collect();
         let mut keep: HashSet<&Path> = HashSet::new();
@@ -289,10 +361,22 @@ impl Tree {
                 children.entry(parent).or_default().push((path, *is_dir));
             }
         }
-        fn add(dir: &Path, depth: usize, children: &mut HashMap<&Path, Vec<(&Path, bool)>>, rows: &mut Vec<Row>) {
+        fn add(
+            dir: &Path,
+            depth: usize,
+            sort: Sort,
+            ranks: &mut HashMap<PathBuf, i128>,
+            children: &mut HashMap<&Path, Vec<(&Path, bool)>>,
+            rows: &mut Vec<Row>,
+        ) {
             let Some(mut entries) = children.remove(dir) else { return };
-            entries
-                .sort_by_cached_key(|(p, is_dir)| (!is_dir, p.file_name().map(|n| n.to_string_lossy().to_lowercase())));
+            entries.sort_by_cached_key(|(p, is_dir)| {
+                let place = match sort {
+                    Sort::Name => 0,
+                    _ => *ranks.entry(p.to_path_buf()).or_insert_with(|| rank(p, *is_dir, sort)),
+                };
+                order(p, *is_dir, place)
+            });
             for (path, is_dir) in entries {
                 let name =
                     path.file_name().map_or_else(|| path.display().to_string(), |n| n.to_string_lossy().into_owned());
@@ -301,11 +385,11 @@ impl Tree {
                 let is_dir = is_dir || archive;
                 rows.push(Row { path: path.to_path_buf(), name, is_dir, depth, archive, repo, up: false });
                 if is_dir {
-                    add(path, depth + 1, children, rows);
+                    add(path, depth + 1, sort, ranks, children, rows);
                 }
             }
         }
-        add(root, 0, &mut children, rows);
+        add(root, 0, sort, ranks, &mut children, rows);
     }
 
     pub fn filtering(&self) -> bool {
@@ -330,6 +414,13 @@ impl Tree {
             }
         }
         self.rebuild();
+    }
+
+    /// Puts what's in each folder in `sort`'s order, the selection kept in view.
+    pub fn set_sort(&mut self, sort: Sort) {
+        self.sort = sort;
+        self.rebuild();
+        self.scroll_to_selected = true;
     }
 
     /// Reads everything from disk again.
@@ -467,9 +558,10 @@ fn ignored_from_above(dir: &Path) -> bool {
         .any(|e| e.depth() == 1)
 }
 
-/// A directory's entries, directories first, honoring .gitignore unless `all`. Given
-/// `top`, a folder that `dir` is in, only the rules from `top` down apply.
-fn list_dir(dir: &Path, all: bool, top: Option<&Path>) -> Vec<(PathBuf, bool)> {
+/// A directory's entries, directories first and then in `sort`'s order, honoring
+/// .gitignore unless `all`. Given `top`, a folder that `dir` is in, only the rules from
+/// `top` down apply.
+fn list_dir(dir: &Path, all: bool, top: Option<&Path>, sort: Sort) -> Vec<(PathBuf, bool)> {
     // The rules are picked up on the way down, so the walk starts at `top`, though it looks
     // into nothing but the folders on the way to `dir`. It doesn't go through symlinks, so
     // beyond one, only the rules from `dir` down apply.
@@ -498,8 +590,7 @@ fn list_dir(dir: &Path, all: bool, top: Option<&Path>) -> Vec<(PathBuf, bool)> {
             (e.into_path(), is_dir)
         })
         .collect();
-    entries
-        .sort_by_cached_key(|(path, is_dir)| (!is_dir, path.file_name().map(|n| n.to_string_lossy().to_lowercase())));
+    entries.sort_by_cached_key(|(path, is_dir)| order(path, *is_dir, rank(path, *is_dir, sort)));
     entries
 }
 
@@ -507,6 +598,49 @@ fn list_dir(dir: &Path, all: bool, top: Option<&Path>) -> Vec<(PathBuf, bool)> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn sorts_by_name_size_and_date_with_folders_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let day = std::time::Duration::from_secs(86_400);
+        let now = SystemTime::now();
+        // Name, size, and days old
+        for (name, size, age) in [("b.txt", 300, 2), ("A.txt", 100, 1), ("c.txt", 200, 3)] {
+            let file = fs::File::create(root.join(name)).unwrap();
+            file.set_len(size).unwrap();
+            file.set_modified(now - day * age).unwrap();
+        }
+        for (name, age) in [("old", 5), ("new", 4)] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::File::open(root.join(name)).unwrap().set_modified(now - day * age).unwrap();
+        }
+        let mut tree = Tree::new(root.to_path_buf());
+        let names = |tree: &Tree| tree.rows.iter().filter(|r| !r.up).map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&tree), ["new", "old", "A.txt", "b.txt", "c.txt"]);
+        tree.set_sort(tree.sort.next());
+        assert_eq!(tree.sort, Sort::Size);
+        assert_eq!(names(&tree), ["new", "old", "b.txt", "c.txt", "A.txt"]);
+        tree.set_sort(tree.sort.next());
+        assert_eq!(names(&tree), ["old", "new", "c.txt", "b.txt", "A.txt"]);
+        tree.set_sort(tree.sort.next());
+        assert_eq!(names(&tree), ["new", "old", "A.txt", "b.txt", "c.txt"]);
+        assert_eq!(tree.sort, Sort::Newest);
+        // The filter's matches go in the same order
+        tree.set_filter(Some("txt".into()));
+        assert_eq!(names(&tree), ["A.txt", "b.txt", "c.txt"]);
+        tree.set_sort(Sort::Oldest);
+        assert_eq!(names(&tree), ["c.txt", "b.txt", "A.txt"]);
+        assert_eq!(tree.sort.next(), Sort::Newest);
+        // read once, like what the filter looks through, until that's read again
+        tree.set_sort(Sort::Size);
+        assert_eq!(names(&tree), ["b.txt", "c.txt", "A.txt"]);
+        fs::File::options().write(true).open(root.join("A.txt")).unwrap().set_len(1000).unwrap();
+        tree.rebuild();
+        assert_eq!(names(&tree), ["b.txt", "c.txt", "A.txt"]);
+        tree.refresh();
+        assert_eq!(names(&tree), ["A.txt", "b.txt", "c.txt"]);
+    }
 
     #[test]
     fn lists_dirs_first_and_skips_ignored() {

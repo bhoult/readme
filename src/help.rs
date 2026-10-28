@@ -71,7 +71,7 @@ fn unlink(text: &str) -> String {
 }
 
 /// "2026-10-27 10:41": the local time `secs` seconds after the epoch.
-fn local_time(secs: u64) -> String {
+pub fn local_time(secs: u64) -> String {
     let time = secs as libc::time_t;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     if unsafe { libc::localtime_r(&time, &mut tm) }.is_null() {

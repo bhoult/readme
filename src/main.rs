@@ -93,9 +93,10 @@ Keys
   Tab          switch between the tree and the file
   Tree         ↑↓/jk move · Enter open · ←→/hl fold · / filter by name
                Backspace or .. up a folder
+               s sort: by name, biggest, oldest or newest first
                F find text in all the files (Esc back to the tree)
                . hidden files · r refresh · H git history · B branches
-               Space mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
+               m mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
                F2 rename · drag marked files onto a folder to move them
   File         ↑↓ PgUp PgDn Home End scroll · ← back to the tree
                / search, n/N next/prev
@@ -105,8 +106,9 @@ Keys
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
-  Videos       Space or Enter play/pause · ←→ 5 s · ↑↓ 1 min · Home start
-               m sound · o the video player · Esc back to the tree
+  Videos       Space play/pause (in the tree too) · ←→ 5 s · ↑↓ 1 min
+               Home start · m sound · +/- volume · Esc back to the tree
+               Enter or o the video player, pausing it here
   History      H on a file or folder · ↑↓ commits · Enter its files
                d diff or file · a all files · ← back, or a wider history
                B its branches · Esc leave
@@ -123,16 +125,17 @@ Keys
 
 Mouse
   Click a directory or archive to fold it, a file to open it; double-click a
-  file to focus it. Wheel scrolls (Shift+wheel sideways). Drag across text to
-  select and copy it. Double-click text to start editing there. Drag the
-  divider to resize the tree.
+  file to focus it. Wheel scrolls (Shift+wheel sideways), and over a video
+  turns its sound up or down. Drag across text to select and copy it.
+  Double-click text to start editing there. Drag the divider to resize the
+  tree.
 
 Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
 archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, a
 folder with images in it shows them as thumbnails (+/- to resize, Enter or a
 click to open one, Esc to go back), MP4 and MOV videos with H.264 play in the
-pane with their sound, and clicking an HTML file, or a video readme can't
-play (or Enter on it), opens it in the browser or the video player.
+pane with their sound, and Enter on an HTML file or a video opens it in the
+browser or the video player; a click never does.
 
 Environment
   README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)

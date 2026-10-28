@@ -7,10 +7,14 @@ mod frames;
 pub(crate) mod kitty;
 pub mod mp4;
 mod sound;
+mod spectrum;
 
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -26,6 +30,7 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use frames::{Decoded, Frame, Frames, Late, Size};
 use mp4::{Codec, Movie};
 use sound::Sound;
+use spectrum::Spectrum;
 
 pub use frames::WORKER as PICTURES;
 pub use sound::WORKER as SOUND;
@@ -33,6 +38,24 @@ pub use sound::WORKER as SOUND;
 /// How far the arrow keys move
 pub const STEP: f64 = 5.0;
 pub const BIG_STEP: f64 = 60.0;
+
+/// The volume control at the bar's end, " sound ▁▂▂▃▄▅▅▆▇█ ": its label, a step for each
+/// tenth, and a space
+const VOLUME_LABEL: u16 = 7;
+const VOLUME_STEPS: [&str; 10] = ["▁", "▂", "▂", "▃", "▄", "▅", "▅", "▆", "▇", "█"];
+const VOLUME_WIDTH: u16 = VOLUME_LABEL + VOLUME_STEPS.len() as u16 + 1;
+/// How much each step is, in percent
+const VOLUME_STEP: u8 = 100 / VOLUME_STEPS.len() as u8;
+/// Eighths of a cell filled from the bottom, for the spectrum's bars
+const EIGHTHS: [&str; 9] = [" ", "▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+
+/// What a click on the volume control does.
+pub enum VolumeClick {
+    /// On "sound" or "muted": turns the sound on or off
+    Toggle,
+    /// On the steps: sets the volume, in percent
+    Set(u8),
+}
 
 /// Pixels a Kitty picture starts out with at most, before it's seen how fast the
 /// terminal takes them, and the range it's kept in: every picture goes through the
@@ -64,14 +87,21 @@ pub struct Video {
     sound: Option<(Sound, Instant)>,
     /// Videos start with their sound off
     pub muted: bool,
+    /// How loud the sound plays, in percent: the same for every video, and followed by
+    /// the sound's thread as it changes
+    volume: Arc<AtomicU8>,
     /// Whether the video has sound this plays
     has_sound: bool,
+    /// The sound's spectrum, for the bars under the bar
+    spectrum: Option<Spectrum>,
     kitty: Option<KittyState>,
     /// Pixels per cell
     cell: (f64, f64),
     /// Where the picture and the bar under it were drawn last, for the mouse
     pub picture_area: Rect,
     pub bar: Rect,
+    /// And the spectrum under the bar, for knowing when to draw again
+    spectrum_area: Rect,
 }
 
 #[derive(Clone, Copy)]
@@ -122,8 +152,9 @@ pub fn clock_time(seconds: f64) -> String {
 }
 
 impl Video {
-    /// Opens the video at `path`, paused at the start, its first picture on its way.
-    pub fn open(path: &Path, picker: &Picker) -> Result<Self, String> {
+    /// Opens the video at `path`, paused at the start, its first picture on its way. Its
+    /// sound plays at `volume` percent, as that changes.
+    pub fn open(path: &Path, picker: &Picker, volume: Arc<AtomicU8>) -> Result<Self, String> {
         let movie = Arc::new(mp4::open(path).map_err(|e| e.0)?);
         let Some(track) = &movie.video else { return Err("it has no video track".into()) };
         match &track.codec {
@@ -131,8 +162,9 @@ impl Video {
             Codec::Other(kind) => return Err(format!("it's {}, and readme plays H.264", codec_name(kind))),
             Codec::Aac(_) => return Err("its video track holds sound".into()),
         }
-        let has_sound = movie.audio.as_ref().and_then(sound::Aac::new).is_some();
-        let sound = match (&movie.audio, movie.audio.as_ref().and_then(sound::Aac::new)) {
+        let aac = movie.audio.as_ref().and_then(sound::Aac::new);
+        let has_sound = aac.is_some();
+        let sound = match (&movie.audio, &aac) {
             (_, Some(aac)) if aac.channels == 1 => ", mono",
             (_, Some(_)) => ", stereo",
             (Some(_), None) => ", sound readme can't play",
@@ -149,6 +181,7 @@ impl Video {
             ((f64::from(track.height) * k).round() as u32).max(1),
         );
         let frames = Frames::start(path, movie.clone(), 0.0, size.clone(), late.clone());
+        let spectrum = aac.and_then(|aac| Spectrum::new(path, movie.clone(), aac));
         Ok(Self {
             path: path.to_path_buf(),
             movie,
@@ -165,12 +198,20 @@ impl Video {
             clock: Clock::Paused(0.0),
             sound: None,
             muted: true,
+            volume,
             has_sound,
+            spectrum,
             kitty: kitty_for(picker),
             cell: cell_size(picker),
             picture_area: Rect::default(),
             bar: Rect::default(),
+            spectrum_area: Rect::default(),
         })
+    }
+
+    /// Whether the video has sound readme plays, which the volume is for.
+    pub fn has_sound(&self) -> bool {
+        self.has_sound
     }
 
     /// From now on drawn the way `picker` draws.
@@ -253,7 +294,8 @@ impl Video {
     fn start_sound(&mut self, at: f64) {
         self.sound = None;
         if !self.muted && self.has_sound {
-            self.sound = Sound::start(&self.path, self.movie.clone(), at).map(|s| (s, Instant::now()));
+            self.sound =
+                Sound::start(&self.path, self.movie.clone(), at, self.volume.clone()).map(|s| (s, Instant::now()));
         }
     }
 
@@ -320,7 +362,9 @@ impl Video {
     pub fn next_due(&self) -> Option<Duration> {
         match (&self.clock, &self.queued) {
             (Clock::Playing { .. }, Some(next)) if !self.waiting => {
-                Some(Duration::from_secs_f64((next.at - self.position()).clamp(0.0, 1.0)))
+                let picture = Duration::from_secs_f64((next.at - self.position()).clamp(0.0, 1.0));
+                // The spectrum moves on between pictures, about 30 times a second
+                Some(if self.spectrum_area.height > 0 { picture.min(Duration::from_millis(33)) } else { picture })
             }
             // Waiting on the decoder, or the sound, to start
             (Clock::Playing { .. }, _) => Some(Duration::from_millis(10)),
@@ -350,11 +394,22 @@ impl Video {
         if area.width == 0 || area.height < 2 {
             return;
         }
-        let room = Rect::new(area.x, area.y, area.width, area.height - 1);
+        // The sound's spectrum goes under the bar, where there's room for it
+        let bars = match area.height {
+            _ if self.spectrum.is_none() => 0,
+            40.. => 8,
+            24.. => 6,
+            12.. => 4,
+            8.. => 2,
+            _ => 0,
+        };
+        let room = Rect::new(area.x, area.y, area.width, area.height - 1 - bars);
         let mut at = self.fit(room);
-        // The bar goes right under the picture, the two centered together
-        at.y = area.y + (area.height - at.height - 1) / 2;
+        // The bar goes right under the picture, the spectrum under that, all centered
+        // together
+        at.y = area.y + (area.height - at.height - 1 - bars) / 2;
         self.bar = Rect::new(area.x, at.y + at.height, area.width, 1);
+        self.spectrum_area = Rect::new(area.x, self.bar.y + 1, area.width, bars);
         self.picture_area = at;
         self.size_frames(at);
         match self.kitty.is_some() {
@@ -362,6 +417,7 @@ impl Video {
             false => self.draw_blocks(f, at),
         }
         self.draw_bar(f);
+        self.draw_spectrum(f);
     }
 
     /// Where the picture goes in `room`: as big as fits, keeping its shape, centered.
@@ -446,38 +502,138 @@ impl Video {
         }
     }
 
-    /// What the bar says before the line: whether it's playing, and the time. The
-    /// marks are text, as some terminals draw ⏸ as a wide emoji.
-    fn bar_label(&self) -> String {
+    /// What the bar says before its line, whether it's playing and the time, and whether
+    /// the volume control fits at its end. The marks are text, as some terminals draw ⏸
+    /// as a wide emoji.
+    fn bar_label(&self) -> (String, bool) {
         let mark = if self.playing() { "▶" } else { "‖" };
-        let muted = if self.muted && self.has_sound { "muted " } else { "" };
-        format!(" {mark} {} / {} {muted}", clock_time(self.position()), clock_time(self.duration))
+        let label = format!(" {mark} {} / {} ", clock_time(self.position()), clock_time(self.duration));
+        let width = unicode_width::UnicodeWidthStr::width(label.as_str());
+        let volume = self.has_sound
+            && self.failed.is_none()
+            && usize::from(self.bar.width) >= width + usize::from(VOLUME_WIDTH) + 12;
+        // Where the volume control doesn't fit, the label says the sound's off
+        if self.muted && self.has_sound && !volume { (label + "muted ", false) } else { (label, volume) }
+    }
+
+    /// Where the bar's line is: the column it starts at, and how long it is.
+    fn line(&self) -> (u16, u16) {
+        let (label, volume) = self.bar_label();
+        let left = unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+        let right = if volume { VOLUME_WIDTH } else { 1 };
+        (self.bar.x + left, self.bar.width.saturating_sub(left + right))
+    }
+
+    /// How much of a line `length` long has played.
+    fn played(&self, length: u16) -> u16 {
+        let done = if self.duration > 0.0 { self.position() / self.duration * f64::from(length) } else { 0.0 };
+        (done.round() as u16).min(length)
     }
 
     fn draw_bar(&self, f: &mut Screen) {
-        let at = self.position();
-        let left = self.bar_label();
-        let width = usize::from(self.bar.width);
-        let left_width = unicode_width::UnicodeWidthStr::width(left.as_str());
-        let mut spans = vec![Span::raw(left)];
+        let (label, volume) = self.bar_label();
+        let (_, length) = self.line();
+        let mut spans = vec![Span::raw(label)];
         if let Some(why) = &self.failed {
             spans.push(Span::styled(format!("stopped: {why}"), Style::default().add_modifier(Modifier::DIM)));
-        } else if width > left_width + 2 {
-            let room = width - left_width - 1;
-            let done = if self.duration > 0.0 { ((at / self.duration) * room as f64).round() as usize } else { 0 };
-            spans.push(Span::styled("━".repeat(done.min(room)), Style::default().fg(Color::Cyan)));
-            spans.push(Span::styled("─".repeat(room - done.min(room)), Style::default().add_modifier(Modifier::DIM)));
+        } else if length > 1 {
+            let done = self.played(length);
+            spans.push(Span::styled("━".repeat(usize::from(done)), Style::default().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                "─".repeat(usize::from(length - done)),
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            if volume {
+                spans.extend(self.volume_control());
+            }
         }
         f.render_widget(Paragraph::new(Line::from(spans)), self.bar);
     }
 
-    /// The time a click on the bar at column `x` goes to, if it's on the bar's line.
-    pub fn bar_time(&self, x: u16) -> Option<f64> {
-        let left = unicode_width::UnicodeWidthStr::width(self.bar_label().as_str()) as u16;
-        let start = self.bar.x + left;
-        let room = self.bar.width.saturating_sub(left + 1);
-        (x >= start && room > 0).then(|| f64::from((x - start).min(room)) / f64::from(room) * self.duration)
+    /// "sound" or "muted", and a step for each tenth of the volume, lit while the sound
+    /// is on.
+    fn volume_control(&self) -> Vec<Span<'static>> {
+        let steps = usize::from(self.volume.load(Ordering::Relaxed).div_ceil(VOLUME_STEP));
+        let mut spans = vec![Span::raw(if self.muted { " muted " } else { " sound " })];
+        for (i, step) in VOLUME_STEPS.iter().enumerate() {
+            spans.push(match (i < steps, self.muted) {
+                (true, false) => Span::styled(*step, Style::default().fg(Color::Cyan)),
+                (true, true) => Span::raw(*step),
+                (false, _) => Span::styled("·", Style::default().add_modifier(Modifier::DIM)),
+            });
+        }
+        spans.push(Span::raw(" "));
+        spans
     }
+
+    /// The time a click at column `x` of the bar goes to, if it's on the bar's line, or
+    /// just past its end, which is the end of the video.
+    pub fn bar_time(&self, x: u16) -> Option<f64> {
+        let (start, length) = self.line();
+        (length > 0 && (start..=start + length).contains(&x))
+            .then(|| f64::from(x - start) / f64::from(length) * self.duration)
+    }
+
+    /// What a click at column `x` of the bar does to the sound, if it's on the volume
+    /// control: on its label, the sound on or off; on its steps, the volume to that one.
+    /// Where the control doesn't fit, a click on "muted" in the bar turns the sound on.
+    pub fn volume_click(&self, x: u16) -> Option<VolumeClick> {
+        let (label, fits) = self.bar_label();
+        if !fits {
+            let end = self.bar.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
+            let on_muted = label.ends_with("muted ") && (end - 6..end - 1).contains(&x);
+            return on_muted.then_some(VolumeClick::Toggle);
+        }
+        // All of it is the control's, the spaces at its ends too: up to the label's end,
+        // the sound on or off; from just left of the first step (none at all) to just past
+        // the last (all of it), the volume
+        let at = x.checked_sub(self.bar.x + self.bar.width - VOLUME_WIDTH)?;
+        Some(match at.checked_sub(VOLUME_LABEL - 1) {
+            None => VolumeClick::Toggle,
+            Some(step) => VolumeClick::Set(step.min(VOLUME_STEPS.len() as u16) as u8 * VOLUME_STEP),
+        })
+    }
+
+    /// The sound's spectrum under the bar: a bar for each band of pitches, low ones on
+    /// the left, as high as they're loud, green at the bottom and red at the top.
+    fn draw_spectrum(&mut self, f: &mut Screen) {
+        let area = self.spectrum_area;
+        if area.height == 0 || area.width < 8 || self.failed.is_some() {
+            return;
+        }
+        let (at, playing) = (self.position(), self.playing());
+        let Some(spectrum) = &mut self.spectrum else { return };
+        // Two columns to a bar, and one between
+        let count = usize::from((area.width + 1) / 3);
+        let left = area.x + (area.width + 1 - count as u16 * 3) / 2;
+        let rows = area.height;
+        let buf = f.buffer_mut();
+        for (i, level) in spectrum.bars(at, count, playing).iter().enumerate() {
+            let eighths = (level * f32::from(rows * 8)).round() as u16;
+            for row in 0..rows {
+                let filled = usize::from(eighths.saturating_sub(row * 8).min(8));
+                if filled == 0 {
+                    break;
+                }
+                let style = Style::default().fg(bar_color(row, rows));
+                for x in [left + i as u16 * 3, left + i as u16 * 3 + 1] {
+                    if let Some(cell) = buf.cell_mut((x, area.y + rows - 1 - row)) {
+                        cell.set_symbol(EIGHTHS[filled]).set_style(style);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The color of the spectrum's bars `row` rows up of `rows`: green, then yellow, then red
+/// at the top.
+fn bar_color(row: u16, rows: u16) -> Color {
+    let t = f32::from(row) / f32::from(rows.saturating_sub(1).max(1));
+    let (from, to, t) =
+        if t < 0.5 { ((46, 204, 64), (240, 200, 40), t * 2.0) } else { ((240, 200, 40), (230, 60, 50), t * 2.0 - 1.0) };
+    let mix = |a: u8, b: u8| (f32::from(a) + (f32::from(b) - f32::from(a)) * t).round() as u8;
+    Color::Rgb(mix(from.0, to.0), mix(from.1, to.1), mix(from.2, to.2))
 }
 
 impl Drop for Video {
@@ -552,7 +708,7 @@ mod tests {
         let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(10, 20));
         picker.set_protocol_type(ProtocolType::Kitty);
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
-        let mut video = Video::open(&path, &picker).unwrap();
+        let mut video = Video::open(&path, &picker, Arc::new(AtomicU8::new(100))).unwrap();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
         video.play();
         let mut sent = Vec::new();
@@ -569,6 +725,13 @@ mod tests {
         assert_eq!(sent.len(), 3, "{sent:?}");
         assert_ne!(sent[0], sent[1]);
         assert_eq!(sent[0], sent[2]);
+    }
+
+    #[test]
+    fn a_video_without_sound_has_no_spectrum() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/pyramid.mp4");
+        let video = Video::open(&path, &Picker::halfblocks(), Arc::default()).unwrap();
+        assert!(!video.has_sound() && video.spectrum.is_none());
     }
 
     #[test]

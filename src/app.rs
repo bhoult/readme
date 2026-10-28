@@ -7,6 +7,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicU8, Ordering},
+    },
     time::{Duration, Instant, SystemTime},
 };
 
@@ -37,8 +41,8 @@ use crate::{
         Place, char_at_col_from, display_col, display_col_from, find_all, line_spans, printable, push_span, row_of,
         search, slice_line, split_at_width, str_width, tail_width, wider_than, wrap_points,
     },
-    tree::{NoWayUp, Tree},
-    video::{self, Video},
+    tree::{NoWayUp, Sort, Tree},
+    video::{self, Video, VolumeClick},
 };
 
 const MESSAGE_FOR: Duration = Duration::from_secs(4);
@@ -168,6 +172,23 @@ fn disk_stamp(path: &Path) -> (Option<SystemTime>, u64) {
 }
 
 impl Doc {
+    /// What the header says about it: "120 lines", and for a file from disk, its size and
+    /// when it was changed, as they were when it was read or last saved.
+    fn facts(&self) -> Vec<String> {
+        // An empty file reads in as one empty line, as does one with just a newline, which
+        // only the size on disk tells apart: one from history or an archive counts as empty
+        let lines = match self.buf.lines.as_slice() {
+            [only] if only.is_empty() && (self.source != Source::Disk || self.disk.1 == 0) => 0,
+            lines => lines.len(),
+        };
+        let mut facts = vec![format!("{} line{}", grouped(lines), if lines == 1 { "" } else { "s" })];
+        if self.source == Source::Disk {
+            facts.push(human_size(self.disk.1));
+            facts.extend(self.disk.0.map(date));
+        }
+        facts
+    }
+
     fn new(path: &Path, buf: Buffer, wrap: bool, source: Source, label: Option<String>) -> Self {
         let kind = kind_of(path);
         let mut doc = Self {
@@ -524,6 +545,7 @@ enum Shown {
 struct VideoShown {
     path: PathBuf,
     bytes: u64,
+    modified: Option<SystemTime>,
     video: Video,
 }
 
@@ -745,8 +767,19 @@ enum Target {
 /// What to do once unsaved changes are dealt with.
 enum After {
     Quit,
-    /// Open a file, and with true pass a web page or video on to the browser or player
-    Open(PathBuf, bool),
+    Open(PathBuf, Then),
+}
+
+/// What happens to a file once it's opened here.
+#[derive(Clone, Copy)]
+enum Then {
+    /// Nothing more
+    Stay,
+    /// A video readme plays starts playing
+    Play,
+    /// A web page or a video goes to the browser or the video player too, and a video
+    /// playing here pauses: what Enter does, and only Enter
+    Outside,
 }
 
 /// A preview put off while more moving is queued up: holding ↓ through a folder of big
@@ -759,7 +792,9 @@ enum Preview {
     Grep,
 }
 
-/// Keys that move a list's selection, each one putting off the preview again.
+/// Keys that move a list's selection, each one putting off the preview again: `m` marks
+/// a row and moves on. Space isn't one: it plays the video the selection is on, so that
+/// one is shown first.
 fn moves(key: &KeyEvent) -> bool {
     !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         && matches!(
@@ -770,7 +805,7 @@ fn moves(key: &KeyEvent) -> bool {
                 | KeyCode::PageDown
                 | KeyCode::Home
                 | KeyCode::End
-                | KeyCode::Char('j' | 'k' | 'g' | 'G' | ' ')
+                | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'm')
         )
 }
 
@@ -808,6 +843,9 @@ pub struct App {
     fetch: Option<git::Fetch>,
     fetched: HashMap<PathBuf, Instant>,
     picker: Picker,
+    /// Videos' volume, in percent: kept from one to the next, and followed by the sound
+    /// of the one playing
+    volume: Arc<AtomicU8>,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
     /// The left pane shows the matches of a search through all the files
@@ -856,6 +894,7 @@ impl App {
             fetch: None,
             fetched: HashMap::new(),
             picker: Picker::halfblocks(),
+            volume: Arc::new(AtomicU8::new(100)),
             gallery_stash: None,
             grep: None,
             last_grep: String::new(),
@@ -989,14 +1028,14 @@ impl App {
     fn open(&mut self, path: &Path) {
         self.shown = if path.exists() {
             if external::is_video(path) && path.is_file() {
-                let size = fs::metadata(path).map_or(0, |m| m.len());
-                match Video::open(path, &self.picker) {
-                    Ok(video) => Shown::Video(Box::new(VideoShown { path: path.into(), bytes: size, video })),
+                let (modified, size) = disk_stamp(path);
+                match Video::open(path, &self.picker, self.volume.clone()) {
+                    Ok(video) => Shown::Video(Box::new(VideoShown { path: path.into(), bytes: size, modified, video })),
                     Err(why) => Shown::Note(
                         path.into(),
                         format!(
                             "Video, {}.\nreadme can't play this one: {why}.\n\
-                             Click it, or press Enter, to open it in the video player.",
+                             Press Enter to open it in the video player.",
                             human_size(size)
                         ),
                     ),
@@ -1092,18 +1131,28 @@ impl App {
         self.focus = Focus::Content;
     }
 
-    /// Opens `path`, asking first what to do with unsaved changes.
-    /// Opens `path`, asking first about unsaved changes. With `hand_off`, a web page or a
-    /// video also goes to the browser or player, once it's opened here.
-    fn request_open(&mut self, path: PathBuf, hand_off: bool) {
+    /// Opens `path`, asking first about unsaved changes, and then does `then` with it.
+    fn request_open(&mut self, path: PathBuf, then: Then) {
         if !self.showing(&path) {
             if self.dirty() {
-                return self.prompt = Some(Prompt::Unsaved(After::Open(path, hand_off)));
+                return self.prompt = Some(Prompt::Unsaved(After::Open(path, then)));
             }
             self.open(&path);
         }
-        if hand_off {
-            self.hand_off(&path);
+        self.then(&path, then);
+    }
+
+    fn then(&mut self, path: &Path, then: Then) {
+        match then {
+            Then::Stay => {}
+            Then::Play => {
+                if let Shown::Video(shown) = &mut self.shown
+                    && shown.path == path
+                {
+                    shown.video.play();
+                }
+            }
+            Then::Outside => self.open_outside(path),
         }
     }
 
@@ -1118,11 +1167,9 @@ impl App {
     fn proceed(&mut self, after: After) {
         match after {
             After::Quit => self.quit = true,
-            After::Open(path, hand_off) => {
+            After::Open(path, then) => {
                 self.open(&path);
-                if hand_off {
-                    self.hand_off(&path);
-                }
+                self.then(&path, then);
             }
         }
     }
@@ -1419,9 +1466,19 @@ impl App {
                 }
                 self.filtering = true;
             }
-            KeyCode::Char(' ') => {
+            KeyCode::Char('m') => {
                 self.tree.toggle_mark(self.tree.selected);
                 self.tree_move(1);
+            }
+            KeyCode::Char('s') => {
+                let sort = self.tree.sort.next();
+                self.tree.set_sort(sort);
+                self.say(format!("Sorted {}", sort.label()));
+            }
+            KeyCode::Char(' ') => {
+                if let Shown::Video(shown) = &mut self.shown {
+                    shown.video.toggle();
+                }
             }
             KeyCode::Delete => self.request_trash(),
             KeyCode::F(2) => self.request_rename(),
@@ -2213,7 +2270,7 @@ impl App {
             self.tree_up();
         } else if !is_dir {
             self.focus = Focus::Content;
-            self.request_open(path, true);
+            self.request_open(path, if enter { Then::Outside } else { Then::Play });
         } else if archive && self.tree.filter.is_some() {
             // The filter doesn't look inside archives, so open it in the full tree
             self.tree.set_filter(None);
@@ -2233,22 +2290,24 @@ impl App {
             && external::is_video(path)
         {
             let path = path.clone();
-            return self.hand_off(&path);
+            return self.open_outside(&path);
         }
         if let Shown::Video(shown) = &mut self.shown {
             let video = &mut shown.video;
             match key.code {
-                KeyCode::Char(' ') | KeyCode::Enter => video.toggle(),
+                KeyCode::Char(' ') => video.toggle(),
+                KeyCode::Enter | KeyCode::Char('o') => {
+                    let path = shown.path.clone();
+                    self.open_outside(&path);
+                }
                 KeyCode::Left | KeyCode::Char('h') => video.seek_by(-video::STEP),
                 KeyCode::Right | KeyCode::Char('l') => video.seek_by(video::STEP),
                 KeyCode::Up | KeyCode::Char('k') => video.seek_by(video::BIG_STEP),
                 KeyCode::Down | KeyCode::Char('j') => video.seek_by(-video::BIG_STEP),
                 KeyCode::Home | KeyCode::Char('0' | 'g') => video.seek(0.0),
                 KeyCode::Char('m') => video.toggle_mute(),
-                KeyCode::Char('o') => {
-                    let path = shown.path.clone();
-                    self.open_outside(&path);
-                }
+                KeyCode::Char('+' | '=') => self.change_volume(10),
+                KeyCode::Char('-' | '_') => self.change_volume(-10),
                 KeyCode::Char('H') => self.toggle_history(),
                 KeyCode::Char('B') => self.toggle_branches(),
                 KeyCode::Esc => self.focus = Focus::Tree,
@@ -2689,7 +2748,10 @@ impl App {
                     self.tree.scroll = self.tree.scroll.saturating_add_signed(delta).min(max);
                 } else if self.content_area.contains(at) {
                     let (page, width) = (self.page(), self.text_width());
-                    if let Shown::Gallery(gallery) = &mut self.shown {
+                    if let Shown::Video(_) = &self.shown {
+                        // The wheel turns a video's sound up or down
+                        self.change_volume(if delta < 0 { 5 } else { -5 });
+                    } else if let Shown::Gallery(gallery) = &mut self.shown {
                         if mouse.modifiers.contains(KeyModifiers::CONTROL) {
                             gallery.resize(if delta < 0 { 25 } else { -25 });
                         } else {
@@ -2997,7 +3059,7 @@ impl App {
             }
             self.show_gallery(&path);
         } else {
-            self.request_open(path, !double);
+            self.request_open(path, if double { Then::Stay } else { Then::Play });
             if double {
                 self.focus = Focus::Content;
             }
@@ -3017,18 +3079,6 @@ impl App {
             }
             Ok(()) => {}
         }
-    }
-
-    /// Plays a video here, or else opens a web page in the browser, or a video readme
-    /// can't play in the video player, as well as showing it here. Only on a click or
-    /// Enter, not while the selection moves past, and only for files on disk.
-    fn hand_off(&mut self, path: &Path) {
-        if let Shown::Video(shown) = &mut self.shown
-            && shown.path == path
-        {
-            return shown.video.play();
-        }
-        self.open_outside(path);
     }
 
     /// Opens a web page in the browser, or a video in the video player.
@@ -3052,19 +3102,48 @@ impl App {
         }
     }
 
+    /// Turns a video's sound up or down by `step` percent.
+    fn change_volume(&mut self, step: i16) {
+        let volume = i16::from(self.volume.load(Ordering::Relaxed));
+        self.set_volume((volume + step).clamp(0, 100) as u8);
+    }
+
+    /// Sets the volume of the video shown, and the ones after it, saying what it is now.
+    fn set_volume(&mut self, volume: u8) {
+        let Shown::Video(shown) = &self.shown else { return };
+        if !shown.video.has_sound() {
+            return self.say("This video has no sound readme can play");
+        }
+        self.volume.store(volume, Ordering::Relaxed);
+        let off = match (shown.video.muted, self.focus) {
+            (false, _) => "",
+            // In the tree, m marks a file
+            (true, Focus::Tree) => ", with the sound off",
+            (true, Focus::Content) => ", with the sound off: m turns it on",
+        };
+        self.say(format!("Volume {volume}%{off}"));
+    }
+
     fn content_click(&mut self, x: u16, y: u16, double: bool, shift: bool) {
+        // Only Enter opens other programs
         if let Shown::Note(path, _) = &self.shown
             && external::is_video(path)
+            && path.is_file()
         {
-            let path = path.clone();
-            return self.hand_off(&path);
+            return self.say("Enter opens it in the video player");
         }
         if let Shown::Video(shown) = &mut self.shown {
             let video = &mut shown.video;
-            // On the bar, to that time; anywhere else, play or pause
-            match video.bar_time(x).filter(|_| y == video.bar.y) {
-                Some(at) => video.seek(at),
-                None => video.toggle(),
+            // On the volume control, the sound; on the bar, to that time; anywhere else,
+            // play or pause
+            let on_bar = y == video.bar.y;
+            let volume = video.volume_click(x).filter(|_| on_bar);
+            let time = video.bar_time(x).filter(|_| on_bar);
+            match (volume, time) {
+                (Some(VolumeClick::Toggle), _) => video.toggle_mute(),
+                (Some(VolumeClick::Set(volume)), _) => self.set_volume(volume),
+                (None, Some(at)) => video.seek(at),
+                (None, None) => video.toggle(),
             }
             return;
         }
@@ -3137,6 +3216,11 @@ impl App {
         self.settle();
         let area = f.area();
         if area.width < 30 || area.height < 5 {
+            // A video playing on unseen keeps taking its pictures as they come due, or the
+            // wait for the next one would be none at all, and the loop would spin
+            if let Shown::Video(shown) = &mut self.shown {
+                shown.video.poll();
+            }
             f.render_widget(Paragraph::new("Too small"), area);
             return;
         }
@@ -3181,13 +3265,23 @@ impl App {
 
     fn draw_tree(&mut self, f: &mut Frame, header_area: Rect) {
         let focused = self.focus == Focus::Tree;
-        let flag = match self.tree.hidden {
-            _ if self.tree.show_hidden => "all ".to_string(),
+        let mut flags = Vec::new();
+        if self.tree.sort != Sort::Name {
+            flags.push(self.tree.sort.label().to_string());
+        }
+        match self.tree.hidden {
+            _ if self.tree.show_hidden => flags.push("all".into()),
             // The count is of the top folder, which the filter's matches replace
-            _ if self.tree.filtering() => String::new(),
-            0 => String::new(),
-            n => format!("{n} hidden "),
-        };
+            _ if self.tree.filtering() => {}
+            0 => {}
+            n => flags.push(format!("{n} hidden")),
+        }
+        // Beside the order, the hidden count gives way where the two would leave the
+        // folder's name no room
+        if flags.len() > 1 && str_width(&flags.join(" · ")) + 12 > usize::from(header_area.width) {
+            flags.pop();
+        }
+        let flag = if flags.is_empty() { String::new() } else { format!("{} ", flags.join(" · ")) };
         header(f, header_area, &format!(" {}", tilde(&self.tree.root)), &flag, focused);
 
         let words: Vec<String> = match &self.tree.filter {
@@ -3520,12 +3614,16 @@ impl App {
             }
             Shown::Image(image) => {
                 let title = image.label.clone().unwrap_or_else(|| format!(" {}", relative(&image.path, &root)));
-                header(f, area, &title, &format!("{} · {} ", image.picture.info, human_size(image.bytes)), focused);
+                let facts = [Some(human_size(image.bytes)), image.disk.0.map(date)].into_iter().flatten().collect();
+                let right = header_right(&title, &[&image.picture.info], facts, area.width);
+                header(f, area, &title, &right, focused);
                 image.picture.draw(f, body);
             }
             Shown::Video(shown) => {
                 let title = format!(" {}", relative(&shown.path, &root));
-                header(f, area, &title, &format!("{} · {} ", shown.video.info, human_size(shown.bytes)), focused);
+                let facts = [Some(human_size(shown.bytes)), shown.modified.map(date)].into_iter().flatten().collect();
+                let right = header_right(&title, &[&shown.video.info], facts, area.width);
+                header(f, area, &title, &right, focused);
                 shown.video.draw(f, body);
             }
             Shown::Gallery(gallery) => {
@@ -3573,8 +3671,8 @@ impl App {
                     _ => None,
                 };
                 flags.extend(more);
-                let flags = if flags.is_empty() { String::new() } else { format!("{} ", flags.join(" · ")) };
-                header(f, area, &title, &flags, focused);
+                let right = header_right(&title, &flags, doc.facts(), area.width);
+                header(f, area, &title, &right, focused);
             }
         }
     }
@@ -3654,14 +3752,18 @@ impl App {
             }
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) if !self.tree.marks.is_empty() => {
-                "Space mark · drag onto a folder to move · Del trash · Esc unmark"
+                "m mark · drag onto a folder to move · Del trash · Esc unmark"
+            }
+            // On the video, not a folder it stays shown beside, which Enter folds
+            (Shown::Video(shown), Focus::Tree) if self.tree.selected_entry().is_some_and(|r| r.path == shown.path) => {
+                "Space play/pause · ⏎ video player · ↑↓ move · m mark · Del trash · F2 rename · ? help · q quit"
             }
             (_, Focus::Tree) => {
-                "? help · ↑↓ move · ⏎ open · F find in files · H git history · B branches · / filter · Space mark · Del trash · F2 rename · q quit"
+                "? help · ↑↓ move · ⏎ open · s sort · / filter · F find in files · H git history · B branches · m mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Video(_), _) => {
-                "Space play/pause · ←→ 5 s · ↑↓ 1 min · Home start · m sound · o video player · Esc tree · q quit"
+                "Space play/pause · ⏎ video player · ←→ 5 s · ↑↓ 1 min · Home start · m sound · +/- volume · Esc tree · q quit"
             }
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
                 "wheel or +/- zoom · 0 fit · drag to move · Esc back to the thumbnails · ← tree"
@@ -3848,12 +3950,32 @@ fn draw_source(f: &mut Frame, doc: &mut Doc, area: Rect, focused: bool, search: 
     gutter
 }
 
-/// A one-line pane title, reversed when the pane has the focus.
+/// What a header says on its right: `always`, then as many of `facts` as leave room for
+/// the start of `title` in a pane `width` wide, the last of them giving way first.
+fn header_right(title: &str, always: &[&str], mut facts: Vec<String>, width: u16) -> String {
+    let keep = str_width(title).min(24) + 1;
+    loop {
+        let parts: Vec<&str> = always.iter().copied().chain(facts.iter().map(String::as_str)).collect();
+        let right = if parts.is_empty() { String::new() } else { format!("{} ", parts.join(" · ")) };
+        if facts.is_empty() || str_width(&right) + keep <= usize::from(width) {
+            return right;
+        }
+        facts.pop();
+    }
+}
+
+/// Pane titles' backgrounds, which set them apart from what's under them: blue for the
+/// pane with the focus, gray for the other. They're from the 256 colors, which more
+/// terminals show than 24-bit color, and which themes leave as they are.
+const TITLE_FOCUSED: Color = Color::Indexed(24);
+const TITLE: Color = Color::Indexed(237);
+
+/// A one-line pane title.
 fn header(f: &mut Frame, area: Rect, title: &str, right: &str, focused: bool) {
     let style = if focused {
-        Style::new().add_modifier(Modifier::REVERSED | Modifier::BOLD)
+        Style::new().fg(Color::Indexed(231)).bg(TITLE_FOCUSED).add_modifier(Modifier::BOLD)
     } else {
-        Style::new().add_modifier(Modifier::BOLD | Modifier::DIM)
+        Style::new().fg(Color::Indexed(251)).bg(TITLE).add_modifier(Modifier::BOLD)
     };
     let width = area.width as usize;
     // A space always parts the title from what's on the right
@@ -3962,6 +4084,24 @@ fn human_size(bytes: u64) -> String {
         b if b < 1 << 20 => format!("{:.1} KB", b as f64 / 1024.0),
         b => format!("{:.1} MB", b as f64 / (1 << 20) as f64),
     }
+}
+
+/// "12,345".
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, digit) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// "2026-10-27 18:32": when a file was changed, in local time.
+fn date(time: SystemTime) -> String {
+    help::local_time(time.duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs()))
 }
 
 #[cfg(test)]
@@ -4116,6 +4256,54 @@ mod tests {
         assert!(screen.contains("Some bold words."), "{screen}");
         assert!(!screen.contains("**"), "{screen}");
         assert!(screen.contains("▸ src"), "{screen}");
+    }
+
+    #[test]
+    fn counts_are_grouped_in_thousands() {
+        assert_eq!([0, 999, 1000, 1_234_567].map(grouped), ["0", "999", "1,000", "1,234,567"]);
+    }
+
+    #[test]
+    fn a_files_header_gives_its_lines_size_and_date_on_a_color_of_its_own() {
+        let mut h = Harness::new(&[("a.txt", "one\ntwo\nthree\n"), ("empty.txt", "")]);
+        let (x, y) = h.find("a.txt");
+        h.click(x, y);
+        let changed = date(fs::metadata(h.root.join("a.txt")).unwrap().modified().unwrap());
+        assert!(h.row(0).contains(" a.txt "), "{}", h.screen());
+        assert!(h.row(0).contains(&format!("3 lines · 14 bytes · {changed} ")), "{}", h.screen());
+        // Blue with the focus, gray without
+        let (x, _) = h.find(" a.txt");
+        let background = |h: &Harness| h.term.backend().buffer()[(x, 0)].bg;
+        let expected = |h: &Harness| if h.app.focus == Focus::Content { TITLE_FOCUSED } else { TITLE };
+        assert_eq!(background(&h), expected(&h));
+        h.key(KeyCode::Tab);
+        assert_eq!(background(&h), expected(&h));
+        // An empty file has no lines
+        let (x, y) = h.find("empty.txt");
+        h.click(x, y);
+        assert!(h.row(0).contains("0 lines · 0 bytes · "), "{}", h.screen());
+    }
+
+    #[test]
+    fn s_sorts_the_tree_and_its_header_says_how() {
+        let big = "x".repeat(5000);
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("big.txt", &big), (".hidden", "")]);
+        let a_first = |h: &Harness| h.find("a.txt").1 < h.find("big.txt").1;
+        assert!(a_first(&h), "{}", h.screen());
+        let name = h.root.file_name().unwrap().to_string_lossy().into_owned();
+        let end_of_name = &name[name.len() - 4..];
+        assert!(h.row(0).contains("1 hidden ") && h.row(0).contains(end_of_name), "{}", h.screen());
+        h.key(KeyCode::Char('s'));
+        assert!(h.screen().contains("Sorted biggest first"), "{}", h.screen());
+        assert!(h.row(0).contains("biggest first "), "{}", h.screen());
+        assert!(!a_first(&h), "{}", h.screen());
+        // In the narrow tree, the hidden count gives way so the folder's name still shows
+        assert!(!h.row(0).contains("hidden") && h.row(0).contains(end_of_name), "{}", h.screen());
+        for _ in 0..3 {
+            h.key(KeyCode::Char('s'));
+        }
+        assert!(h.screen().contains("Sorted by name"), "{}", h.screen());
+        assert!(a_first(&h) && !h.row(0).contains("by name"), "{}", h.screen());
     }
 
     #[test]
@@ -4371,7 +4559,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_a_videos_note_plays_it() {
+    fn enter_on_a_videos_note_opens_the_video_player() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "\0\0\0\x18ftypmp42")]);
         h.key(KeyCode::Down);
         h.key(KeyCode::Tab);
@@ -4421,6 +4609,39 @@ mod tests {
         assert!(h.app.shown_path().is_none(), "nothing read while the keys come in");
         h.draw();
         assert!(h.screen().contains("ccc"), "{}", h.screen());
+    }
+
+    /// A key as it comes in, before anything's drawn.
+    fn press(code: KeyCode) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
+    #[test]
+    fn marking_a_run_of_files_reads_only_where_it_stops() {
+        let mut h = Harness::new(&[("a.txt", "aaa\n"), ("b.txt", "bbb\n"), ("c.txt", "ccc\n")]);
+        h.app.handle(press(KeyCode::Char('m')));
+        h.app.handle(press(KeyCode::Char('m')));
+        assert!(h.app.shown_path().is_none(), "nothing read while the keys come in");
+        h.draw();
+        assert!(h.screen().contains("ccc"), "{}", h.screen());
+        assert_eq!(h.screen().matches('●').count(), 2, "{}", h.screen());
+    }
+
+    #[test]
+    fn space_plays_the_video_the_selection_has_just_moved_to() {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "")]);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
+        fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
+        // ↓ and Space come in together, before the video's been shown
+        h.app.handle(press(KeyCode::Down));
+        h.app.handle(press(KeyCode::Char(' ')));
+        h.draw();
+        assert!(h.screen().contains("▶ 0:00"), "{}", h.screen());
     }
 
     #[test]
@@ -4580,16 +4801,17 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_web_page_opens_the_browser() {
+    fn only_enter_opens_a_web_page_in_the_browser() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("page.html", "<h1>Hi</h1>\n")]);
-        // Arrowing past it only shows the source
+        // Arrowing past it, or clicking it, only shows the source
         h.key(KeyCode::Down);
         h.key(KeyCode::Down);
         assert!(h.screen().contains("<h1>Hi</h1>"), "{}", h.screen());
-        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
         // The tree's row, not the file pane's title
         let (x, y) = h.find("  page.html");
         h.click(x + 2, y);
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        h.key(KeyCode::Enter);
         let opened = external::OPENED.with(|o| o.borrow().clone());
         assert_eq!(opened, vec![h.root.join("page.html")]);
         assert!(h.screen().contains("Opened page.html in the browser"), "{}", h.screen());
@@ -4642,14 +4864,19 @@ mod tests {
     }
 
     #[test]
-    fn clicking_a_video_plays_it() {
+    fn a_video_readme_cant_play_goes_to_the_video_player_only_on_enter() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "\0\0\0\x18ftypmp42")]);
         h.key(KeyCode::Down);
         h.key(KeyCode::Down);
-        assert!(h.screen().contains("Video, "), "{}", h.screen());
-        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        assert!(h.screen().contains("Press Enter to open it in the video player"), "{}", h.screen());
+        // Clicking it in the tree, or its note, doesn't
         let (x, y) = h.find("  clip.mp4");
         h.click(x + 2, y);
+        let (x, y) = h.find("Press Enter");
+        h.click(x, y);
+        assert!(h.screen().contains("Enter opens it in the video player"), "{}", h.screen());
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        h.key(KeyCode::Enter);
         assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
         assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
     }
@@ -4681,8 +4908,8 @@ mod tests {
         assert!(blocks.iter().filter(|c| near(**c, RED)).count() > blocks.len() / 2);
         assert!(blocks.iter().any(|c| near(*c, (255, 255, 255))));
         assert!(external::OPENED.with(|o| o.borrow().is_empty()));
-        // Enter plays it, here, through to its last picture, blue, and stops there
-        h.key(KeyCode::Enter);
+        // Space plays it, from the tree, through to its last picture, blue, and stops there
+        h.key(KeyCode::Char(' '));
         assert!(h.screen().contains("▶ 0:00 / 0:01"), "{}", h.screen());
         assert!(external::OPENED.with(|o| o.borrow().is_empty()));
         h.draw_until(|h| h.screen().contains("‖"));
@@ -4697,21 +4924,143 @@ mod tests {
     }
 
     #[test]
+    fn enter_on_a_video_opens_the_video_player_and_pauses_it_here() {
+        let mut h = showing_video("clip.mp4");
+        h.draw_until(|h| !h.blocks().is_empty());
+        h.key(KeyCode::Char(' '));
+        assert!(h.screen().contains("▶ 0:0"), "{}", h.screen());
+        h.key(KeyCode::Enter);
+        assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
+        assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
+        assert!(h.screen().contains(" ‖ 0:0"), "{}", h.screen());
+        // The same in the video's pane, where Enter left the focus
+        assert_eq!(h.app.focus, Focus::Content);
+        h.key(KeyCode::Char(' '));
+        assert!(h.screen().contains("▶ 0:0"), "{}", h.screen());
+        h.key(KeyCode::Enter);
+        assert_eq!(external::OPENED.with(|o| o.borrow().len()), 2);
+        assert!(h.screen().contains(" ‖ 0:0"), "{}", h.screen());
+    }
+
+    #[test]
     fn a_video_starts_with_its_sound_off() {
         let mut h = showing_video("clip.mp4");
         h.key(KeyCode::Tab);
         h.draw_until(|h| !h.blocks().is_empty());
-        assert!(h.screen().contains("0:01 muted"), "{}", h.screen());
+        assert!(h.screen().contains(" muted ▁▂▂▃▄▅▅▆▇█ "), "{}", h.screen());
         // m turns it on, and off again
         h.key(KeyCode::Char('m'));
+        assert!(h.screen().contains(" sound ▁▂▂▃▄▅▅▆▇█ "), "{}", h.screen());
         assert!(!h.screen().contains("muted"), "{}", h.screen());
         h.key(KeyCode::Char('m'));
-        assert!(h.screen().contains("0:01 muted"), "{}", h.screen());
-        // A video without sound doesn't say it's muted
+        assert!(h.screen().contains(" muted ▁"), "{}", h.screen());
+        // A video without sound has no volume control, and doesn't say it's muted
         let mut h = showing_video("pyramid.mp4");
         h.draw_until(|h| !h.blocks().is_empty());
         assert!(h.screen().contains("no sound"), "{}", h.screen());
+        assert!(!h.screen().contains("muted") && !h.screen().contains("sound ▁"), "{}", h.screen());
+        // or turn its volume, which stays as it was for the next
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('-'));
+        assert!(h.screen().contains("This video has no sound readme can play"), "{}", h.screen());
+        assert_eq!(h.app.volume.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn a_videos_volume_goes_up_and_down_and_stays_for_the_next() {
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        // Down two steps and up one, with the sound still off
+        h.key(KeyCode::Char('-'));
+        h.key(KeyCode::Char('-'));
+        h.key(KeyCode::Char('+'));
+        assert!(h.screen().contains("Volume 90%, with the sound off: m turns it on"), "{}", h.screen());
+        assert!(h.screen().contains(" muted ▁▂▂▃▄▅▅▆▇· "), "{}", h.screen());
+        // A click on the control's label turns the sound on, and one on a step sets the
+        // volume to it
+        let (x, y) = h.find(" muted ▁");
+        h.click(x + 1, y);
+        assert!(h.screen().contains(" sound ▁▂▂▃▄▅▅▆▇· "), "{}", h.screen());
+        h.click(x + 9, y);
+        assert!(h.screen().contains("Volume 30%"), "{}", h.screen());
+        assert!(h.screen().contains(" sound ▁▂▂······· "), "{}", h.screen());
+        // The wheel turns it up
+        h.mouse(MouseEventKind::ScrollUp, x + 9, y);
+        assert!(h.screen().contains("Volume 35%"), "{}", h.screen());
+        // The next video plays at that volume, its sound off to start with
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Up);
+        h.key(KeyCode::Down);
+        h.draw_until(|h| h.screen().contains(" muted ▁"));
+        assert!(h.screen().contains(" muted ▁▂▂▃······ "), "{}", h.screen());
+        // From the tree, where m marks, the wheel doesn't say m turns the sound on
+        h.mouse(MouseEventKind::ScrollUp, x + 9, y);
+        assert!(h.screen().contains("Volume 40%, with the sound off"), "{}", h.screen());
+        assert!(!h.screen().contains("m turns it on"), "{}", h.screen());
+    }
+
+    #[test]
+    fn the_hints_offer_the_video_player_only_on_the_video() {
+        let mut h = Harness::new(&[("docs/notes.md", "x\n"), ("clip.mp4", "")]);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
+        fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
+        h.key(KeyCode::Down);
+        assert!(h.row(19).contains("⏎ video player"), "{}", h.screen());
+        // On the folder above, the video stays, and Enter opens the folder
+        h.key(KeyCode::Up);
+        assert!(h.screen().contains("‖ 0:00"), "{}", h.screen());
+        assert!(h.row(19).contains("⏎ open") && !h.row(19).contains("video player"), "{}", h.screen());
+    }
+
+    #[test]
+    fn clicks_beside_the_volume_steps_and_on_muted_go_to_the_sound() {
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        h.key(KeyCode::Char('-'));
+        // Just past the loudest step is all of it, and the space before the label is the
+        // label's: neither goes to the end of the video
+        let (x, y) = h.find(" muted ▁");
+        h.click(x + 17, y);
+        assert!(h.screen().contains("Volume 100%"), "{}", h.screen());
+        h.click(x, y);
+        assert!(h.screen().contains(" sound ▁▂▂▃▄▅▅▆▇█ "), "{}", h.screen());
+        assert!(h.screen().contains("‖ 0:00 / 0:01"), "{}", h.screen());
+        // Where the pane's too narrow for the control, "muted" in the bar turns it on
+        h.key(KeyCode::Char('m'));
+        let divider = h.app.divider_x;
+        h.mouse(MouseEventKind::Down(MouseButton::Left), divider, 3);
+        h.mouse(MouseEventKind::Drag(MouseButton::Left), 45, 3);
+        h.mouse(MouseEventKind::Up(MouseButton::Left), 45, 3);
+        let (x, y) = h.find("0:01 muted ─");
+        h.click(x + 5, y);
         assert!(!h.screen().contains("muted"), "{}", h.screen());
+        assert!(h.screen().contains("‖ 0:00 / 0:01"), "{}", h.screen());
+    }
+
+    #[test]
+    fn a_videos_sound_shows_as_a_spectrum_under_its_bar() {
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        // Half way through, its tone shows in bars over the four rows under the bar,
+        // green at the bottom
+        let (_, bar) = h.find("‖ 0:00 / 0:01");
+        let row = h.row(bar);
+        let line: Vec<usize> = row.chars().enumerate().filter(|(_, c)| *c == '─').map(|(i, _)| i).collect();
+        h.click(((line[0] + line[line.len() - 1]) / 2) as u16, bar);
+        let lit = |h: &Harness, y: u16| -> Vec<u16> {
+            h.row(y).chars().enumerate().filter(|(_, c)| "▁▂▃▄▅▆▇█".contains(*c)).map(|(x, _)| x as u16).collect()
+        };
+        h.draw_until(|h| !lit(h, bar + 4).is_empty());
+        let bottom = lit(&h, bar + 4);
+        assert!(!bottom.is_empty(), "{}", h.screen());
+        assert_eq!(h.term.backend().buffer()[(bottom[0], bar + 4)].fg, Color::Rgb(46, 204, 64));
+        assert!(h.screen().contains("‖ 0:00 / 0:01"), "still paused, at 0.6 s:\n{}", h.screen());
+        // A click on the bars plays it, as on the picture
+        h.click(bottom[0], bar + 4);
+        assert!(h.screen().contains("▶"), "{}", h.screen());
     }
 
     #[test]
@@ -4821,8 +5170,11 @@ mod tests {
     #[test]
     fn marked_files_go_to_the_trash() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
+        // m marks, and Space doesn't
         h.key(KeyCode::Char(' '));
-        h.key(KeyCode::Char(' '));
+        assert!(!h.screen().contains('●'), "{}", h.screen());
+        h.key(KeyCode::Char('m'));
+        h.key(KeyCode::Char('m'));
         assert_eq!(h.screen().matches('●').count(), 2, "{}", h.screen());
         h.key(KeyCode::Delete);
         assert!(h.screen().contains("Move 2 items to the trash?"), "{}", h.screen());
@@ -5371,7 +5723,7 @@ mod tests {
         assert!(screen.contains("Features") && screen.contains("Tree of the folder"), "{screen}");
         assert!(h.app.focus == Focus::Content);
         h.key(KeyCode::PageDown);
-        assert!(h.screen().contains("Git branches: whose each one is"), "{}", h.screen());
+        assert!(h.screen().contains("Git history of any file or folder"), "{}", h.screen());
         h.key(KeyCode::End);
         assert!(h.screen().contains("README_IMAGES"), "{}", h.screen());
         h.key(KeyCode::Char('e'));
