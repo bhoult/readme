@@ -96,7 +96,7 @@ Keys
                s sort: by name, biggest, oldest or newest first
                F find text in all the files (Esc back to the tree)
                . hidden files · r refresh · H git history · B branches
-               m mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
+               x mark (Ctrl+click, Shift+↑↓ for a range) · Del to trash
                F2 rename · drag marked files onto a folder to move them
   File         ↑↓ PgUp PgDn Home End scroll · ← back to the tree
                / search, n/N next/prev
@@ -106,8 +106,8 @@ Keys
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
-  Videos       play once chosen · Space pause/play (in the tree too) · ←→ 5 s
-               ↑↓ 1 min · Home start · m sound · +/- volume · Esc back
+  Videos       play once chosen · Space pause/play and m sound (in the tree
+               too) · ←→ 5 s · ↑↓ 1 min · Home start · +/- volume · Esc back
                Enter or o the video player, pausing it here
   History      H on a file or folder · ↑↓ commits · Enter its files
                d diff or file · a all files · ← back, or a wider history

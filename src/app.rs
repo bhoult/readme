@@ -850,9 +850,9 @@ enum Preview {
     Grep,
 }
 
-/// Keys that move a list's selection, each one putting off the preview again: `m` marks
-/// a row and moves on. Space isn't one: it plays the video the selection is on, so that
-/// one is shown first.
+/// Keys that move a list's selection, each one putting off the preview again: `x` marks
+/// a row and moves on. Space and `m` aren't: they play or pause the video the selection
+/// is on and turn its sound on or off, so that one is shown first.
 fn moves(key: &KeyEvent) -> bool {
     !key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         && matches!(
@@ -863,7 +863,7 @@ fn moves(key: &KeyEvent) -> bool {
                 | KeyCode::PageDown
                 | KeyCode::Home
                 | KeyCode::End
-                | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'm')
+                | KeyCode::Char('j' | 'k' | 'g' | 'G' | 'x')
         )
 }
 
@@ -1536,10 +1536,11 @@ impl App {
                 }
                 self.filtering = true;
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('x') => {
                 self.tree.toggle_mark(self.tree.selected);
                 self.tree_move(1);
             }
+            KeyCode::Char('m') => self.toggle_sound(),
             KeyCode::Char('s') => {
                 let sort = self.tree.sort.next();
                 self.tree.set_sort(sort);
@@ -2382,7 +2383,7 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => video.seek_by(video::BIG_STEP),
                 KeyCode::Down | KeyCode::Char('j') => video.seek_by(-video::BIG_STEP),
                 KeyCode::Home | KeyCode::Char('0' | 'g') => video.seek(0.0),
-                KeyCode::Char('m') => video.toggle_mute(),
+                KeyCode::Char('m') => self.toggle_sound(),
                 KeyCode::Char('+' | '=') => self.change_volume(10),
                 KeyCode::Char('-' | '_') => self.change_volume(-10),
                 KeyCode::Char('H') => self.toggle_history(),
@@ -3189,6 +3190,17 @@ impl App {
         self.set_volume((volume + step).clamp(0, 100) as u8);
     }
 
+    /// Turns the sound of the video shown on or off, and so of the ones after it.
+    fn toggle_sound(&mut self) {
+        let Shown::Video(shown) = &mut self.shown else { return };
+        if !shown.video.has_sound() {
+            return self.say("This video has no sound readme can play");
+        }
+        shown.video.toggle_mute();
+        let on = !shown.video.muted();
+        self.say(if on { "Sound on" } else { "Sound off" });
+    }
+
     /// Sets the volume of the video shown, and the ones after it, saying what it is now.
     fn set_volume(&mut self, volume: u8) {
         let Shown::Video(shown) = &self.shown else { return };
@@ -3196,12 +3208,7 @@ impl App {
             return self.say("This video has no sound readme can play");
         }
         self.volume.store(volume, Ordering::Relaxed);
-        let off = match (shown.video.muted(), self.focus) {
-            (false, _) => "",
-            // In the tree, m marks a file
-            (true, Focus::Tree) => ", with the sound off",
-            (true, Focus::Content) => ", with the sound off: m turns it on",
-        };
+        let off = if shown.video.muted() { ", with the sound off: m turns it on" } else { "" };
         self.say(format!("Volume {volume}%{off}"));
     }
 
@@ -3221,7 +3228,7 @@ impl App {
             let volume = video.volume_click(x).filter(|_| on_bar);
             let time = video.bar_time(x).filter(|_| on_bar);
             match (volume, time) {
-                (Some(VolumeClick::Toggle), _) => video.toggle_mute(),
+                (Some(VolumeClick::Toggle), _) => self.toggle_sound(),
                 (Some(VolumeClick::Set(volume)), _) => self.set_volume(volume),
                 (None, Some(at)) => video.seek(at),
                 (None, None) => video.toggle(),
@@ -3836,14 +3843,14 @@ impl App {
             }
             (_, Focus::Tree) if self.filtering => "type to filter · ↑↓ choose · ⏎ open · Esc clear",
             (_, Focus::Tree) if !self.tree.marks.is_empty() => {
-                "m mark · drag onto a folder to move · Del trash · Esc unmark"
+                "x mark · drag onto a folder to move · Del trash · Esc unmark"
             }
             // On the video, not a folder it stays shown beside, which Enter folds
             (Shown::Video(shown), Focus::Tree) if self.tree.selected_entry().is_some_and(|r| r.path == shown.path) => {
-                "Space play/pause · ⏎ video player · ↑↓ move · m mark · Del trash · F2 rename · ? help · q quit"
+                "Space play/pause · m sound · ⏎ video player · ↑↓ move · x mark · Del trash · F2 rename · ? help · q quit"
             }
             (_, Focus::Tree) => {
-                "? help · ↑↓ move · ⏎ open · s sort · / filter · F find in files · H git history · B branches · m mark · Del trash · F2 rename · q quit"
+                "? help · ↑↓ move · ⏎ open · s sort · / filter · F find in files · H git history · B branches · x mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
             (Shown::Video(_), _) => {
@@ -4711,8 +4718,8 @@ mod tests {
     #[test]
     fn marking_a_run_of_files_reads_only_where_it_stops() {
         let mut h = Harness::new(&[("a.txt", "aaa\n"), ("b.txt", "bbb\n"), ("c.txt", "ccc\n")]);
-        h.app.handle(press(KeyCode::Char('m')));
-        h.app.handle(press(KeyCode::Char('m')));
+        h.app.handle(press(KeyCode::Char('x')));
+        h.app.handle(press(KeyCode::Char('x')));
         assert!(h.app.shown_path().is_none(), "nothing read while the keys come in");
         h.draw();
         assert!(h.screen().contains("ccc"), "{}", h.screen());
@@ -5086,11 +5093,15 @@ mod tests {
         h.draw_until(|h| !h.blocks().is_empty());
         assert!(h.screen().contains("no sound"), "{}", h.screen());
         assert!(!h.screen().contains("muted") && !h.screen().contains("sound ▁"), "{}", h.screen());
-        // or turn its volume, which stays as it was for the next
+        // or turn its sound on or its volume, which stay as they were for the next
         h.key(KeyCode::Tab);
         h.key(KeyCode::Char('-'));
         assert!(h.screen().contains("This video has no sound readme can play"), "{}", h.screen());
         assert_eq!(h.app.volume.load(Ordering::Relaxed), 100);
+        h.key(KeyCode::Esc);
+        h.key(KeyCode::Char('m'));
+        assert!(h.screen().contains("This video has no sound readme can play"), "{}", h.screen());
+        assert!(h.app.muted.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -5121,13 +5132,11 @@ mod tests {
         h.key(KeyCode::Down);
         h.draw_until(|h| h.screen().contains(" sound ▁"));
         assert!(h.screen().contains(" sound ▁▂▂▃······ "), "{}", h.screen());
-        // With it off, from the tree, where m marks, the wheel doesn't say m turns it on
-        h.key(KeyCode::Tab);
+        // m turns it off from the tree too, and then the wheel says m turns it on
         h.key(KeyCode::Char('m'));
-        h.key(KeyCode::Esc);
+        assert!(h.screen().contains("Sound off") && h.screen().contains(" muted ▁"), "{}", h.screen());
         h.mouse(MouseEventKind::ScrollUp, x + 9, y);
-        assert!(h.screen().contains("Volume 40%, with the sound off"), "{}", h.screen());
-        assert!(!h.screen().contains("m turns it on"), "{}", h.screen());
+        assert!(h.screen().contains("Volume 40%, with the sound off: m turns it on"), "{}", h.screen());
     }
 
     #[test]
@@ -5328,11 +5337,12 @@ mod tests {
     #[test]
     fn marked_files_go_to_the_trash() {
         let mut h = Harness::new(&[("a.txt", "a\n"), ("b.txt", "b\n"), ("c.txt", "c\n")]);
-        // m marks, and Space doesn't
+        // x marks, and Space and m don't
         h.key(KeyCode::Char(' '));
+        h.key(KeyCode::Char('m'));
         assert!(!h.screen().contains('●'), "{}", h.screen());
-        h.key(KeyCode::Char('m'));
-        h.key(KeyCode::Char('m'));
+        h.key(KeyCode::Char('x'));
+        h.key(KeyCode::Char('x'));
         assert_eq!(h.screen().matches('●').count(), 2, "{}", h.screen());
         h.key(KeyCode::Delete);
         assert!(h.screen().contains("Move 2 items to the trash?"), "{}", h.screen());

@@ -146,12 +146,13 @@ MP4 and MOV videos with H.264 pictures play in the right pane: most screen recor
 videos made with ffmpeg, and older phones' videos. Select one and it plays; `Space`
 pauses and plays it, in the tree as well as in the pane, and so does a click on the
 picture. `Enter` opens it in your video player instead, pausing it here. Videos start
-with their sound off; `m` turns it on, and it stays on for the videos after, until it's
-turned off or readme quits. Under the picture is the time, a bar to click to go anywhere
-in it, and the volume: click `muted` to turn the sound on, click a step to set it, or
-turn the wheel. The volume stays as you set it for the next video. Under the bar, the
-sound's spectrum moves as it plays, sound on or off: a bar for each band of pitches, the
-low ones on the left, leaping up as loud as they are and falling back.
+with their sound off; `m` turns it on, from the tree too, and it stays on for the videos
+after, until it's turned off or readme quits. Under the picture is the time, a bar to
+click to go anywhere in it, and the volume: click `muted` to turn the sound on, click a
+step to set it, or turn the wheel. The volume stays as you set it for the next video.
+Under the bar, the sound's spectrum moves as it plays, sound on or off: a bar for each
+band of pitches, the low ones on the left, leaping up as loud as they are and falling
+back.
 
 | Keys | |
 |---|---|
@@ -159,7 +160,7 @@ low ones on the left, leaping up as loud as they are and falling back.
 | `←` `→` | 5 seconds back or on |
 | `↑` `↓` | a minute on or back |
 | `Home` | back to the start |
-| `m` | sound on or off (it starts off) |
+| `m` | sound on or off, in the tree too (it starts off) |
 | `+` `-` | louder or quieter, a tenth at a time |
 | `Enter` `o` | open it in your video player, pausing it here |
 | `Esc` | back to the tree, still playing |
@@ -242,7 +243,7 @@ Case doesn't matter unless the search has a capital letter in it.
 
 ## Managing files
 
-Mark files with `m` or `Ctrl`+click (`Shift`+`↑`/`↓` or `Shift`+click for a range).
+Mark files with `x` or `Ctrl`+click (`Shift`+`↑`/`↓` or `Shift`+click for a range).
 Then drag them onto a folder to move them there, or press `Delete` to send them to the
 trash. `F2` renames. Each of these asks before it does anything, nothing gets
 overwritten, and an open file follows its new name.
@@ -311,14 +312,14 @@ date too.
 |---|---|
 | Anywhere | `?` help (`F1` while typing) · `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
 | Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `s` sort · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
-| Files | `m` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
+| Files | `x` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
 | Find in files | `↑↓` matches · `Enter` go to it · `n` `N` within the file · `F` search again · `Esc` back to the tree |
 | File | `↑↓` `PgUp` `PgDn` `Home` `End` scroll · `←` back to the tree (when not scrolled sideways) · `→` sideways · `/` search, `n` `N` next/previous · `w` word wrap · `e` edit · `m` raw/formatted · `y` copy selection · `q` quit |
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image or a video) back to the thumbnails |
-| Videos | `Space` play/pause · `Enter` the video player · `←→` 5 s · `↑↓` 1 min · `Home` start · `m` sound · `+` `-` volume · `Esc` back to the tree |
+| Videos | `Space` play/pause and `m` sound, in the tree too · `Enter` the video player · `←→` 5 s · `↑↓` 1 min · `Home` start · `+` `-` volume · `Esc` back to the tree |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
 | Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches (fetching the remote's) · `←` back, or wider · `H` history · `Esc` leave |
 
