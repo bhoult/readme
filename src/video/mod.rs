@@ -13,7 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -98,8 +98,9 @@ pub struct Video {
     pub failed: Option<String>,
     clock: Clock,
     sound: Option<(Sound, Instant)>,
-    /// Videos start with their sound off
-    pub muted: bool,
+    /// Whether the sound's off: the same for every video, so one turned on leaves the
+    /// next on too
+    muted: Arc<AtomicBool>,
     /// How loud the sound plays, in percent: the same for every video, and followed by
     /// the sound's thread as it changes
     volume: Arc<AtomicU8>,
@@ -166,8 +167,8 @@ pub fn clock_time(seconds: f64) -> String {
 
 impl Video {
     /// Opens the video at `path`, paused at the start, its first picture on its way. Its
-    /// sound plays at `volume` percent, as that changes.
-    pub fn open(path: &Path, picker: &Picker, volume: Arc<AtomicU8>) -> Result<Self, String> {
+    /// sound plays at `volume` percent, as that changes, unless it's `muted`.
+    pub fn open(path: &Path, picker: &Picker, volume: Arc<AtomicU8>, muted: Arc<AtomicBool>) -> Result<Self, String> {
         let movie = Arc::new(mp4::open(path).map_err(|e| e.0)?);
         let Some(track) = &movie.video else { return Err("it has no video track".into()) };
         match &track.codec {
@@ -210,7 +211,7 @@ impl Video {
             failed: None,
             clock: Clock::Paused(0.0),
             sound: None,
-            muted: true,
+            muted,
             volume,
             has_sound,
             spectrum,
@@ -291,8 +292,14 @@ impl Video {
         self.seek(to);
     }
 
+    /// Whether the sound's off.
+    pub fn muted(&self) -> bool {
+        self.muted.load(Ordering::Relaxed)
+    }
+
+    /// Turns the sound on or off, for this video and the ones after it.
     pub fn toggle_mute(&mut self) {
-        self.muted = !self.muted;
+        self.muted.fetch_xor(true, Ordering::Relaxed);
         if self.playing() {
             // The clock takes over from the sound, or the sound from the clock, here
             let at = self.position();
@@ -306,7 +313,7 @@ impl Video {
 
     fn start_sound(&mut self, at: f64) {
         self.sound = None;
-        if !self.muted && self.has_sound {
+        if !self.muted() && self.has_sound {
             self.sound =
                 Sound::start(&self.path, self.movie.clone(), at, self.volume.clone()).map(|s| (s, Instant::now()));
         }
@@ -526,7 +533,7 @@ impl Video {
             && self.failed.is_none()
             && usize::from(self.bar.width) >= width + usize::from(VOLUME_WIDTH) + 12;
         // Where the volume control doesn't fit, the label says the sound's off
-        if self.muted && self.has_sound && !volume { (label + "muted ", false) } else { (label, volume) }
+        if self.muted() && self.has_sound && !volume { (label + "muted ", false) } else { (label, volume) }
     }
 
     /// Where the bar's line is: the column it starts at, and how long it is.
@@ -567,9 +574,9 @@ impl Video {
     /// is on.
     fn volume_control(&self) -> Vec<Span<'static>> {
         let steps = usize::from(self.volume.load(Ordering::Relaxed).div_ceil(VOLUME_STEP));
-        let mut spans = vec![Span::raw(if self.muted { " muted " } else { " sound " })];
+        let mut spans = vec![Span::raw(if self.muted() { " muted " } else { " sound " })];
         for (i, step) in VOLUME_STEPS.iter().enumerate() {
-            spans.push(match (i < steps, self.muted) {
+            spans.push(match (i < steps, self.muted()) {
                 (true, false) => Span::styled(*step, Style::default().fg(Color::Cyan)),
                 (true, true) => Span::raw(*step),
                 (false, _) => Span::styled("·", Style::default().add_modifier(Modifier::DIM)),
@@ -721,7 +728,8 @@ mod tests {
         let mut picker = Picker::from_fontsize(ratatui_image::FontSize::new(10, 20));
         picker.set_protocol_type(ProtocolType::Kitty);
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/clip.mp4");
-        let mut video = Video::open(&path, &picker, Arc::new(AtomicU8::new(100))).unwrap();
+        let mut video =
+            Video::open(&path, &picker, Arc::new(AtomicU8::new(100)), Arc::new(AtomicBool::new(true))).unwrap();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 12)).unwrap();
         video.play();
         let mut sent = Vec::new();
@@ -743,7 +751,7 @@ mod tests {
     #[test]
     fn a_video_without_sound_has_no_spectrum() {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/pyramid.mp4");
-        let video = Video::open(&path, &Picker::halfblocks(), Arc::default()).unwrap();
+        let video = Video::open(&path, &Picker::halfblocks(), Arc::default(), Arc::default()).unwrap();
         assert!(!video.has_sound() && video.spectrum.is_none());
     }
 

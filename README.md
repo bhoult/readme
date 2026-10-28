@@ -145,13 +145,13 @@ plays a video. `Esc` goes back to the grid.
 MP4 and MOV videos with H.264 pictures play in the right pane: most screen recordings,
 videos made with ffmpeg, and older phones' videos. Select one and it plays; `Space`
 pauses and plays it, in the tree as well as in the pane, and so does a click on the
-picture. `Enter` opens it in your video player instead, pausing it
-here. Videos start with their sound off; `m` turns it on. Under the picture is the time,
-a bar to click to go anywhere in it, and the volume: click `muted` to turn the sound on,
-click a step to set it, or turn the wheel. The volume stays as you set it for the next
-video. Under the bar, the sound's spectrum moves as it plays, sound on or off: a bar for
-each band of pitches, the low ones on the left, leaping up as loud as they are and
-falling back.
+picture. `Enter` opens it in your video player instead, pausing it here. Videos start
+with their sound off; `m` turns it on, and it stays on for the videos after, until it's
+turned off or readme quits. Under the picture is the time, a bar to click to go anywhere
+in it, and the volume: click `muted` to turn the sound on, click a step to set it, or
+turn the wheel. The volume stays as you set it for the next video. Under the bar, the
+sound's spectrum moves as it plays, sound on or off: a bar for each band of pitches, the
+low ones on the left, leaping up as loud as they are and falling back.
 
 | Keys | |
 |---|---|

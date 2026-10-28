@@ -9,7 +9,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc,
-        atomic::{AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     time::{Duration, Instant, SystemTime},
 };
@@ -904,6 +904,9 @@ pub struct App {
     /// Videos' volume, in percent: kept from one to the next, and followed by the sound
     /// of the one playing
     volume: Arc<AtomicU8>,
+    /// Whether videos' sound is off: so when readme starts, and after that as it was last
+    /// turned, in any video, for every one after it
+    muted: Arc<AtomicBool>,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
     /// The left pane shows the matches of a search through all the files
@@ -953,6 +956,7 @@ impl App {
             fetched: HashMap::new(),
             picker: Picker::halfblocks(),
             volume: Arc::new(AtomicU8::new(100)),
+            muted: Arc::new(AtomicBool::new(true)),
             gallery_stash: None,
             grep: None,
             last_grep: String::new(),
@@ -1090,7 +1094,7 @@ impl App {
         self.shown = if path.exists() {
             if external::is_video(path) && path.is_file() {
                 let (modified, size) = disk_stamp(path);
-                match Video::open(path, &self.picker, self.volume.clone()) {
+                match Video::open(path, &self.picker, self.volume.clone(), self.muted.clone()) {
                     Ok(video) => Shown::Video(Box::new(VideoShown { path: path.into(), bytes: size, modified, video })),
                     Err(why) => Shown::Note(
                         path.into(),
@@ -3192,7 +3196,7 @@ impl App {
             return self.say("This video has no sound readme can play");
         }
         self.volume.store(volume, Ordering::Relaxed);
-        let off = match (shown.video.muted, self.focus) {
+        let off = match (shown.video.muted(), self.focus) {
             (false, _) => "",
             // In the tree, m marks a file
             (true, Focus::Tree) => ", with the sound off",
@@ -5111,16 +5115,47 @@ mod tests {
         // The wheel turns it up
         h.mouse(MouseEventKind::ScrollUp, x + 9, y);
         assert!(h.screen().contains("Volume 35%"), "{}", h.screen());
-        // The next video plays at that volume, its sound off to start with
+        // The next video plays at that volume, its sound still on
         h.key(KeyCode::Esc);
         h.key(KeyCode::Up);
         h.key(KeyCode::Down);
-        h.draw_until(|h| h.screen().contains(" muted ▁"));
-        assert!(h.screen().contains(" muted ▁▂▂▃······ "), "{}", h.screen());
-        // From the tree, where m marks, the wheel doesn't say m turns the sound on
+        h.draw_until(|h| h.screen().contains(" sound ▁"));
+        assert!(h.screen().contains(" sound ▁▂▂▃······ "), "{}", h.screen());
+        // With it off, from the tree, where m marks, the wheel doesn't say m turns it on
+        h.key(KeyCode::Tab);
+        h.key(KeyCode::Char('m'));
+        h.key(KeyCode::Esc);
         h.mouse(MouseEventKind::ScrollUp, x + 9, y);
         assert!(h.screen().contains("Volume 40%, with the sound off"), "{}", h.screen());
         assert!(!h.screen().contains("m turns it on"), "{}", h.screen());
+    }
+
+    #[test]
+    fn the_sound_stays_as_it_was_last_turned_for_the_next_video() {
+        let next_video = |h: &mut Harness| {
+            h.key(KeyCode::Esc);
+            h.key(KeyCode::Up);
+            h.key(KeyCode::Down);
+            h.draw_until(|h| !h.blocks().is_empty());
+            h.key(KeyCode::Tab);
+        };
+        // Off to start with
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains(" muted ▁"), "{}", h.screen());
+        // Turned on, it's on for the next video, and turned off again, off
+        h.key(KeyCode::Char('m'));
+        next_video(&mut h);
+        assert!(h.screen().contains(" sound ▁"), "{}", h.screen());
+        h.key(KeyCode::Char('m'));
+        next_video(&mut h);
+        assert!(h.screen().contains(" muted ▁"), "{}", h.screen());
+        // A readme started again starts with it off
+        h.key(KeyCode::Char('m'));
+        let mut h = showing_video("clip.mp4");
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains(" muted ▁"), "{}", h.screen());
     }
 
     #[test]
