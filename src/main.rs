@@ -17,6 +17,7 @@ mod picture;
 mod table;
 mod text;
 mod tree;
+mod video;
 
 use std::{
     env,
@@ -36,7 +37,7 @@ use ratatui::{
         cursor::{SetCursorStyle, Show},
         event::{self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event},
         execute,
-        terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+        terminal::{self, BeginSynchronizedUpdate, EndSynchronizedUpdate, EnterAlternateScreen, LeaveAlternateScreen},
     },
 };
 
@@ -104,6 +105,8 @@ Keys
                Ctrl+C/X/V copy/cut/paste · Ctrl+A select all · Ctrl+F search
                Alt+Z word wrap
   Images       wheel or +/- zoom · 0 fit · drag or arrows to move around
+  Videos       Space or Enter play/pause · ←→ 5 s · ↑↓ 1 min · Home start
+               m sound · o the video player · Esc back to the tree
   History      H on a file or folder · ↑↓ commits · Enter its files
                d diff or file · a all files · ← back, or a wider history
                B its branches · Esc leave
@@ -127,8 +130,9 @@ Mouse
 Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
 archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, a
 folder with images in it shows them as thumbnails (+/- to resize, Enter or a
-click to open one, Esc to go back), and clicking an HTML file or a video (or
-Enter on it) opens it in the browser or the video player.
+click to open one, Esc to go back), MP4 and MOV videos with H.264 play in the
+pane with their sound, and clicking an HTML file, or a video readme can't
+play (or Enter on it), opens it in the browser or the video player.
 
 Environment
   README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)
@@ -149,14 +153,15 @@ impl Tui {
         // Only a panic on this thread ends the program. One on another thread ends just
         // that thread, so the screen stays as it is and says so in its status line,
         // rather than have the message written over it. Thumbnail decoders say it
-        // themselves, by showing "can't read".
+        // themselves, by showing "can't read", and a video says its decoder stopped.
         let main = std::thread::current().id();
+        let quiet = [gallery::WORKER, video::PICTURES, video::SOUND];
         panic::set_hook(Box::new(move |info| {
             let thread = std::thread::current();
             if thread.id() == main {
                 restore();
                 previous(info);
-            } else if thread.name() != Some(gallery::WORKER) {
+            } else if !thread.name().is_some_and(|name| quiet.contains(&name)) {
                 let at = info.location().map(|l| format!(" ({}:{})", l.file(), l.line())).unwrap_or_default();
                 let payload = info.payload();
                 let message =
@@ -191,6 +196,7 @@ fn restore() {
     restore_passthrough();
     let _ = execute!(
         io::stdout(),
+        EndSynchronizedUpdate,
         DisableBracketedPaste,
         DisableMouseCapture,
         LeaveAlternateScreen,
@@ -238,14 +244,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, mut lat
     let mut bar_cursor = false;
     let mut last_tick = Instant::now();
     while !app.quit {
+        let started = Instant::now();
+        // Terminals that can hold each frame back until all of it is there, so a video's
+        // picture never shows half of one and half of the next
+        execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|f| app.draw(f))?;
+        execute!(io::stdout(), EndSynchronizedUpdate)?;
+        app.drew(started.elapsed());
         if app.editing() != bar_cursor {
             bar_cursor = app.editing();
             let style = if bar_cursor { SetCursorStyle::BlinkingBar } else { SetCursorStyle::DefaultUserShape };
             execute!(io::stdout(), style)?;
         }
-        // Straight back to drawing while there's more to color in, unless a key comes first
-        let wait = if app.busy() { Duration::ZERO } else { Duration::from_millis(250) };
+        // Straight back to drawing while there's more to color in, and back for a video's
+        // next picture when it's due, unless a key comes first
+        let idle = Duration::from_millis(250);
+        let wait = if app.busy() { Duration::ZERO } else { app.due().map_or(idle, |due| due.min(idle)) };
         if event::poll(wait)? {
             handle(app, event::read()?);
             // Take whatever else is queued before redrawing, so fast scrolling keeps up

@@ -2,8 +2,8 @@
 
 **A file viewer and basic editor for the terminal.** A directory tree on the left, the
 file on the right, and the mouse works everywhere. It reads source code, Markdown, CSV,
-images, archives and git history, finds text across a whole project, and keeps up with
-files as other programs change them.
+images, videos, archives and git history, finds text across a whole project, and keeps
+up with files as other programs change them.
 
 It was made for a [herdr](https://herdr.dev) pane next to coding agents: you watch
 their edits land, read what they wrote, look back through the history, and fix a line
@@ -34,13 +34,14 @@ on Linux.
 - [**CSV and TSV**](#csv-and-tsv-tables) as aligned tables with the header kept on screen
 - [**Images**](#images) at full resolution in terminals that can show them, with zoom, and colored half-blocks anywhere else
 - [**Thumbnails**](#thumbnails) of a folder of images, in a grid
+- [**Videos**](#videos) play in the pane, with their sound: MP4 and MOV with H.264, decoded in pure Rust
 - [**Archives**](#archives): zip and tar files open like folders, nothing unpacked
 - [**Git history**](#git-history) of any file or folder, as it was or as a diff, following renames
 - [**Git branches**](#git-branches): whose each one is, when it last changed, and what it changed, file by file
 - [**Find in files**](#find-in-files) across the whole tree, on every CPU core
 - [**Managing files**](#managing-files): mark, drag to move, rename, send to the trash
 - [**Live reload**](#live-reload) when another program changes the open file
-- [**Web pages and videos**](#web-pages-and-videos) open in the browser and the video player
+- [**Web pages**](#web-pages) open in the browser, and other videos in the video player
 
 ## The tree
 
@@ -132,6 +133,42 @@ wide; `+` and `-` (or `Ctrl`+wheel) change their size, and a click or `Enter` op
 
 ![A folder of nine images shown as 300-pixel thumbnails](docs/screenshots/gallery.png)
 
+## Videos
+
+MP4 and MOV videos with H.264 pictures play in the right pane: most screen recordings,
+videos made with ffmpeg, and older phones' videos. Select one and its first
+picture shows; `Space` or `Enter` (or a click on it, or `Enter` in the tree) plays and
+pauses it. Videos start with their sound off; `m` turns it on. Under the picture is the
+time, and a bar to click to go anywhere in it.
+
+| Keys | |
+|---|---|
+| `Space` `Enter` | play or pause |
+| `←` `→` | 5 seconds back or on |
+| `↑` `↓` | a minute on or back |
+| `Home` | back to the start |
+| `m` | sound on or off (it starts off) |
+| `o` | open it in your video player instead |
+| `Esc` | back to the tree, still playing |
+
+Pictures are drawn in real pixels where images are, and in half-blocks anywhere else.
+A terminal that reads pictures from files, as Ghostty and herdr do, gets each one at
+full size in a temporary file that it deletes once read. Elsewhere they go as text, so
+readme sends them only as big as the terminal (and herdr or tmux) takes as fast as they
+come, starting from about a quarter of a megapixel, and the terminal scales them up to
+fill the pane.
+
+Sound plays through ALSA, which every Linux desktop has, PipeWire and PulseAudio
+included; readme loads it when a video first plays, so it needs nothing to build, and
+without it videos play silently. AAC sound plays, in mono or stereo. The pictures keep
+time with it.
+
+Nothing else is needed: the decoder is [rust_h264](https://github.com/roticv/rust_h264),
+in pure Rust, with fixes to it made for readme
+([vendor/rust_h264](vendor/rust_h264/PATCHES.md)), and AAC is
+[Symphonia](https://github.com/pdeljanov/Symphonia)'s. Videos readme can't play, such as
+HEVC, VP9 or AV1 ones, or Matroska and WebM files, say so and open in your video player.
+
 ## Archives
 
 Zip files (and `.jar`, `.whl`, `.epub`) and tar files, plain or compressed with gzip,
@@ -207,10 +244,10 @@ screenshot) shows the new one at the same zoom. If you have unsaved changes of y
 readme keeps them and marks the file as changed on disk instead; undo them and the new
 contents come in, or save, and it asks before writing over the other changes.
 
-## Web pages and videos
+## Web pages
 
-Clicking an HTML file, or pressing `Enter` on it, opens it in your browser; a video opens
-in your video player.
+Clicking an HTML file, or pressing `Enter` on it, opens it in your browser. A video
+readme can't play opens in your video player the same way.
 
 ## Make it yours
 
@@ -268,6 +305,7 @@ date too.
 | Editing | `Esc` stop · `Ctrl+Z` `Ctrl+Y` undo/redo · `Ctrl+C` `Ctrl+X` `Ctrl+V` copy/cut/paste · `Ctrl+A` select all · `Ctrl+F` search · `Alt+Z` word wrap · `Shift`+arrows select · `Ctrl`+arrows by word |
 | Images | wheel or `+` `-` zoom · `0` fit · `←→↑↓` or drag to move around |
 | Thumbnails | `←→↑↓` choose · `Enter` open · `+` `-` size · `Esc` (in an image) back to the thumbnails |
+| Videos | `Space` `Enter` play/pause · `←→` 5 s · `↑↓` 1 min · `Home` start · `m` sound · `o` the video player · `Esc` back to the tree |
 | History | `↑↓` commits · `Enter` a commit's files · `d` diff or file · `a` all files at that commit · `←` back, or wider · `B` branches · `Esc` leave |
 | Branches | `↑↓` branches · `Enter` a branch's files · `d` diff or file · `a` all the files it changed · `s` newest first, by name or by owner · `f` all, local or remote branches (fetching the remote's) · `←` back, or wider · `H` history · `Esc` leave |
 
@@ -278,8 +316,8 @@ quits, asking first if there are unsaved changes.
 
 ### Mouse
 
-- Click a directory or an archive to fold or unfold it; click a file to open it (an HTML
-  file or a video opens in its own program too); double-click a file to move into it.
+- Click a directory or an archive to fold or unfold it; click a file to open it (a video
+  plays, and an HTML file opens in the browser too); double-click a file to move into it.
 - The wheel scrolls whichever pane it's over; `Shift`+wheel scrolls sideways.
 - Drag across text to select and copy it. While editing, a click moves the cursor and a
   double-click selects a word; while viewing, a double-click starts editing there.
@@ -290,6 +328,7 @@ quits, asking first if there are unsaved changes.
   move them there.
 - On an image, the wheel zooms toward the pointer, dragging moves it, and a double-click
   fits it again. Over thumbnails, `Ctrl`+wheel resizes them.
+- On a video, a click plays or pauses it, and a click on the bar under it goes there.
 - Drag the divider between the panes to resize the tree.
 
 ### Clipboard
@@ -322,6 +361,8 @@ palette. Set `README_THEME` to use another of bat's themes, for example `Nord`,
 ## Built to stay quick
 
 - Searching, filtering and thumbnails use every CPU core.
+- Videos decode on a thread of their own, a few pictures ahead, each made at the size
+  it's shown. Pictures nothing else needs are skipped when seeking or running late.
 - Syntax colors are worked out only as far as you've looked, a slice per frame, and kept
   across reloads down to the first line that changed.
 - Memory stays bounded: files over 50 MB aren't opened, Markdown over 5 MB shows as text,
@@ -354,7 +395,8 @@ drags included.
 | `src/git.rs` | history and branches, through the `git` command |
 | `src/grep.rs` | find in files |
 | `src/fileops.rs` | trash, rename and move |
-| `src/external.rs` | opening web pages and videos in other programs |
+| `src/video/` | videos: the MP4 reader, decoding, sound, and Kitty pictures |
+| `src/external.rs` | opening web pages, and videos readme can't play, in other programs |
 | `src/text.rs` | column math, wrapping, search, styled line slices |
 | `src/clipboard.rs` | copy and paste |
 
@@ -365,8 +407,11 @@ Built with [ratatui](https://ratatui.rs) and
 [pulldown-cmark](https://github.com/pulldown-cmark/pulldown-cmark),
 [ignore](https://github.com/BurntSushi/ripgrep/tree/master/crates/ignore),
 [csv](https://github.com/BurntSushi/rust-csv), [image](https://github.com/image-rs/image),
-[zip](https://github.com/zip-rs/zip2) and [tar](https://github.com/alexcrichton/tar-rs).
+[zip](https://github.com/zip-rs/zip2), [tar](https://github.com/alexcrichton/tar-rs),
+[rust_h264](https://github.com/roticv/rust_h264) and
+[Symphonia](https://github.com/pdeljanov/Symphonia).
 
 ## License
 
-[MIT](LICENSE)
+[MIT](LICENSE). The H.264 decoder in [vendor/rust_h264](vendor/rust_h264) is
+rust_h264's own, under MIT or Apache-2.0.

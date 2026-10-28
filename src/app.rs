@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
+    widgets::{Paragraph, Wrap},
 };
 use ratatui_image::picker::Picker;
 
@@ -38,6 +38,7 @@ use crate::{
         search, slice_line, split_at_width, str_width, tail_width, wider_than, wrap_points,
     },
     tree::{NoWayUp, Tree},
+    video::{self, Video},
 };
 
 const MESSAGE_FOR: Duration = Duration::from_secs(4);
@@ -517,6 +518,13 @@ enum Shown {
     Image(Box<ImageShown>),
     /// A folder's images as thumbnails
     Gallery(Box<Gallery>),
+    Video(Box<VideoShown>),
+}
+
+struct VideoShown {
+    path: PathBuf,
+    bytes: u64,
+    video: Video,
 }
 
 struct ImageShown {
@@ -896,6 +904,7 @@ impl App {
             Shown::Doc(doc) => Some(&doc.path),
             Shown::Image(image) => Some(&image.path),
             Shown::Gallery(gallery) => Some(&gallery.dir),
+            Shown::Video(shown) => Some(&shown.path),
             Shown::Note(path, _) => Some(path),
             Shown::Nothing => None,
         }
@@ -906,7 +915,7 @@ impl App {
         let source = match &self.shown {
             Shown::Doc(doc) => doc.source,
             Shown::Image(image) => image.source,
-            Shown::Gallery(_) => Source::Disk,
+            Shown::Gallery(_) | Shown::Video(_) => Source::Disk,
             // A note (moved to the trash, couldn't be read) is tried again
             Shown::Note(..) | Shown::Nothing => return false,
         };
@@ -919,6 +928,7 @@ impl App {
         self.picker = picker;
         match &mut self.shown {
             Shown::Image(image) => image.picture.set_picker(&self.picker),
+            Shown::Video(shown) => shown.video.set_picker(&self.picker),
             Shown::Gallery(gallery) => {
                 let dir = gallery.dir.clone();
                 self.shown = Shown::Nothing;
@@ -943,6 +953,21 @@ impl App {
         matches!(&self.shown, Shown::Doc(doc) if doc.coloring)
     }
 
+    /// How soon there's next something to draw that no key brings: a video's next picture.
+    pub fn due(&self) -> Option<Duration> {
+        match &self.shown {
+            Shown::Video(shown) => shown.video.next_due(),
+            _ => None,
+        }
+    }
+
+    /// How long the last frame took to go out to the terminal.
+    pub fn drew(&mut self, took: Duration) {
+        if let Shown::Video(shown) = &mut self.shown {
+            shown.video.drew(took);
+        }
+    }
+
     pub fn say(&mut self, message: impl Into<String>) {
         self.message = Some((message.into(), Instant::now()));
     }
@@ -965,7 +990,17 @@ impl App {
         self.shown = if path.exists() {
             if external::is_video(path) && path.is_file() {
                 let size = fs::metadata(path).map_or(0, |m| m.len());
-                Shown::Note(path.into(), format!("Video, {}. Click it, or press Enter, to play it.", human_size(size)))
+                match Video::open(path, &self.picker) {
+                    Ok(video) => Shown::Video(Box::new(VideoShown { path: path.into(), bytes: size, video })),
+                    Err(why) => Shown::Note(
+                        path.into(),
+                        format!(
+                            "Video, {}.\nreadme can't play this one: {why}.\n\
+                             Click it, or press Enter, to open it in the video player.",
+                            human_size(size)
+                        ),
+                    ),
+                }
             } else if picture::is_image(path) {
                 // Taken before reading, so a change made meanwhile shows up as one
                 let stamp = disk_stamp(path);
@@ -2200,6 +2235,28 @@ impl App {
             let path = path.clone();
             return self.hand_off(&path);
         }
+        if let Shown::Video(shown) = &mut self.shown {
+            let video = &mut shown.video;
+            match key.code {
+                KeyCode::Char(' ') | KeyCode::Enter => video.toggle(),
+                KeyCode::Left | KeyCode::Char('h') => video.seek_by(-video::STEP),
+                KeyCode::Right | KeyCode::Char('l') => video.seek_by(video::STEP),
+                KeyCode::Up | KeyCode::Char('k') => video.seek_by(video::BIG_STEP),
+                KeyCode::Down | KeyCode::Char('j') => video.seek_by(-video::BIG_STEP),
+                KeyCode::Home | KeyCode::Char('0' | 'g') => video.seek(0.0),
+                KeyCode::Char('m') => video.toggle_mute(),
+                KeyCode::Char('o') => {
+                    let path = shown.path.clone();
+                    self.open_outside(&path);
+                }
+                KeyCode::Char('H') => self.toggle_history(),
+                KeyCode::Char('B') => self.toggle_branches(),
+                KeyCode::Esc => self.focus = Focus::Tree,
+                KeyCode::Char('q') => self.request_quit(),
+                _ => {}
+            }
+            return;
+        }
         if let Shown::Gallery(gallery) = &mut self.shown {
             let (across, rows) = (gallery.per_row as isize, gallery.rows_shown.max(1) as isize);
             match key.code {
@@ -2962,10 +3019,23 @@ impl App {
         }
     }
 
-    /// Opens a web page in the browser, or a video in the video player, as well as
-    /// showing it here. Only on a click or Enter, not while the selection moves past,
-    /// and only for files on disk.
+    /// Plays a video here, or else opens a web page in the browser, or a video readme
+    /// can't play in the video player, as well as showing it here. Only on a click or
+    /// Enter, not while the selection moves past, and only for files on disk.
     fn hand_off(&mut self, path: &Path) {
+        if let Shown::Video(shown) = &mut self.shown
+            && shown.path == path
+        {
+            return shown.video.play();
+        }
+        self.open_outside(path);
+    }
+
+    /// Opens a web page in the browser, or a video in the video player.
+    fn open_outside(&mut self, path: &Path) {
+        if let Shown::Video(shown) = &mut self.shown {
+            shown.video.pause();
+        }
         let program = if external::is_web_page(path) {
             "the browser"
         } else if external::is_video(path) {
@@ -2988,6 +3058,15 @@ impl App {
         {
             let path = path.clone();
             return self.hand_off(&path);
+        }
+        if let Shown::Video(shown) = &mut self.shown {
+            let video = &mut shown.video;
+            // On the bar, to that time; anywhere else, play or pause
+            match video.bar_time(x).filter(|_| y == video.bar.y) {
+                Some(at) => video.seek(at),
+                None => video.toggle(),
+            }
+            return;
         }
         if let Shown::Image(image) = &mut self.shown {
             // A double-click fits it back in; otherwise a drag moves it around
@@ -3436,12 +3515,18 @@ impl App {
             }
             Shown::Note(path, note) => {
                 header(f, area, &format!(" {}", relative(path, &root)), "", focused);
-                f.render_widget(Paragraph::new(Line::styled(format!("  {note}"), dim())), body);
+                let lines: Vec<Line> = note.lines().map(|line| Line::styled(format!("  {line}"), dim())).collect();
+                f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body);
             }
             Shown::Image(image) => {
                 let title = image.label.clone().unwrap_or_else(|| format!(" {}", relative(&image.path, &root)));
                 header(f, area, &title, &format!("{} · {} ", image.picture.info, human_size(image.bytes)), focused);
                 image.picture.draw(f, body);
+            }
+            Shown::Video(shown) => {
+                let title = format!(" {}", relative(&shown.path, &root));
+                header(f, area, &title, &format!("{} · {} ", shown.video.info, human_size(shown.bytes)), focused);
+                shown.video.draw(f, body);
             }
             Shown::Gallery(gallery) => {
                 let rel = relative(&gallery.dir, &root);
@@ -3575,6 +3660,9 @@ impl App {
                 "? help · ↑↓ move · ⏎ open · F find in files · H git history · B branches · / filter · Space mark · Del trash · F2 rename · q quit"
             }
             (Shown::Gallery(_), _) => "←→↑↓ choose · ⏎ or click to open · +/- size · ⇥ tree · q quit",
+            (Shown::Video(_), _) => {
+                "Space play/pause · ←→ 5 s · ↑↓ 1 min · Home start · m sound · o video player · Esc tree · q quit"
+            }
             (Shown::Image(_), _) if self.gallery_stash.is_some() => {
                 "wheel or +/- zoom · 0 fit · drag to move · Esc back to the thumbnails · ← tree"
             }
@@ -3962,6 +4050,21 @@ mod tests {
 
         fn cursor(&mut self) -> Pos {
             self.app.doc().unwrap().buf.cursor
+        }
+
+        /// Draws until `done`, or five seconds have gone.
+        fn draw_until(&mut self, done: impl Fn(&Self) -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !done(self) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+                self.draw();
+            }
+        }
+
+        /// The colours a video's half-blocks show, top and bottom.
+        fn blocks(&self) -> Vec<Color> {
+            let buf = self.term.backend().buffer();
+            buf.content.iter().filter(|c| c.symbol() == "▀").flat_map(|c| [c.fg, c.bg]).collect()
         }
 
         /// Draws until every branch has been looked into.
@@ -4549,6 +4652,98 @@ mod tests {
         h.click(x + 2, y);
         assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
         assert!(h.screen().contains("Opened clip.mp4 in the video player"), "{}", h.screen());
+    }
+
+    /// The tree with a.txt and testdata's `name` as clip.mp4, which is selected.
+    fn showing_video(name: &str) -> Harness {
+        let mut h = Harness::new(&[("a.txt", "a\n"), ("clip.mp4", "")]);
+        let data = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+        fs::write(h.root.join("clip.mp4"), fs::read(data).unwrap()).unwrap();
+        h.key(KeyCode::Down);
+        h
+    }
+
+    fn near(color: Color, (r, g, b): (u8, u8, u8)) -> bool {
+        matches!(color, Color::Rgb(cr, cg, cb) if cr.abs_diff(r) < 12 && cg.abs_diff(g) < 12 && cb.abs_diff(b) < 12)
+    }
+
+    const RED: (u8, u8, u8) = (207, 32, 32);
+    const BLUE: (u8, u8, u8) = (32, 62, 223);
+
+    #[test]
+    fn a_video_plays_in_the_pane() {
+        let mut h = showing_video("clip.mp4");
+        assert!(h.screen().contains("72×40 H.264, stereo"), "{}", h.screen());
+        // Its first picture, paused at the start: red, with a white square
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains("‖ 0:00 / 0:01"), "{}", h.screen());
+        let blocks = h.blocks();
+        assert!(blocks.iter().filter(|c| near(**c, RED)).count() > blocks.len() / 2);
+        assert!(blocks.iter().any(|c| near(*c, (255, 255, 255))));
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        // Enter plays it, here, through to its last picture, blue, and stops there
+        h.key(KeyCode::Enter);
+        assert!(h.screen().contains("▶ 0:00 / 0:01"), "{}", h.screen());
+        assert!(external::OPENED.with(|o| o.borrow().is_empty()));
+        h.draw_until(|h| h.screen().contains("‖"));
+        assert!(h.screen().contains("‖ 0:01 / 0:01"), "{}", h.screen());
+        assert!(!h.screen().contains("stopped"), "{}", h.screen());
+        let blocks = h.blocks();
+        assert!(blocks.iter().filter(|c| near(**c, BLUE)).count() > blocks.len() / 2);
+        // Played through, it plays again from the start
+        h.key(KeyCode::Char(' '));
+        h.draw_until(|h| h.blocks().iter().filter(|c| near(**c, RED)).count() > h.blocks().len() / 2);
+        assert!(h.screen().contains("▶"), "{}", h.screen());
+    }
+
+    #[test]
+    fn a_video_starts_with_its_sound_off() {
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains("0:01 muted"), "{}", h.screen());
+        // m turns it on, and off again
+        h.key(KeyCode::Char('m'));
+        assert!(!h.screen().contains("muted"), "{}", h.screen());
+        h.key(KeyCode::Char('m'));
+        assert!(h.screen().contains("0:01 muted"), "{}", h.screen());
+        // A video without sound doesn't say it's muted
+        let mut h = showing_video("pyramid.mp4");
+        h.draw_until(|h| !h.blocks().is_empty());
+        assert!(h.screen().contains("no sound"), "{}", h.screen());
+        assert!(!h.screen().contains("muted"), "{}", h.screen());
+    }
+
+    #[test]
+    fn a_video_goes_where_the_keys_and_its_bar_say() {
+        let mut h = showing_video("clip.mp4");
+        h.key(KeyCode::Tab);
+        h.draw_until(|h| !h.blocks().is_empty());
+        // Five seconds on is past its end: the last picture, still paused
+        h.key(KeyCode::Right);
+        h.draw_until(|h| h.blocks().iter().filter(|c| near(**c, BLUE)).count() > h.blocks().len() / 2);
+        assert!(h.screen().contains("‖ 0:01 / 0:01"), "{}", h.screen());
+        h.key(KeyCode::Home);
+        h.draw_until(|h| h.blocks().iter().filter(|c| near(**c, RED)).count() > h.blocks().len() / 2);
+        assert!(h.screen().contains("‖ 0:00 / 0:01"), "{}", h.screen());
+        // A click at the end of the bar goes to the end
+        let (x, y) = h.find("──");
+        let end = x + h.row(y)[..].chars().skip(x as usize).take_while(|c| *c == '─').count() as u16 - 1;
+        h.click(end, y);
+        h.draw_until(|h| h.blocks().iter().filter(|c| near(**c, BLUE)).count() > h.blocks().len() / 2);
+        assert!(h.screen().contains("‖ 0:01 / 0:01"), "{}", h.screen());
+        // Esc goes back to the tree
+        h.key(KeyCode::Esc);
+        assert_eq!(h.app.focus, Focus::Tree);
+    }
+
+    #[test]
+    fn a_video_readme_cant_play_goes_to_the_video_player() {
+        let mut h = showing_video("other-codec.mp4");
+        let screen = h.screen();
+        assert!(screen.contains("readme can't play this one") && screen.contains("MPEG-4"), "{screen}");
+        h.key(KeyCode::Enter);
+        assert_eq!(external::OPENED.with(|o| o.borrow().clone()), vec![h.root.join("clip.mp4")]);
     }
 
     #[test]

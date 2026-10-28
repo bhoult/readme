@@ -4,6 +4,7 @@
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
@@ -121,6 +122,23 @@ impl LateAnswers {
     }
 }
 
+/// The terminal takes Kitty pictures from files, as videos send them, having said so
+/// when it was asked.
+static KITTY_FILES: AtomicBool = AtomicBool::new(false);
+
+pub fn kitty_files() -> bool {
+    KITTY_FILES.load(Ordering::Relaxed)
+}
+
+/// A file deleted when this is dropped, if the terminal hasn't deleted it already.
+struct Probe(PathBuf);
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Asks the terminal whether it shows Kitty graphics or sixels, and how big its
 /// character cells are. ratatui-image can ask too, but it waits on a thread that's
 /// left reading the keyboard when a terminal never answers; this waits here, with a
@@ -145,9 +163,20 @@ fn query_terminal(late: &mut bool) -> Option<Picker> {
     };
     let input = tty.as_ref().map_or(libc::STDIN_FILENO, |tty| tty.as_raw_fd());
     let mut out = std::io::stdout();
+    // Whether it takes pictures from files: one with a 1×1 picture in it, which the
+    // terminal deletes if it reads it
+    let probe = Probe(crate::video::kitty::file_path("probe"));
+    let _ = std::fs::remove_file(&probe.0);
+    let mut question = Vec::new();
+    if crate::video::kitty::write_new(&probe.0, &[0, 0, 0]).is_ok() {
+        use base64::Engine as _;
+        let name = base64::engine::general_purpose::STANDARD.encode(probe.0.as_os_str().as_encoded_bytes());
+        question.extend(format!("\x1b_Gi=32,s=1,v=1,a=q,t=t,f=24;{name}\x1b\\").bytes());
+    }
     // Kitty graphics, the cell size, then the device attributes every terminal answers,
     // which come back last and end the wait
-    out.write_all(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c").ok()?;
+    question.extend(b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\x1b[16t\x1b[c");
+    out.write_all(&question).ok()?;
     out.flush().ok()?;
     let deadline = std::time::Instant::now() + Duration::from_millis(500);
     let mut answers = Vec::new();
@@ -168,6 +197,7 @@ fn query_terminal(late: &mut bool) -> Option<Picker> {
         answers.extend_from_slice(&chunk[..read as usize]);
     }
     let (kitty, sixel, cell) = parse_answers(&answers);
+    KITTY_FILES.store(kitty && String::from_utf8_lossy(&answers).contains("\x1b_Gi=32;OK"), Ordering::Relaxed);
     // Without the cell size in an answer, the window's size in pixels gives it
     let cell = cell.or_else(|| {
         let size = ratatui::crossterm::terminal::window_size().ok()?;
