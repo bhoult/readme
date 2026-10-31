@@ -1,5 +1,7 @@
 # readme
 
+Made by Claude Opus 5.5, instigated by [Brandon Hoult](https://hoult.co).
+
 **A file viewer and basic editor for the terminal.** A directory tree on the left, the
 file on the right, and the mouse works everywhere. It reads source code, Markdown, CSV,
 images, videos, archives and git history, finds text across a whole project, and keeps
