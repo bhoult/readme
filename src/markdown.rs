@@ -72,8 +72,6 @@ impl Rendered {
 
 type Frag = (String, Style);
 
-/// Table cells wider than this are cut short with "…"
-const MAX_CELL: usize = 60;
 /// Roughly the most memory a table may take laid out. Every cell is padded to its
 /// column's width and kept as text of its own, so a table of many short or empty cells
 /// takes a hundred times its size or more; one past this shows as a note instead.
@@ -490,11 +488,8 @@ impl Renderer {
                 widths[i] = widths[i].max(cell_width(cell));
             }
         }
-        // A wide table runs off to the side rather than squeezing its cells; only
-        // very long cells are cut short
-        for width in &mut widths {
-            *width = (*width).min(MAX_CELL);
-        }
+        // A wide table runs off to the side, where the view scrolls to it, rather than
+        // squeezing its cells or cutting them short
         // Each cell and the bar after it are a span apiece, each with text of its own on the heap
         let row_bytes = widths.iter().sum::<usize>() + cols * (3 + 2 * (size_of::<ratatui::text::Span>() + 32));
         if table.rows.len().saturating_mul(row_bytes) > MAX_TABLE_BYTES {
@@ -795,6 +790,12 @@ mod tests {
         let r = render(md, 20, false);
         let lines: Vec<String> = (0..r.lines.len()).map(|i| r.text(i)).collect();
         assert!(lines[0].contains("a long heading │ another long heading"), "{lines:?}");
+        // However long a cell is, it shows whole, to scroll along
+        let long = "word ".repeat(18);
+        let r2 = render(&format!("| a | b |\n|---|---|\n| {long} | 2 |\n"), 20, false);
+        let row = (0..r2.lines.len()).map(|i| r2.text(i)).find(|l| l.contains("word")).unwrap();
+        assert!(row.contains(long.trim()) && !row.contains('…'), "{row}");
+        assert!(r2.width > 90, "{}", r2.width);
         assert!(lines.iter().any(|l| l.contains("fn main() { let x = 1; let y = 2; }")), "{lines:?}");
         assert!(r.width > 20);
         // With word wrap on, code still wraps
