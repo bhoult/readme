@@ -42,6 +42,7 @@ on Linux.
 - [**Managing files**](#managing-files): mark, drag to move, rename, send to the trash
 - [**Live reload**](#live-reload) when another program changes the open file
 - [**Web pages**](#web-pages) open in the browser, and other videos in the video player
+- [**Settings**](#settings) behind ⚙ Settings: the background, code colors, word wrap, hidden files, tree order and pictures
 
 ## The tree
 
@@ -311,7 +312,8 @@ date too.
 
 | Where | Keys |
 |---|---|
-| Anywhere | `?` help (`F1` while typing) · `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
+| Anywhere | `?` help (`F1` while typing) · `c` settings, or click ⚙ Settings at the bottom right (not while typing) · `Tab` switch panes · `Ctrl+S` save · `Ctrl+Q` or `Ctrl+C` quit |
+| Settings | `↑↓` choose a setting · `←→` change it, shown at once · `Enter` save them as the defaults · `Esc` put back what you had |
 | Tree | `↑↓` `j` `k` move · `Enter` open · `←→` `h` `l` fold · `s` sort · `/` filter · `.` hidden files · `r` refresh · `H` git history · `B` branches · `F` find in files · `q` quit |
 | Files | `x` mark · `Shift`+`↑↓` mark a range · `Delete` to the trash · `F2` rename · `Esc` unmark |
 | Filter | type to filter · `↑↓` choose · `Enter` open · `Esc` clear |
@@ -347,6 +349,9 @@ quits, asking first if there are unsaved changes.
 - On a video, a click plays or pauses it, and a click on the bar under it goes there. A click on the volume control turns the sound on or off, or sets the
   volume, and the wheel turns it up or down.
 - Drag the divider between the panes to resize the tree.
+- Click ⚙ Settings at the bottom right for the settings. There, click a setting's ‹ or ›
+  (or its choice) to change it, or turn the wheel over it. Save saves them; Cancel, or a
+  click outside the box, puts back what you had.
 
 ### Clipboard
 
@@ -366,14 +371,41 @@ does. When every window attached to the session is in one of those, images use r
 pixels; otherwise half-blocks (Linux only). So run herdr in Ghostty, say, rather than
 GNOME Terminal, and keep any other windows on that session in such a terminal too.
 
-`README_IMAGES` overrides the choice: `kitty`, `sixel`, `iterm2`, `halfblocks`, or `auto`
-to ask the terminal.
+That's what the Pictures setting's auto does. The setting can instead pick Kitty, Sixel,
+iTerm2 or half-blocks by hand, and `README_IMAGES` wins over it: `kitty`, `sixel`,
+`iterm2`, `halfblocks`, or `auto`.
 
-### Colors
+### Settings
 
-Highlighting uses bat's `ansi` theme by default, which draws with the terminal's own
-palette. Set `README_THEME` to use another of bat's themes, for example `Nord`,
-`Monokai Extended` or `GitHub`.
+`c`, or ⚙ Settings at the bottom right of the screen, opens the settings. `↑↓` choose
+one and `←→` change it, and each change shows at once. `Enter` or Save saves them as the
+defaults, which readme starts with from then on, and `Esc` or Cancel puts back what you
+had.
+
+- **Background**: OS default, then black, charcoal, dark blues, teal, green, plum, wine
+  and brown, then paper and white, each with a text color that reads on it. OS default
+  paints nothing: the background and text are the terminal's own, which usually follow
+  the system's light or dark theme. On Paper and White, text in the terminal's 16
+  colors, such as headings, code and the tree's folders, takes darker shades of them,
+  and the cursor turns dark, since a terminal's colors are usually made for a dark
+  background. The colors are 24-bit; a terminal that doesn't say it shows 24-bit color,
+  in `COLORTERM`, gets the nearest of the 256 colors instead.
+- **Code colors**: any of bat's 32 themes. The first, `ansi`, draws with the terminal's
+  own palette, so it suits light and dark terminals alike. The others, such as `Nord`,
+  `Monokai Extended` or `GitHub`, have colors of their own, which Paper and White leave
+  as they are.
+- **Word wrap**: on or off for the files you open. `w` turns it on or off until readme
+  quits.
+- **Hidden files**: shown in the tree or hidden, as `.` shows or hides them until readme
+  quits.
+- **Tree order**: by name, biggest first, oldest first or newest first, as `s` sorts it
+  until readme quits.
+- **Pictures**: auto, or Kitty, Sixel, iTerm2 or half-blocks, as under [Images and
+  terminal multiplexers](#images-and-terminal-multiplexers).
+
+The settings are kept in `~/.config/readme/settings.toml`, or under `$XDG_CONFIG_HOME`
+if that's set. `README_THEME` and `README_IMAGES`, when they're set, win over the code
+colors and pictures saved there.
 
 ## Built to stay quick
 
@@ -416,6 +448,8 @@ drags included.
 | `src/external.rs` | opening web pages, and videos readme can't play, in other programs |
 | `src/text.rs` | column math, wrapping, search, styled line slices |
 | `src/clipboard.rs` | copy and paste |
+| `src/background.rs` | the backgrounds to choose from, and the text color for each |
+| `src/settings.rs` | what's kept from one run to the next, in `~/.config/readme/settings.toml` |
 
 Built with [ratatui](https://ratatui.rs) and
 [ratatui-image](https://github.com/ratatui/ratatui-image),

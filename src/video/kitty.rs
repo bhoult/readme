@@ -165,9 +165,98 @@ pub fn placeholders(buf: &mut Buffer, area: Rect, id: u32, first: Option<&str>) 
     }
 }
 
+/// Readies Kitty pictures, ratatui-image's as much as a video's, for a box drawn over
+/// `covered`. A picture goes to the terminal written ahead of its first placeholder, and
+/// only once, so under the box it would never get there: such commands go to the cell
+/// at `to` instead, which serves as well, the placements being virtual. And a row's
+/// placeholders after the first say nothing of where in the picture they are, taking it
+/// from the one before, so the first just past the box is told.
+pub fn uncover(buf: &mut Buffer, covered: Rect, to: ratatui::layout::Position) {
+    let x = covered.right();
+    for y in covered.top()..covered.bottom() {
+        let Some(after) = buf.cell(ratatui::layout::Position::new(x, y)) else { break };
+        if after.symbol() != PLACEHOLDER.to_string() {
+            continue;
+        }
+        // The nearest one before it that says where it is, of the same picture
+        let fg = after.fg;
+        let mut from = x;
+        let marked = loop {
+            let Some(before) = from.checked_sub(1).and_then(|b| buf.cell((b, y))) else { break None };
+            from -= 1;
+            if before.fg != fg || !before.symbol().contains(PLACEHOLDER) {
+                break None;
+            }
+            if let Some(marks) = marks(before.symbol()) {
+                break Some(marks);
+            }
+        };
+        if let Some((row, column, extra)) = marked {
+            let column = column + u32::from(x - from);
+            let symbol: String = [PLACEHOLDER, diacritic(row), diacritic(column), diacritic(extra)].iter().collect();
+            buf[(x, y)].set_symbol(&symbol);
+        }
+    }
+    let mut moved = String::new();
+    for y in covered.top()..covered.bottom() {
+        for x in covered.left()..covered.right() {
+            let Some(cell) = buf.cell_mut((x, y)) else { continue };
+            let symbol = cell.symbol();
+            if let Some(at) = symbol.find(PLACEHOLDER).filter(|&at| at > 0 && symbol.starts_with('\x1b')) {
+                moved.push_str(&symbol[..at]);
+                let rest = symbol[at..].to_string();
+                cell.set_symbol(&rest);
+            }
+        }
+    }
+    if let Some(cell) = buf.cell_mut(to).filter(|_| !moved.is_empty()) {
+        moved.push_str(cell.symbol());
+        cell.set_symbol(&moved)
+            .set_diff_option(ratatui::buffer::CellDiffOption::ForcedWidth(std::num::NonZeroU16::MIN));
+    }
+}
+
+/// The row, column and id byte a placeholder's marks give, if it has them.
+fn marks(symbol: &str) -> Option<(u32, u32, u32)> {
+    let mut marks = symbol.rsplit(PLACEHOLDER).next()?.chars().map(|c| DIACRITICS.iter().position(|&d| d == c as u32));
+    let (row, column) = (marks.next()??, marks.next()??);
+    let extra = marks.next().flatten().unwrap_or(0);
+    Some((row as u32, column as u32, extra as u32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn past_a_box_a_pictures_row_says_where_it_goes_on() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        placeholders(&mut buf, Rect::new(1, 0, 8, 3), 0x0300_0007, None);
+        assert_eq!(buf[(6, 2)].symbol(), PLACEHOLDER.to_string());
+        uncover(&mut buf, Rect::new(3, 1, 3, 2), ratatui::layout::Position::new(0, 0));
+        // Rows 1 and 2 of the picture go on at its column 5, under the box's right edge
+        for y in 1..3 {
+            assert_eq!(marks(buf[(6, y)].symbol()), Some((u32::from(y), 5, 3)), "{:?}", buf[(6, y)].symbol());
+        }
+        // The row above the box, and cells past the first, are as they were
+        assert_eq!(buf[(6, 0)].symbol(), PLACEHOLDER.to_string());
+        assert_eq!(buf[(7, 1)].symbol(), PLACEHOLDER.to_string());
+        assert_eq!(marks(buf[(1, 1)].symbol()), Some((1, 0, 3)));
+    }
+
+    #[test]
+    fn commands_under_a_box_go_to_a_cell_outside_it() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 4));
+        placeholders(&mut buf, Rect::new(2, 1, 4, 2), 7, Some("\x1b_Ga=T,i=7;AAAA\x1b\\"));
+        buf[(0, 0)].set_symbol("x");
+        uncover(&mut buf, Rect::new(1, 1, 6, 3), ratatui::layout::Position::new(0, 0));
+        assert_eq!(buf[(0, 0)].symbol(), "\x1b_Ga=T,i=7;AAAA\x1b\\x");
+        assert!(buf[(2, 1)].symbol().starts_with(PLACEHOLDER), "{:?}", buf[(2, 1)].symbol());
+        // Nothing to move leaves the cell as it was
+        let mut plain = Buffer::empty(Rect::new(0, 0, 3, 1));
+        uncover(&mut plain, Rect::new(1, 0, 2, 1), ratatui::layout::Position::new(0, 0));
+        assert_eq!(plain, Buffer::empty(Rect::new(0, 0, 3, 1)));
+    }
 
     #[test]
     fn files_are_private_and_left_ones_are_taken_back() {

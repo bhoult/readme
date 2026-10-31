@@ -47,6 +47,23 @@ pub enum Sort {
 }
 
 impl Sort {
+    pub const ALL: [Sort; 4] = [Sort::Name, Sort::Size, Sort::Oldest, Sort::Newest];
+
+    /// Its name in the settings file.
+    pub fn key(self) -> &'static str {
+        match self {
+            Sort::Name => "name",
+            Sort::Size => "biggest",
+            Sort::Oldest => "oldest",
+            Sort::Newest => "newest",
+        }
+    }
+
+    /// The one with this name in the settings file.
+    pub fn named(key: &str) -> Option<Self> {
+        Sort::ALL.into_iter().find(|sort| sort.key() == key.trim())
+    }
+
     pub fn next(self) -> Self {
         match self {
             Sort::Name => Sort::Size,

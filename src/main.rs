@@ -3,6 +3,7 @@
 
 mod app;
 mod archive;
+mod background;
 mod buffer;
 mod clipboard;
 mod external;
@@ -14,6 +15,7 @@ mod help;
 mod highlight;
 mod markdown;
 mod picture;
+mod settings;
 mod table;
 mod text;
 mod tree;
@@ -21,11 +23,14 @@ mod video;
 
 use std::{
     env,
-    io::{self, Stdout},
+    io::{self, Stdout, Write},
     panic,
     path::PathBuf,
     process::{Command, Stdio},
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -46,6 +51,21 @@ use picture::LateAnswers;
 
 /// What a panic on another thread said, for the screen to show
 static BACKGROUND_PANIC: Mutex<Option<String>> = Mutex::new(None);
+
+/// Whether readme has given the cursor a color of its own (for a light background), which
+/// the terminal's is put back in place of on the way out.
+static CURSOR_COLORED: AtomicBool = AtomicBool::new(false);
+
+/// Gives the cursor `color` (as OSC 12 has it), or the terminal's own back.
+fn color_cursor(color: Option<&str>) -> io::Result<()> {
+    let mut out = io::stdout();
+    match color {
+        Some(color) => write!(out, "\x1b]12;{color}\x1b\\")?,
+        None => write!(out, "\x1b]112\x1b\\")?,
+    }
+    CURSOR_COLORED.store(color.is_some(), Ordering::Relaxed);
+    out.flush()
+}
 
 /// What tmux's allow-passthrough was for this pane before readme started, empty if the
 /// pane didn't set it. ratatui-image turns it on whenever it's set up inside tmux and
@@ -120,6 +140,10 @@ Keys
                f all, local or remote branches (fetching the remote's)
                Esc leave
   Anywhere     ? help, with the version (F1 while typing)
+               c (not while typing) or ⚙ Settings, bottom right: the settings,
+               the background, code colors, word wrap, hidden files, tree order
+               and pictures. ↑↓ choose one, ←→ change it, shown at once; Enter
+               saves them as the defaults, Esc puts back what you had
                Ctrl+Q or Ctrl+C quit (q when not editing; while editing,
                Ctrl+C copies the selected text if there is some)
 
@@ -128,7 +152,9 @@ Mouse
   file to focus it. Wheel scrolls (Shift+wheel sideways), and over a video
   turns its sound up or down. Drag across text to select and copy it.
   Double-click text to start editing there. Drag the divider to resize the
-  tree.
+  tree. In the settings, a click on a setting's ‹ or › changes it, as does
+  the wheel over it; Save saves them, and Cancel or a click outside puts back
+  what you had.
 
 Also: CSV/TSV files show as tables, images show in the terminal, zip and tar
 archives (.tar.gz, .tar.bz2, .tar.xz, .tar.zst) open like directories, a
@@ -138,10 +164,10 @@ to go back), MP4 and MOV videos with H.264 play in the pane with their sound,
 and Enter on an HTML file or a video opens it in the browser or the video
 player; a click never does.
 
-Environment
-  README_THEME   syntax theme from bat's set (default: ansi, the terminal's colors)
+Environment (each, when set, wins over the settings)
+  README_THEME   code colors from bat's themes (default: ansi, the terminal's colors)
   README_IMAGES  halfblocks, kitty, sixel, iterm2 or auto. Inside tmux or zellij
-                 the default is halfblocks, since they claim graphics support the
+                 auto is halfblocks, since they claim graphics support the
                  terminal around them may not have. Inside herdr, images use real
                  pixels when every herdr window runs in Ghostty, WezTerm or kitty.
 ";
@@ -198,6 +224,9 @@ impl Drop for Tui {
 
 fn restore() {
     restore_passthrough();
+    if CURSOR_COLORED.load(Ordering::Relaxed) {
+        let _ = color_cursor(None);
+    }
     let _ = execute!(
         io::stdout(),
         EndSynchronizedUpdate,
@@ -233,8 +262,8 @@ fn main() -> Result<()> {
     let mut app = App::new(&target)?;
     let mut tui = Tui::start()?;
     // Asking the terminal about graphics needs raw mode, and has to happen before any input is read
-    let (picker, late) = picture::picker();
-    app.set_picker(picker);
+    let (graphics, late) = picture::graphics(app.pictures());
+    app.set_graphics(graphics);
     run(&mut tui.terminal, &mut app, late.then(LateAnswers::new))
 }
 
@@ -246,12 +275,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, mut lat
         }
     };
     let mut bar_cursor = false;
+    let mut cursor_color = None;
     let mut last_tick = Instant::now();
     while !app.quit {
         let started = Instant::now();
         // Terminals that can hold each frame back until all of it is there, so a video's
         // picture never shows half of one and half of the next
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
+        if app.take_redraw() {
+            terminal.clear()?;
+        }
         terminal.draw(|f| app.draw(f))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
         app.drew(started.elapsed());
@@ -259,6 +292,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App, mut lat
             bar_cursor = app.editing();
             let style = if bar_cursor { SetCursorStyle::BlinkingBar } else { SetCursorStyle::DefaultUserShape };
             execute!(io::stdout(), style)?;
+        }
+        // The terminal's cursor color may not show on a light background
+        if app.cursor_color() != cursor_color {
+            cursor_color = app.cursor_color();
+            color_cursor(cursor_color)?;
         }
         // Straight back to drawing while there's more to color in, and back for a video's
         // next picture when it's due, unless a key comes first

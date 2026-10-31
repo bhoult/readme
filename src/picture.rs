@@ -45,38 +45,123 @@ pub fn decode_upright<R: std::io::BufRead + std::io::Seek>(
     Ok(image)
 }
 
-/// How images get drawn, chosen once at startup. A terminal multiplexer answers
-/// graphics queries itself even when the terminal around it can't show the result
-/// (herdr does inside GNOME Terminal), so inside one this keeps to half-blocks. The
-/// exception is herdr whose windows all run in a terminal it passes images on to.
-/// README_IMAGES overrides all this: kitty, sixel, iterm2, halfblocks, or auto to ask
-/// the terminal. Also says whether the terminal was asked and didn't answer in time, so
-/// its answers may yet come, as keys.
-pub fn picker() -> (Picker, bool) {
-    let wanted = env::var("README_IMAGES").unwrap_or_default().to_lowercase();
-    let multiplexed = ["HERDR_ENV", "TMUX", "ZELLIJ", "STY"].iter().any(|v| env::var_os(v).is_some());
-    let herdr_shows_images = wanted.is_empty() && env::var_os("HERDR_ENV").is_some() && herdr_windows_show_images();
-    let mut late = false;
-    let mut picker = match wanted.as_str() {
-        "halfblocks" | "blocks" => Picker::halfblocks(),
-        "" if multiplexed && !herdr_shows_images => Picker::halfblocks(),
-        _ => {
-            let (asked, slow) = ask_terminal();
-            late = slow;
-            asked.unwrap_or_else(Picker::halfblocks)
+/// How pictures are drawn, as the settings have it: auto, or one way picked by hand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Pictures {
+    #[default]
+    Auto,
+    Kitty,
+    Sixel,
+    Iterm2,
+    Halfblocks,
+}
+
+impl Pictures {
+    pub const ALL: [Pictures; 5] =
+        [Pictures::Auto, Pictures::Kitty, Pictures::Sixel, Pictures::Iterm2, Pictures::Halfblocks];
+
+    /// Its name in the settings file, as README_IMAGES has it too.
+    pub fn key(self) -> &'static str {
+        match self {
+            Pictures::Auto => "auto",
+            Pictures::Kitty => "kitty",
+            Pictures::Sixel => "sixel",
+            Pictures::Iterm2 => "iterm2",
+            Pictures::Halfblocks => "halfblocks",
         }
-    };
-    let forced = match wanted.as_str() {
-        "kitty" => Some(ProtocolType::Kitty),
-        "" if herdr_shows_images => Some(ProtocolType::Kitty),
-        "sixel" => Some(ProtocolType::Sixel),
-        "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
-        _ => None,
-    };
-    if let Some(protocol) = forced {
-        picker.set_protocol_type(protocol);
     }
-    (picker, late)
+
+    /// The one with this name, or another README_IMAGES takes for it.
+    pub fn named(name: &str) -> Option<Self> {
+        match name.trim().to_lowercase().as_str() {
+            "iterm" => Some(Pictures::Iterm2),
+            "blocks" => Some(Pictures::Halfblocks),
+            name => Pictures::ALL.into_iter().find(|p| p.key() == name),
+        }
+    }
+
+    /// The way it draws them, or None for auto, which depends on the terminal.
+    pub fn protocol(self) -> Option<ProtocolType> {
+        match self {
+            Pictures::Auto => None,
+            Pictures::Kitty => Some(ProtocolType::Kitty),
+            Pictures::Sixel => Some(ProtocolType::Sixel),
+            Pictures::Iterm2 => Some(ProtocolType::Iterm2),
+            Pictures::Halfblocks => Some(ProtocolType::Halfblocks),
+        }
+    }
+}
+
+/// What a way of drawing pictures is called.
+pub fn protocol_name(protocol: ProtocolType) -> &'static str {
+    match protocol {
+        ProtocolType::Kitty => "Kitty",
+        ProtocolType::Sixel => "Sixel",
+        ProtocolType::Iterm2 => "iTerm2",
+        ProtocolType::Halfblocks => "half-blocks",
+    }
+}
+
+/// How pictures can be drawn here: what the terminal said, if it was asked (its cell
+/// size with it), and what auto picks.
+pub struct Graphics {
+    asked: Picker,
+    auto: ProtocolType,
+    /// README_IMAGES, which wins over the settings
+    forced: Option<Pictures>,
+}
+
+impl Graphics {
+    /// Half-blocks, with nothing asked: until the terminal is, and in tests.
+    pub fn halfblocks() -> Self {
+        Self { asked: Picker::halfblocks(), auto: ProtocolType::Halfblocks, forced: None }
+    }
+
+    /// How pictures are drawn with `choice`, unless README_IMAGES says otherwise.
+    pub fn picker(&self, choice: Pictures) -> Picker {
+        let mut picker = self.asked.clone();
+        picker.set_protocol_type(self.forced.unwrap_or(choice).protocol().unwrap_or(self.auto));
+        picker
+    }
+
+    /// The way auto draws them.
+    pub fn auto(&self) -> ProtocolType {
+        self.auto
+    }
+}
+
+/// How pictures can be drawn, found out at startup, with `saved` the way the settings
+/// have it. A terminal multiplexer answers graphics queries itself even when the
+/// terminal around it can't show the result (herdr does inside GNOME Terminal), so
+/// inside one auto keeps to half-blocks, and the terminal is asked only for a way picked
+/// by hand. The exception is herdr whose windows all run in a terminal it passes images
+/// on to. README_IMAGES overrides the settings: kitty, sixel, iterm2, halfblocks, or
+/// auto. Also says whether the terminal was asked and didn't answer in time, so its
+/// answers may yet come, as keys.
+pub fn graphics(saved: Pictures) -> (Graphics, bool) {
+    let forced = env::var("README_IMAGES").ok().and_then(|wanted| Pictures::named(&wanted));
+    let wanted = forced.unwrap_or(saved);
+    let multiplexed = ["HERDR_ENV", "TMUX", "ZELLIJ", "STY"].iter().any(|v| env::var_os(v).is_some());
+    let herdr_shows_images = env::var_os("HERDR_ENV").is_some() && herdr_windows_show_images();
+    let trusted = !multiplexed || herdr_shows_images;
+    // Half-blocks picked by hand are asked about too, so auto knows what it would be,
+    // though not when README_IMAGES picks them
+    let ask = match wanted {
+        Pictures::Auto => trusted,
+        Pictures::Halfblocks => trusted && forced.is_none(),
+        _ => true,
+    };
+    let (mut asked, mut late) = (Picker::halfblocks(), false);
+    if ask {
+        let (answer, slow) = ask_terminal();
+        (asked, late) = (answer.unwrap_or_else(Picker::halfblocks), slow);
+    }
+    let auto = match () {
+        _ if herdr_shows_images => ProtocolType::Kitty,
+        _ if multiplexed => ProtocolType::Halfblocks,
+        _ => asked.protocol_type(),
+    };
+    (Graphics { asked, auto, forced }, late)
 }
 
 /// Answers to the graphics question that come after the wait for them ended. crossterm
@@ -519,6 +604,21 @@ impl Picture {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pictures_go_by_readme_images_names_and_auto_by_what_was_found() {
+        assert_eq!(Pictures::ALL.map(|p| Pictures::named(p.key())), Pictures::ALL.map(Some));
+        assert_eq!(
+            [" Kitty", "iterm", "blocks", "x"].map(Pictures::named),
+            [Some(Pictures::Kitty), Some(Pictures::Iterm2), Some(Pictures::Halfblocks), None]
+        );
+        let graphics = Graphics { auto: ProtocolType::Kitty, ..Graphics::halfblocks() };
+        assert_eq!(graphics.picker(Pictures::Auto).protocol_type(), ProtocolType::Kitty);
+        assert_eq!(graphics.picker(Pictures::Sixel).protocol_type(), ProtocolType::Sixel);
+        // README_IMAGES wins
+        let forced = Graphics { forced: Some(Pictures::Halfblocks), ..graphics };
+        assert_eq!(forced.picker(Pictures::Kitty).protocol_type(), ProtocolType::Halfblocks);
+    }
 
     fn shows(vars: &[(&'static str, &'static str)]) -> bool {
         terminal_shows_kitty(|name| vars.iter().find(|(k, _)| *k == name).map(|(_, v)| *v))

@@ -21,12 +21,13 @@ use ratatui::{
     layout::{Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Paragraph, Wrap},
+    widgets::{Block, BorderType, Clear, Paragraph, Wrap},
 };
-use ratatui_image::picker::Picker;
+use ratatui_image::picker::{Picker, ProtocolType};
 
 use crate::{
     archive,
+    background::{self, BACKGROUNDS},
     buffer::{Buffer, Loaded, Pos},
     clipboard, external, fileops,
     gallery::{self, Gallery},
@@ -35,8 +36,8 @@ use crate::{
     help,
     highlight::{self, LineCache},
     markdown::{self, Rendered},
-    picture::{self, Picture},
-    table,
+    picture::{self, Graphics, Picture, Pictures},
+    settings, table,
     text::{
         self, Place, char_at_col_from, display_col_from, find_all, line_spans, line_wider_than, place_after_col,
         place_before_char, place_before_col, printable, push_span, row_of, search, slice_line, split_at_width,
@@ -124,7 +125,7 @@ struct Doc {
     /// Column within a wrapped row, kept while moving up and down
     wrap_x: Option<usize>,
     /// The formatted view, with the buffer version, width and highlighting it was made for
-    rendered: Option<((u64, u16, bool, bool), Rendered)>,
+    rendered: Option<((u64, u16, u64, bool), Rendered)>,
     /// First formatted line below the pinned ones, and how far it's scrolled sideways
     fmt_top: usize,
     fmt_left: usize,
@@ -290,8 +291,8 @@ impl Doc {
         // Tables depend on none of the width, wrapping or colors, so changing those doesn't
         // redo one
         let key = match self.kind {
-            Kind::Table(_) => (self.buf.version, 0, false, false),
-            _ => (self.buf.version, width, highlight::get().is_some(), self.wrap),
+            Kind::Table(_) => (self.buf.version, 0, 0, false),
+            _ => (self.buf.version, width, highlight::version(), self.wrap),
         };
         if self.rendered.as_ref().is_none_or(|(k, _)| *k != key) {
             // Laid out again (a new width, or new text), the same source line stays at the top
@@ -806,6 +807,70 @@ enum Prompt {
     Rename(PathBuf, String),
     /// What to find in all the files, being typed
     Grep(String),
+    /// The settings, open over everything, on `row` of `Setting::ALL`; each change shows
+    /// at once, and `was` is what they were, to put back
+    Settings {
+        row: usize,
+        was: Box<Choices>,
+    },
+}
+
+/// The settings, as the box lists them.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Setting {
+    Background,
+    CodeColors,
+    WordWrap,
+    HiddenFiles,
+    TreeOrder,
+    Pictures,
+}
+
+impl Setting {
+    const ALL: [Setting; 6] = [
+        Setting::Background,
+        Setting::CodeColors,
+        Setting::WordWrap,
+        Setting::HiddenFiles,
+        Setting::TreeOrder,
+        Setting::Pictures,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Setting::Background => "Background",
+            Setting::CodeColors => "Code colors",
+            Setting::WordWrap => "Word wrap",
+            Setting::HiddenFiles => "Hidden files",
+            Setting::TreeOrder => "Tree order",
+            Setting::Pictures => "Pictures",
+        }
+    }
+}
+
+/// What the settings are set to.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Choices {
+    background: usize,
+    theme: &'static str,
+    wrap: bool,
+    hidden: bool,
+    sort: Sort,
+    pictures: Pictures,
+}
+
+/// Where the settings were last drawn, for the mouse.
+#[derive(Default)]
+struct SettingsDrawn {
+    /// The whole box: a click outside it puts the settings away
+    modal: Rect,
+    /// The settings' rows, one each
+    rows: Rect,
+    /// The column of the ‹ that goes back a choice; from two to the right of it on, a
+    /// click goes on to the next
+    back: u16,
+    save: Rect,
+    cancel: Rect,
 }
 
 /// A change to files from the tree, waiting for a yes.
@@ -901,12 +966,25 @@ pub struct App {
     fetch: Option<git::Fetch>,
     fetched: HashMap<PathBuf, Instant>,
     picker: Picker,
+    /// How pictures can be drawn here, and the way the settings say to
+    graphics: Graphics,
+    pictures: Pictures,
     /// Videos' volume, in percent: kept from one to the next, and followed by the sound
     /// of the one playing
     volume: Arc<AtomicU8>,
     /// Whether videos' sound is off: so when readme starts, and after that as it was last
     /// turned, in any video, for every one after it
     muted: Arc<AtomicBool>,
+    /// The background under everything, of `BACKGROUNDS`: the first, OS default, leaves
+    /// it to the terminal
+    background: usize,
+    /// The settings file, which keeps the background for next time
+    settings: Option<PathBuf>,
+    settings_drawn: SettingsDrawn,
+    /// The button at the end of the status line that opens the settings
+    settings_button: Rect,
+    /// The whole screen is to be drawn again, not just what changed
+    redraw: bool,
     /// The thumbnails an image was opened from, to go back to
     gallery_stash: Option<Box<Gallery>>,
     /// The left pane shows the matches of a search through all the files
@@ -955,8 +1033,15 @@ impl App {
             fetch: None,
             fetched: HashMap::new(),
             picker: Picker::halfblocks(),
+            graphics: Graphics::halfblocks(),
+            pictures: Pictures::Auto,
             volume: Arc::new(AtomicU8::new(100)),
             muted: Arc::new(AtomicBool::new(true)),
+            background: 0,
+            settings: settings::path(),
+            settings_drawn: SettingsDrawn::default(),
+            settings_button: Rect::default(),
+            redraw: false,
             gallery_stash: None,
             grep: None,
             last_grep: String::new(),
@@ -976,6 +1061,7 @@ impl App {
             last_refresh: Instant::now(),
             quit: false,
         };
+        app.load_settings();
         if let Some(file) = file {
             app.tree.reveal(&file);
             app.open(&file);
@@ -1043,6 +1129,35 @@ impl App {
     /// Typing goes into the file.
     pub fn editing(&self) -> bool {
         self.focus == Focus::Content && matches!(&self.shown, Shown::Doc(doc) if doc.editing)
+    }
+
+    /// The cursor color the background wants, or None for the terminal's own.
+    pub fn cursor_color(&self) -> Option<&'static str> {
+        BACKGROUNDS[self.background].cursor()
+    }
+
+    /// How pictures can be drawn here, once the terminal's been asked: they're drawn the
+    /// way the settings say.
+    pub fn set_graphics(&mut self, graphics: Graphics) {
+        self.graphics = graphics;
+        self.set_pictures(self.pictures);
+    }
+
+    /// The way the settings say to draw pictures, which `set_graphics` wants to know.
+    pub fn pictures(&self) -> Pictures {
+        self.pictures
+    }
+
+    fn set_pictures(&mut self, pictures: Pictures) {
+        self.pictures = pictures;
+        let picker = self.graphics.picker(pictures);
+        self.set_picker(picker);
+    }
+
+    /// Sixel and iTerm2 pictures are drawn once, from where they start, so once the
+    /// settings have been over one, the whole screen is drawn again. Asked once a frame.
+    pub fn take_redraw(&mut self) -> bool {
+        std::mem::take(&mut self.redraw)
     }
 
     /// Text is selected in the editor, which Ctrl+C copies.
@@ -1285,8 +1400,14 @@ impl App {
     }
 
     fn toggle_wrap(&mut self) {
-        self.wrap = !self.wrap;
-        let (wrap, page, width) = (self.wrap, self.page(), self.text_width());
+        self.set_wrap(!self.wrap);
+        self.say(if self.wrap { "Word wrap on" } else { "Word wrap off" });
+    }
+
+    /// Word wrap on or off, for the file shown and those opened from now on.
+    fn set_wrap(&mut self, wrap: bool) {
+        self.wrap = wrap;
+        let (page, width) = (self.page(), self.text_width());
         if let Some(doc) = self.doc() {
             doc.wrap = wrap;
             (doc.top_row, doc.left, doc.wrap_x) = (0, 0, None);
@@ -1294,7 +1415,6 @@ impl App {
                 doc.follow_cursor(page, width);
             }
         }
-        self.say(if wrap { "Word wrap on" } else { "Word wrap off" });
     }
 
     /// Picks up files changed by something else, such as an agent in the next pane.
@@ -1408,6 +1528,7 @@ impl App {
             // In the editor and the filter, ? is typing, so there it's F1
             KeyCode::F(1) => return self.show_help(),
             KeyCode::Char('?') if !self.editing() && !self.filtering => return self.show_help(),
+            KeyCode::Char('c') if !ctrl && !alt && !self.editing() && !self.filtering => return self.open_settings(),
             _ => {}
         }
         match self.focus {
@@ -1503,7 +1624,167 @@ impl App {
                 }
                 _ => self.prompt = Some(Prompt::Rename(path, name)),
             },
+            // Each background shows as it's come to; Esc puts back the one there was
+            // Each change shows at once; Esc puts back what there was
+            Prompt::Settings { mut row, was } => {
+                let setting = Setting::ALL[row];
+                match key.code {
+                    KeyCode::Up | KeyCode::Char('k') => row = row.saturating_sub(1),
+                    KeyCode::Down | KeyCode::Char('j') => row = (row + 1).min(Setting::ALL.len() - 1),
+                    KeyCode::Left | KeyCode::Char('h') => self.change_setting(setting, -1),
+                    KeyCode::Right | KeyCode::Char('l' | ' ') => self.change_setting(setting, 1),
+                    KeyCode::Enter => return self.save_settings(),
+                    KeyCode::Esc | KeyCode::Char('c') => return self.cancel_settings(&was),
+                    _ => {}
+                }
+                self.prompt = Some(Prompt::Settings { row, was });
+            }
         }
+    }
+
+    /// Opens the settings, on the first.
+    fn open_settings(&mut self) {
+        self.prompt = Some(Prompt::Settings { row: 0, was: Box::new(self.choices()) });
+    }
+
+    /// Puts the settings away, as they are.
+    fn close_settings(&mut self) {
+        if matches!(self.prompt, Some(Prompt::Settings { .. })) {
+            self.prompt = None;
+        }
+        self.redraw |= matches!(self.picker.protocol_type(), ProtocolType::Sixel | ProtocolType::Iterm2);
+    }
+
+    /// Puts the settings away and back as they `were`.
+    fn cancel_settings(&mut self, were: &Choices) {
+        self.close_settings();
+        self.apply(were);
+    }
+
+    /// What the settings are set to now.
+    fn choices(&self) -> Choices {
+        Choices {
+            background: self.background,
+            theme: highlight::theme_name(),
+            wrap: self.wrap,
+            hidden: self.tree.show_hidden,
+            sort: self.tree.sort,
+            pictures: self.pictures,
+        }
+    }
+
+    /// Sets the settings to `choices`, at once.
+    fn apply(&mut self, choices: &Choices) {
+        self.background = choices.background;
+        highlight::set_theme(choices.theme);
+        if self.wrap != choices.wrap {
+            self.set_wrap(choices.wrap);
+        }
+        if self.tree.show_hidden != choices.hidden {
+            self.set_hidden(choices.hidden);
+        }
+        if self.tree.sort != choices.sort {
+            self.tree.set_sort(choices.sort);
+        }
+        if self.pictures != choices.pictures {
+            self.set_pictures(choices.pictures);
+        }
+    }
+
+    /// Moves `setting` `delta` choices on, round from the last to the first, at once.
+    fn change_setting(&mut self, setting: Setting, delta: isize) {
+        let on = |at: usize, len: usize| (at as isize + delta).rem_euclid(len as isize) as usize;
+        let mut choices = self.choices();
+        match setting {
+            Setting::Background => choices.background = on(choices.background, BACKGROUNDS.len()),
+            Setting::CodeColors => {
+                let themes: Vec<&str> = highlight::themes().collect();
+                let at = themes.iter().position(|&theme| theme == choices.theme).unwrap_or(0);
+                choices.theme = themes[on(at, themes.len())];
+            }
+            Setting::WordWrap => choices.wrap = !choices.wrap,
+            Setting::HiddenFiles => choices.hidden = !choices.hidden,
+            Setting::TreeOrder => {
+                let at = Sort::ALL.iter().position(|&sort| sort == choices.sort).unwrap_or(0);
+                choices.sort = Sort::ALL[on(at, Sort::ALL.len())];
+            }
+            Setting::Pictures => {
+                let at = Pictures::ALL.iter().position(|&pictures| pictures == choices.pictures).unwrap_or(0);
+                choices.pictures = Pictures::ALL[on(at, Pictures::ALL.len())];
+            }
+        }
+        self.apply(&choices);
+    }
+
+    /// What `setting` is set to, in words.
+    fn setting_value(&self, setting: Setting) -> String {
+        let choices = self.choices();
+        let words = |yes: bool, on: &str, off: &str| if yes { on.to_string() } else { off.to_string() };
+        match setting {
+            Setting::Background => BACKGROUNDS[choices.background].name.to_string(),
+            Setting::CodeColors if choices.theme == "ansi" => "ansi, the terminal's".to_string(),
+            Setting::CodeColors => choices.theme.to_string(),
+            Setting::WordWrap => words(choices.wrap, "on", "off"),
+            Setting::HiddenFiles => words(choices.hidden, "shown", "hidden"),
+            Setting::TreeOrder => choices.sort.label().to_string(),
+            Setting::Pictures => match choices.pictures.protocol() {
+                None => format!("auto: {}", picture::protocol_name(self.graphics.auto())),
+                Some(protocol) => picture::protocol_name(protocol).to_string(),
+            },
+        }
+    }
+
+    /// Puts the settings away, keeping them, and saves them for next time.
+    fn save_settings(&mut self) {
+        self.close_settings();
+        let choices = self.choices();
+        let on = |yes: bool, on: &'static str, off: &'static str| if yes { on } else { off };
+        let saved = [
+            ("background", BACKGROUNDS[choices.background].name),
+            ("code_colors", choices.theme),
+            ("word_wrap", on(choices.wrap, "on", "off")),
+            ("hidden_files", on(choices.hidden, "shown", "hidden")),
+            ("tree_order", choices.sort.key()),
+            ("pictures", choices.pictures.key()),
+        ];
+        let Some(path) = self.settings.clone() else {
+            return self.say("Settings kept until readme quits: there's no home folder to save them in");
+        };
+        match settings::set(&path, &saved) {
+            Ok(()) => self.say(format!("Settings saved, in {}", tilde(&path))),
+            Err(e) => {
+                self.say(format!("Settings kept until readme quits: they can't be saved in {}: {e}", tilde(&path)))
+            }
+        }
+    }
+
+    /// The settings saved last time, where there are any. README_THEME and README_IMAGES,
+    /// when they're set, win over theirs.
+    fn load_settings(&mut self) {
+        let saved = self.settings.as_deref().map(settings::read).unwrap_or_default();
+        let get = |key: &str| saved.get(key).map(String::as_str);
+        self.background = get("background").and_then(background::named).unwrap_or(0);
+        if std::env::var_os("README_THEME").is_none_or(|theme| theme.is_empty())
+            && let Some(theme) = get("code_colors")
+        {
+            highlight::set_theme(theme);
+        }
+        self.set_wrap(get("word_wrap") == Some("on"));
+        let hidden = get("hidden_files") == Some("shown");
+        if hidden != self.tree.show_hidden {
+            self.set_hidden(hidden);
+        }
+        let sort = get("tree_order").and_then(Sort::named).unwrap_or_default();
+        if sort != self.tree.sort {
+            self.tree.set_sort(sort);
+        }
+        self.set_pictures(get("pictures").and_then(Pictures::named).unwrap_or_default());
+    }
+
+    /// Shows hidden and ignored files in the tree, or hides them.
+    fn set_hidden(&mut self, shown: bool) {
+        self.tree.show_hidden = shown;
+        self.tree.refresh();
     }
 
     fn tree_key(&mut self, key: KeyEvent) {
@@ -1556,8 +1837,7 @@ impl App {
             KeyCode::Esc if !self.tree.marks.is_empty() => self.tree.marks.clear(),
             KeyCode::Esc if self.tree.filter.is_some() => self.tree.set_filter(None),
             KeyCode::Char('.') => {
-                self.tree.show_hidden = !self.tree.show_hidden;
-                self.tree.refresh();
+                self.set_hidden(!self.tree.show_hidden);
                 self.say(if self.tree.show_hidden {
                     "Showing hidden and ignored files"
                 } else {
@@ -2612,7 +2892,7 @@ impl App {
                 self.search = (!query.is_empty()).then(|| query.clone());
             }
             Some(Prompt::Rename(_, name) | Prompt::Grep(name)) => name.push_str(first_line),
-            Some(Prompt::Unsaved(_) | Prompt::Overwrite(_) | Prompt::Confirm(_)) => {}
+            Some(Prompt::Unsaved(_) | Prompt::Overwrite(_) | Prompt::Confirm(_) | Prompt::Settings { .. }) => {}
             None if self.focus == Focus::Tree && self.filtering => {
                 let query = format!("{}{first_line}", self.tree.filter.clone().unwrap_or_default());
                 self.tree.set_filter(Some(query));
@@ -2720,8 +3000,14 @@ impl App {
         let at = Position::new(x, y);
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(Prompt::Settings { .. }) = self.prompt {
+                    return self.settings_click(x, y);
+                }
                 if self.prompt.is_some() {
                     return;
+                }
+                if self.settings_button.contains(at) {
+                    return self.open_settings();
                 }
                 let double =
                     self.last_click.is_some_and(|(t, cx, cy)| t.elapsed() < DOUBLE_CLICK && (cx, cy) == (x, y));
@@ -2802,7 +3088,15 @@ impl App {
                 } else {
                     WHEEL
                 };
-                if self.tree_area.contains(at) && self.grep.is_some() {
+                // With the settings open the wheel is theirs: over one, a notch changes it
+                let rows = self.settings_drawn.rows;
+                if let Some(Prompt::Settings { row, .. }) = &mut self.prompt {
+                    let over = usize::from(y.saturating_sub(rows.y));
+                    if rows.contains(at) && over < Setting::ALL.len() {
+                        *row = over;
+                        self.change_setting(Setting::ALL[over], delta.signum());
+                    }
+                } else if self.tree_area.contains(at) && self.grep.is_some() {
                     let height = self.tree_area.height as usize;
                     if let Some(grep) = &mut self.grep {
                         grep.scroll = grep.scroll.saturating_add_signed(delta).min(grep.rows().saturating_sub(height));
@@ -2852,6 +3146,30 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A click in the settings: on one, its ‹ goes back a choice and the rest of its
+    /// choice on to the next. Save saves them, and Cancel, or a click outside the box,
+    /// puts back what there was.
+    fn settings_click(&mut self, x: u16, y: u16) {
+        let (at, drawn) = (Position::new(x, y), &self.settings_drawn);
+        let (rows, back, save, cancel, modal) = (drawn.rows, drawn.back, drawn.save, drawn.cancel, drawn.modal);
+        let Some(Prompt::Settings { row, .. }) = &mut self.prompt else { return };
+        let clicked = usize::from(y.saturating_sub(rows.y));
+        if save.contains(at) {
+            self.save_settings();
+        } else if rows.contains(at) && clicked < Setting::ALL.len() {
+            *row = clicked;
+            match x {
+                _ if x == back => self.change_setting(Setting::ALL[clicked], -1),
+                _ if x >= back + 2 => self.change_setting(Setting::ALL[clicked], 1),
+                _ => {}
+            }
+        } else if (cancel.contains(at) || !modal.contains(at))
+            && let Some(Prompt::Settings { was, .. }) = self.prompt.take()
+        {
+            self.cancel_settings(&was);
         }
     }
 
@@ -3303,6 +3621,12 @@ impl App {
     pub fn draw(&mut self, f: &mut Frame) {
         self.settle();
         let area = f.area();
+        // The background under everything, the one on show while choosing one: what's
+        // drawn over it with no color of its own keeps it
+        let background = &BACKGROUNDS[self.background];
+        if let Some(style) = background.style() {
+            f.buffer_mut().set_style(area, style);
+        }
         if area.width < 30 || area.height < 5 {
             // A video playing on unseen keeps taking its pictures as they come due, or the
             // wait for the next one would be none at all, and the loop would spin
@@ -3349,6 +3673,10 @@ impl App {
         f.render_widget(Paragraph::new(bar), Rect::new(self.divider_x, area.y, 1, body));
         self.draw_content(f, Rect::new(self.divider_x + 1, area.y, area.width - tw - 1, body));
         self.draw_status(f, Rect::new(area.x, area.y + body, area.width, 1));
+        if matches!(self.prompt, Some(Prompt::Settings { .. })) {
+            self.draw_settings(f, area, background.style());
+        }
+        background.recolor(f.buffer_mut());
     }
 
     fn draw_tree(&mut self, f: &mut Frame, header_area: Rect) {
@@ -3472,6 +3800,73 @@ impl App {
             lines.push(Line::styled(note, dim()));
         }
         f.render_widget(Paragraph::new(lines), list);
+    }
+
+    /// The settings, in a box over the middle of the screen, `fill` its colors: one to a
+    /// row, each with its choice between a ‹ and a › that change it, the one the keys
+    /// change picked out, and under them the buttons that save them or put back what
+    /// there was.
+    fn draw_settings(&mut self, f: &mut Frame, area: Rect, fill: Option<Style>) {
+        let count = Setting::ALL.len() as u16;
+        // Between the top line, whose first cell takes any picture the box would keep
+        // from the terminal, and the status line
+        let room = area.height.saturating_sub(2);
+        let (width, height) = (50.min(area.width.saturating_sub(2)), (count + 5).min(room));
+        let modal = Rect::new(area.x + (area.width - width) / 2, area.y + 1 + (room - height) / 2, width, height);
+        video::kitty::uncover(f.buffer_mut(), modal, Position::new(area.x, area.y));
+        f.render_widget(Clear, modal);
+        if let Some(fill) = fill {
+            f.buffer_mut().set_style(modal, fill);
+        }
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let block =
+            Block::bordered().border_type(BorderType::Rounded).title(Line::styled(" Settings ", bold).centered());
+        let inner = block.inner(modal);
+        f.render_widget(block, modal);
+        // A line of room over and under the settings, then the buttons, given the room
+        let roomy = inner.height >= count + 3;
+        let rows = Rect { y: inner.y + u16::from(roomy), height: count.min(inner.height), ..inner };
+        const LABEL: usize = 13;
+        let back = inner.x + LABEL as u16 + 2;
+        let mut drawn = SettingsDrawn { modal, rows, back, ..SettingsDrawn::default() };
+        if roomy {
+            let x = inner.x + inner.width.saturating_sub(16) / 2;
+            (drawn.save, drawn.cancel) =
+                (Rect::new(x, inner.bottom() - 1, 6, 1), Rect::new(x + 8, inner.bottom() - 1, 8, 1));
+            let save = Style::new().fg(Color::Indexed(231)).bg(TITLE_FOCUSED).add_modifier(Modifier::BOLD);
+            f.render_widget(Paragraph::new(" Save ").style(save), drawn.save.intersection(inner));
+            let cancel = Style::new().fg(Color::Indexed(251)).bg(TITLE).add_modifier(Modifier::BOLD);
+            f.render_widget(Paragraph::new(" Cancel ").style(cancel), drawn.cancel.intersection(inner));
+        }
+        self.settings_drawn = drawn;
+        let Some(Prompt::Settings { row, .. }) = &self.prompt else { return };
+        let row = *row;
+        let mut lines = Vec::new();
+        for (i, &setting) in Setting::ALL.iter().enumerate().take(rows.height as usize) {
+            let (picked, arrow) =
+                if i == row { (Style::new().add_modifier(Modifier::REVERSED), bold) } else { (Style::new(), dim()) };
+            let label = format!("{:<width$}", setting.label(), width = LABEL);
+            let mut spans = vec![
+                Span::raw(" "),
+                Span::styled(label, picked),
+                Span::raw(" "),
+                Span::styled("‹", arrow),
+                Span::raw(" "),
+            ];
+            let (mut value, mut room) = (self.setting_value(setting), (inner.width as usize).saturating_sub(LABEL + 7));
+            // A swatch of the background's color, which OS default hasn't one of
+            if setting == Setting::Background
+                && let Some(swatch) = BACKGROUNDS[self.background].style()
+            {
+                spans.push(Span::styled("   ", swatch));
+                (value, room) = (format!(" {value}"), room.saturating_sub(3));
+            }
+            let value = split_at_width(&value, room).0;
+            spans.push(Span::styled(format!("{value}{}", " ".repeat(room - str_width(value))), picked));
+            spans.extend([Span::raw(" "), Span::styled("›", arrow)]);
+            lines.push(Line::from(spans));
+        }
+        f.render_widget(Paragraph::new(lines), rows);
     }
 
     fn draw_history(&mut self, f: &mut Frame, header_area: Rect) {
@@ -3769,6 +4164,7 @@ impl App {
     }
 
     fn draw_status(&mut self, f: &mut Frame, area: Rect) {
+        self.settings_button = Rect::default();
         if let Some(prompt) = &self.prompt {
             let text = match prompt {
                 Prompt::Unsaved(_) => {
@@ -3788,6 +4184,7 @@ impl App {
                 }
                 Prompt::Rename(_, name) => format!(" Rename to: {name}"),
                 Prompt::Grep(query) => format!(" Find in files: {query}"),
+                Prompt::Settings { .. } => " Settings: ↑↓ choose · ←→ change · ⏎ save · Esc cancel".to_string(),
             };
             let style = Style::new().add_modifier(Modifier::BOLD);
             if let Prompt::Search(_) | Prompt::Rename(..) | Prompt::Grep(_) = prompt {
@@ -3804,14 +4201,25 @@ impl App {
             Focus::Content => (" VIEW ", Color::Cyan),
         };
         let message = self.message.as_ref().filter(|(_, at)| at.elapsed() < MESSAGE_FOR).map(|(m, _)| m.clone());
+        let saying = message.is_some();
         let (text, text_style) = match message {
             Some(m) => (m, Style::new().add_modifier(Modifier::BOLD)),
             None => (self.hints().to_string(), dim()),
         };
         let position = self.position();
-        let room = (area.width as usize).saturating_sub(mode.len() + position.len() + 3);
+        // At the end, the button that opens the settings, which gives a message that
+        // wouldn't fit beside it the room of its name. Two spaces after the gear, which
+        // Ghostty draws over the cell after it.
+        let room =
+            |button: &str| (area.width as usize).saturating_sub(mode.len() + position.len() + str_width(button) + 3);
+        let full = " ⚙  Settings ";
+        let button = if saying && str_width(&text) > room(full) { " ⚙ " } else { full };
+        let room = room(button);
         let text = split_at_width(&text, room).0.to_string();
         let pad = room.saturating_sub(str_width(&text));
+        let before = mode.len() + str_width(&text) + pad + position.len() + 3;
+        let x = area.x.saturating_add(before as u16).min(area.right());
+        self.settings_button = Rect::new(x, area.y, (str_width(button) as u16).min(area.right() - x), 1);
         let line = Line::from(vec![
             Span::styled(mode, Style::new().fg(Color::Black).bg(color).add_modifier(Modifier::BOLD)),
             Span::raw(" "),
@@ -3819,6 +4227,7 @@ impl App {
             Span::raw(" ".repeat(pad + 1)),
             Span::styled(position, dim()),
             Span::raw(" "),
+            Span::styled(button, Style::new().fg(Color::Indexed(231)).bg(TITLE).add_modifier(Modifier::BOLD)),
         ]);
         f.render_widget(Paragraph::new(line), area);
     }
@@ -4109,12 +4518,14 @@ fn scope_name(repo: &Path, scope: &Path, file: Option<&str>) -> String {
 /// A changed file's line in a list: its status letter in color (a space for one that
 /// didn't change), and its path, the end of it if it's long.
 fn file_line(status: char, path: &str, base: Style, width: usize) -> Line<'static> {
+    // A space has no color of its own, so a background's text color stays (selected,
+    // reversed, that's the row's bar)
     let color = match status {
-        'A' => Color::Green,
-        'D' => Color::Red,
-        'R' | 'C' => Color::Cyan,
-        ' ' => Color::Reset,
-        _ => Color::Yellow,
+        'A' => Some(Color::Green),
+        'D' => Some(Color::Red),
+        'R' | 'C' => Some(Color::Cyan),
+        ' ' => None,
+        _ => Some(Color::Yellow),
     };
     let text = printable(path);
     let room = width.saturating_sub(4);
@@ -4122,8 +4533,9 @@ fn file_line(status: char, path: &str, base: Style, width: usize) -> Line<'stati
     let shown = tail_width(&text, room).to_string();
     let pad = room.saturating_sub(str_width(&shown));
     let path_style = if status == ' ' { base.add_modifier(Modifier::DIM) } else { base };
+    let status_style = color.map_or(base, |color| base.fg(color));
     Line::from(vec![
-        Span::styled(format!(" {status} "), base.fg(color).add_modifier(Modifier::BOLD)),
+        Span::styled(format!(" {status} "), status_style.add_modifier(Modifier::BOLD)),
         Span::styled(shown, path_style),
         Span::styled(" ".repeat(pad + 1), base),
     ])
@@ -5908,5 +6320,207 @@ mod tests {
         h.key_with(KeyCode::Char('z'), KeyModifiers::CONTROL);
         h.key(KeyCode::F(1));
         assert!(h.screen().contains(" readme help") && !h.app.editing(), "{}", h.screen());
+    }
+
+    /// The text and background colors of the cell at `x`, `y`.
+    fn colors_at(h: &Harness, x: u16, y: u16) -> (Color, Color) {
+        let cell = &h.term.backend().buffer()[(x, y)];
+        (cell.fg, cell.bg)
+    }
+
+    /// The colors `name` of the backgrounds paints.
+    fn painted(name: &str) -> (Color, Color) {
+        let style = BACKGROUNDS[background::named(name).unwrap()].style().unwrap();
+        (style.fg.unwrap(), style.bg.unwrap())
+    }
+
+    /// What the settings box says `label` is set to.
+    fn setting(h: &Harness, label: &str) -> String {
+        let (_, y) = h.find(&format!(" {label} "));
+        let row = h.row(y);
+        row.split('‹').nth(1).and_then(|rest| rest.split('›').next()).unwrap_or_default().trim().to_string()
+    }
+
+    #[test]
+    fn c_opens_the_settings_where_each_change_shows_at_once_and_enter_saves_them() {
+        let big = "x".repeat(5000);
+        let mut h = Harness::new(&[("notes.txt", "hello\n"), ("big.txt", &big), (".hidden", "x\n")]);
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("readme/settings.toml");
+        h.app.settings = Some(settings.clone());
+        // Beside the file, where nothing's drawn
+        let blank = |h: &Harness| colors_at(h, 70, 10);
+        let terminals = (Color::Reset, Color::Reset);
+        assert_eq!(blank(&h), terminals);
+        let first = h.app.choices();
+
+        // The status line ends with the button that opens the settings
+        assert!(h.row(19).ends_with(" ⚙  Settings "), "{}", h.screen());
+        h.key(KeyCode::Char('c'));
+        let screen = h.screen();
+        assert!(screen.contains("╭─") && screen.contains(" Settings ") && screen.contains(" Save "), "{screen}");
+        assert!(h.row(19).contains(" Settings: ↑↓ choose · ←→ change · ⏎ save · Esc cancel"), "{screen}");
+        let values = ["Background", "Code colors", "Word wrap", "Hidden files", "Tree order", "Pictures"]
+            .map(|label| setting(&h, label));
+        let expected = ["OS default", "ansi, the terminal's", "off", "hidden", "by name", "auto: half-blocks"];
+        assert_eq!(values, expected, "{screen}");
+
+        // Each change shows at once: ← → change the one ↑ ↓ come to
+        h.key(KeyCode::Right);
+        assert_eq!((setting(&h, "Background"), blank(&h)), ("Black".to_string(), painted("Black")));
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        assert_eq!(setting(&h, "Code colors"), "base16");
+        assert_eq!(highlight::theme_name(), "base16");
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        assert_eq!((setting(&h, "Word wrap").as_str(), h.app.wrap), ("on", true));
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        assert_eq!(setting(&h, "Hidden files"), "shown");
+        assert!(h.screen().contains(".hidden"), "{}", h.screen());
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        assert_eq!(setting(&h, "Tree order"), "biggest first");
+        assert!(h.row(0).contains("biggest first"), "{}", h.screen());
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        assert_eq!((setting(&h, "Pictures").as_str(), h.app.picker.protocol_type()), ("Kitty", ProtocolType::Kitty));
+        // Esc puts them all back
+        h.key(KeyCode::Esc);
+        assert_eq!(h.app.choices(), first);
+        assert_eq!((blank(&h), h.app.picker.protocol_type()), (terminals, ProtocolType::Halfblocks));
+        assert!(!h.screen().contains("╭─") && !h.screen().contains(".hidden") && !settings.exists(), "{}", h.screen());
+
+        // Enter keeps them and saves them: here ← goes round to the last background and
+        // the last theme, wrap goes on, hidden files stay hidden, and the tree's order and
+        // the pictures go round to the last, newest first and half-blocks
+        h.key(KeyCode::Char('c'));
+        let (down, left, right) = (KeyCode::Down, KeyCode::Left, KeyCode::Right);
+        for key in [left, down, left, down, right, down, down, left, down, left, KeyCode::Enter] {
+            h.key(key);
+        }
+        assert_eq!(blank(&h), painted("White"));
+        assert!(h.row(19).contains("Settings saved, in "), "{}", h.screen());
+        let saved = format!(
+            "background = \"White\"\ncode_colors = \"{}\"\nword_wrap = \"on\"\nhidden_files = \"hidden\"\ntree_order = \"newest\"\npictures = \"halfblocks\"\n",
+            highlight::themes().last().unwrap()
+        );
+        assert_eq!(fs::read_to_string(&settings).unwrap(), saved);
+        // ...for readme to start with next time
+        let mut later = Harness::new(&[("a.txt", "a\n")]);
+        highlight::set_theme("ansi");
+        later.app.settings = Some(settings.clone());
+        later.app.load_settings();
+        later.draw();
+        assert_eq!(later.app.choices(), h.app.choices());
+        assert_eq!(blank(&later), painted("White"));
+
+        // Typing a filter, c is typing
+        h.key(KeyCode::Char('/'));
+        h.typing("c");
+        assert!(h.app.prompt.is_none() && h.app.tree.filter.as_deref() == Some("c"), "{}", h.screen());
+    }
+
+    #[test]
+    fn text_on_a_background_takes_a_color_that_reads_on_it() {
+        let mut h = Harness::new(&[("notes.md", "# Title\n\nhello\n")]);
+        let (x, y) = h.find("notes.md");
+        h.click(x, y);
+        // Wide enough for the settings to leave the file in sight
+        h.term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        h.draw();
+        let (x, y) = h.find("hello");
+        let text = |h: &Harness| colors_at(h, x, y).0;
+        let (tx, ty) = h.find("Title");
+        let title = |h: &Harness| colors_at(h, tx, ty).0;
+        assert_eq!((text(&h), title(&h)), (Color::Reset, Color::Magenta));
+        h.key(KeyCode::Char('c'));
+        h.key(KeyCode::Left);
+        assert_eq!(text(&h), painted("White").0);
+        // The terminal's colors, made for its own background, go darker on a light one,
+        // and so does the cursor
+        assert!(!matches!(title(&h), Color::Magenta | Color::Reset), "{:?}", title(&h));
+        assert_eq!(h.app.cursor_color(), Some("rgb:1c/1c/1c"));
+        h.key(KeyCode::Right);
+        h.key(KeyCode::Right);
+        assert_eq!((text(&h), title(&h)), (painted("Black").0, Color::Magenta));
+        assert_eq!(h.app.cursor_color(), None);
+        assert_ne!(painted("White").0, painted("Black").0);
+        // The background has a swatch of its color, which OS default hasn't one of
+        let (x, y) = h.find("Black");
+        assert_eq!(colors_at(&h, x - 3, y).1, painted("Black").1);
+        h.key(KeyCode::Left);
+        let (_, y) = h.find("OS default");
+        assert!(h.row(y).contains("‹ OS default"), "{}", h.screen());
+        // An unchanged file's status in a list keeps the background's text color
+        assert_eq!(file_line(' ', "a.txt", Style::new(), 20).spans[0].style.fg, None);
+        assert_eq!(file_line('A', "a.txt", Style::new(), 20).spans[0].style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn new_code_colors_show_at_once() {
+        let mut h = Harness::new(&[("main.rs", "fn main() {}\n")]);
+        let (x, y) = h.find("main.rs");
+        h.click(x, y);
+        let (x, y) = h.find("fn main");
+        h.draw_until(|h| colors_at(h, x, y).0 != Color::Reset);
+        let ansi = colors_at(&h, x, y).0;
+        h.term = Terminal::new(TestBackend::new(160, 20)).unwrap();
+        h.key(KeyCode::Char('c'));
+        h.key(KeyCode::Down);
+        h.key(KeyCode::Right);
+        h.key(KeyCode::Right);
+        assert_eq!(setting(&h, "Code colors"), highlight::themes().nth(2).unwrap());
+        h.draw_until(|h| colors_at(h, x, y).0 != ansi);
+        assert!(matches!(colors_at(&h, x, y).0, Color::Rgb(..)), "{:?}", colors_at(&h, x, y));
+        // And back
+        h.key(KeyCode::Esc);
+        h.draw_until(|h| colors_at(h, x, y).0 == ansi);
+        assert_eq!(colors_at(&h, x, y).0, ansi);
+    }
+
+    #[test]
+    fn the_settings_button_opens_them_and_the_mouse_changes_saves_or_cancels() {
+        let mut h = Harness::new(&[("notes.txt", "hello\n")]);
+        let blank = |h: &Harness| colors_at(h, 70, 10);
+        let open = |h: &mut Harness| {
+            let (x, y) = h.find("⚙");
+            h.click(x, y);
+            assert!(h.screen().contains("╭─") && h.app.prompt.is_some(), "{}", h.screen());
+        };
+        open(&mut h);
+        // On a setting, its ‹ goes back a choice, and the rest of its choice on to the next
+        let (back, top) = (h.app.settings_drawn.back, h.app.settings_drawn.rows.y);
+        h.click(back + 6, top);
+        assert_eq!(blank(&h), painted("Black"));
+        h.click(back + 2, top);
+        assert_eq!(blank(&h), painted("Charcoal"));
+        h.click(back, top);
+        assert_eq!(blank(&h), painted("Black"));
+        // The wheel over one changes it
+        h.mouse(MouseEventKind::ScrollDown, back + 6, top + 2);
+        assert!(h.app.wrap && setting(&h, "Word wrap") == "on", "{}", h.screen());
+        // Cancel, or a click outside the box, puts back what there was
+        let (x, y) = h.find(" Cancel ");
+        h.click(x, y);
+        assert_eq!((blank(&h), h.app.wrap, h.app.prompt.is_none()), ((Color::Reset, Color::Reset), false, true));
+        open(&mut h);
+        h.click(back + 6, top);
+        h.click(2, 10);
+        assert_eq!((blank(&h), h.app.prompt.is_none()), ((Color::Reset, Color::Reset), true));
+        // Save keeps them
+        open(&mut h);
+        h.click(back + 6, top);
+        let (x, y) = h.find(" Save ");
+        h.click(x, y);
+        assert_eq!((blank(&h), h.app.prompt.is_none()), (painted("Black"), true));
+        // Sixel pictures are drawn just once, so once the box is away, everything's
+        // drawn again
+        assert!(!h.app.take_redraw());
+        h.app.picker.set_protocol_type(ProtocolType::Sixel);
+        h.key(KeyCode::Char('c'));
+        h.key(KeyCode::Esc);
+        assert!(h.app.take_redraw() && !h.app.take_redraw());
     }
 }

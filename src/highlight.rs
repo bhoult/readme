@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -14,14 +14,91 @@ use syntect::{
     highlighting::{self, FontStyle, HighlightIterator, HighlightState, Highlighter, Theme},
     parsing::{ParseState, ScopeStack, SyntaxReference, SyntaxSet},
 };
-use two_face::theme::EmbeddedThemeName;
+use two_face::theme::{EmbeddedLazyThemeSet, EmbeddedThemeName};
 
 pub struct Highlighting {
     syntaxes: SyntaxSet,
-    theme: Theme,
 }
 
 static LOADED: OnceLock<Highlighting> = OnceLock::new();
+
+/// The theme the colors come from, and how many times it's been changed, which tells
+/// colors worked out with an earlier one apart.
+struct Chosen {
+    name: EmbeddedThemeName,
+    theme: Arc<Theme>,
+    changes: u64,
+}
+
+impl Chosen {
+    fn new(name: EmbeddedThemeName, changes: u64) -> Self {
+        Self { name, theme: Arc::new(two_face::theme::extra().get(name).clone()), changes }
+    }
+
+    /// README_THEME's theme, or else ansi, which draws with the terminal's own palette
+    /// and so suits light and dark terminals alike.
+    fn first() -> Self {
+        let wanted = std::env::var("README_THEME").ok().and_then(|name| named(&name));
+        Self::new(wanted.unwrap_or(EmbeddedThemeName::Ansi), 0)
+    }
+}
+
+#[cfg(not(test))]
+static CHOSEN: Mutex<Option<Chosen>> = Mutex::new(None);
+
+#[cfg(not(test))]
+fn chosen<R>(f: impl FnOnce(&mut Chosen) -> R) -> R {
+    f(CHOSEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Chosen::first))
+}
+
+// Each test has a theme of its own, as it has a thread of its own, so one that changes
+// it leaves the colors in the others alone
+#[cfg(test)]
+thread_local! {
+    static CHOSEN: std::cell::RefCell<Option<Chosen>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn chosen<R>(f: impl FnOnce(&mut Chosen) -> R) -> R {
+    CHOSEN.with(|chosen| f(chosen.borrow_mut().get_or_insert_with(Chosen::first)))
+}
+
+/// The theme called `name`, in any case.
+fn named(name: &str) -> Option<EmbeddedThemeName> {
+    EmbeddedLazyThemeSet::theme_names().iter().copied().find(|n| n.as_name().eq_ignore_ascii_case(name.trim()))
+}
+
+/// The themes there are, by name, ansi (the terminal's own palette) first.
+pub fn themes() -> impl Iterator<Item = &'static str> {
+    EmbeddedLazyThemeSet::theme_names().iter().map(|n| n.as_name())
+}
+
+/// The name of the theme the colors come from.
+pub fn theme_name() -> &'static str {
+    chosen(|chosen| chosen.name.as_name())
+}
+
+/// Takes the colors from the theme called `name` (in any case) from now on; false if
+/// there's no such theme.
+pub fn set_theme(name: &str) -> bool {
+    let Some(name) = named(name) else { return false };
+    chosen(|chosen| {
+        if chosen.name != name {
+            *chosen = Chosen::new(name, chosen.changes + 1);
+        }
+    });
+    true
+}
+
+fn theme() -> Arc<Theme> {
+    chosen(|chosen| chosen.theme.clone())
+}
+
+/// What colors are worked out with: 0 until highlighting has loaded, and a new number
+/// after each change of theme.
+pub fn version() -> u64 {
+    if LOADED.get().is_some() { chosen(|chosen| chosen.changes) + 1 } else { 0 }
+}
 
 /// Loading the syntax definitions takes a moment, so it happens in the background;
 /// until it's done, files show without colors.
@@ -50,11 +127,12 @@ fn built(hl: &'static Highlighting, syntax: &'static SyntaxReference, text: &[St
     }
     asked.insert(syntax.name.clone(), false);
     let sample: Vec<String> = text.iter().take(SAMPLE).filter(|l| l.len() <= MAX_LINE).cloned().collect();
+    let theme = theme();
     let started = std::thread::Builder::new().name("syntax".into()).spawn(move || {
         // Done even if building fails, so the file isn't left waiting: what's needed is
         // then built as it's highlighted
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let mut lines = HighlightLines::new(syntax, &hl.theme);
+            let mut lines = HighlightLines::new(syntax, &theme);
             for line in &sample {
                 let _ = lines.highlight_line(&format!("{line}\n"), &hl.syntaxes);
             }
@@ -69,17 +147,7 @@ fn built(hl: &'static Highlighting, syntax: &'static SyntaxReference, text: &[St
 }
 
 pub fn load() -> &'static Highlighting {
-    LOADED.get_or_init(|| {
-        // The "ansi" theme uses the terminal's own palette, so it suits light and dark
-        // themes alike; README_THEME picks any other theme bat ships.
-        let wanted = std::env::var("README_THEME").unwrap_or_default();
-        let name = two_face::theme::EmbeddedLazyThemeSet::theme_names()
-            .iter()
-            .copied()
-            .find(|n| n.as_name().eq_ignore_ascii_case(&wanted))
-            .unwrap_or(EmbeddedThemeName::Ansi);
-        Highlighting { syntaxes: two_face::syntax::extra_newlines(), theme: two_face::theme::extra().get(name).clone() }
-    })
+    LOADED.get_or_init(|| Highlighting { syntaxes: two_face::syntax::extra_newlines() })
 }
 
 impl Highlighting {
@@ -141,13 +209,15 @@ pub struct LineCache {
     state: Option<(ParseState, HighlightState)>,
     /// The syntax is being built in the background, so there are no colors yet
     building: bool,
+    /// The theme's changes when these colors were worked out
+    changes: u64,
 }
 
 impl LineCache {
     pub fn new(path: &Path, lines: &[String]) -> Self {
         let disabled = too_slow(lines);
-        let (lines, checkpoints) = (Vec::new(), Vec::new());
-        Self { path: path.into(), syntax: None, disabled, lines, checkpoints, state: None, building: false }
+        let (lines, checkpoints, changes) = (Vec::new(), Vec::new(), chosen(|chosen| chosen.changes));
+        Self { path: path.into(), syntax: None, disabled, lines, checkpoints, state: None, building: false, changes }
     }
 
     /// The text was replaced by `lines`, the same as before up to line `from`: what's
@@ -198,8 +268,15 @@ impl LineCache {
         if self.building {
             return true;
         }
+        // Colors from another theme, and the parser's states, which carry its styles,
+        // are worked out again
+        let changes = chosen(|chosen| chosen.changes);
+        if self.changes != changes {
+            (self.lines, self.checkpoints, self.state, self.changes) = (Vec::new(), Vec::new(), None, changes);
+        }
         let started = Instant::now();
-        let highlighter = Highlighter::new(&hl.theme);
+        let theme = theme();
+        let highlighter = Highlighter::new(&theme);
         let state = self
             .state
             .get_or_insert_with(|| (ParseState::new(syntax), HighlightState::new(&highlighter, ScopeStack::new())));
@@ -257,7 +334,8 @@ pub fn block(lang: &str, code: &str) -> Option<Vec<Vec<(Style, String)>>> {
     }
     let hl = get()?;
     let syntax = hl.syntaxes.find_syntax_by_token(lang)?;
-    let mut lines = HighlightLines::new(syntax, &hl.theme);
+    let theme = theme();
+    let mut lines = HighlightLines::new(syntax, &theme);
     Some(
         code.lines()
             .map(|line| {
@@ -318,6 +396,24 @@ mod tests {
         cache.invalidate(&text, 4);
         assert!(!cache.disabled);
         assert!(block("js", &"x".repeat(20_000)).is_none());
+    }
+
+    #[test]
+    fn a_new_theme_colors_what_was_colored_again() {
+        load();
+        let text: Vec<String> = vec!["fn main() {}".into(); 3];
+        let mut cache = LineCache::new(Path::new("a.rs"), &text);
+        while !cache.ensure(&text, 3) || cache.building() {}
+        let before = cache.get(0).to_vec();
+        let was = version();
+        assert!(set_theme("nord") && theme_name() == "Nord" && version() > was);
+        // Nothing's worked out again until it's asked for
+        assert_eq!(cache.get(0), before.as_slice());
+        while !cache.ensure(&text, 3) || cache.building() {}
+        assert_ne!(cache.get(0), before.as_slice());
+        assert!(cache.get(0).iter().any(|(s, _)| matches!(s.fg, Some(Color::Rgb(..)))), "{:?}", cache.get(0));
+        assert!(!set_theme("no such theme") && theme_name() == "Nord");
+        assert_eq!(themes().next(), Some("ansi"));
     }
 
     impl LineCache {
